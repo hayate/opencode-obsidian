@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ensureGitignore, prepareProjects, REQUIRED_IGNORES, syncConfig, type SyncState } from "../../core/sync/state.ts";
 import { git, gitOk } from "../../core/git.ts";
@@ -8,6 +8,16 @@ import type { Vault } from "../../core/vault.ts";
 import { GIT_CONFIG, commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
 
 const TZ = "Asia/Tokyo";
+
+// Fixtures are assembled at runtime: a literal token-shaped string in this file
+// would trip GitHub push protection on the repository itself.
+const j = (...parts: string[]): string => parts.join("");
+const noise = (n: number): string => {
+  const alphabet = "Qm7Zr2Kx9Lp4Tw8Vb3Nc6Hd1Fg5Js0Yt";
+  let out = "";
+  for (let i = 0; i < n; i++) out += alphabet[(i * 7 + 3) % alphabet.length];
+  return out;
+};
 
 async function vault(): Promise<Vault> {
   const root = await tempDir("sro-vault-");
@@ -134,9 +144,31 @@ test("missing git identity stops the bootstrap instead of letting git guess one"
     const state = await prepareProjects(v, { remote: await bareRemote() }, TZ);
     assertKind(state, "stopped");
     assert.match(state.kind === "stopped" ? state.reason : "", /user\.name/);
+    await assert.rejects(stat(join(v.projectsDir, ".git")));
   } finally {
     process.env.GIT_CONFIG_GLOBAL = GIT_CONFIG;
   }
+});
+
+test("an import whose notes hold a credential-shaped string stops before anything is committed or pushed, and retries once redacted", async () => {
+  const v = await vault();
+  await writeRel(v.projectsDir, "x/ok.md", "just notes\n");
+  const token = j("gh", "p_", noise(36));
+  await writeRel(v.projectsDir, "x/creds.md", `token: ${token}\n`);
+  const remote = await bareRemote();
+
+  const stopped = await prepareProjects(v, { remote }, TZ);
+  assertKind(stopped, "stopped");
+  assert.match(stopped.kind === "stopped" ? stopped.reason : "", /x\/creds\.md/);
+  assert.equal(await gitOk(["ls-remote", "--heads", remote], { cwd: v.root }), "");
+  await assert.rejects(stat(join(v.projectsDir, ".git")));
+
+  await writeRel(v.projectsDir, "x/creds.md", "token: revoked and redacted\n");
+  const ready = await prepareProjects(v, { remote }, TZ);
+  assert.deepEqual(ready, { kind: "ready", branch: "main", bootstrapped: true });
+  const files = await gitOk(["ls-tree", "-r", "--name-only", "HEAD"], { cwd: v.projectsDir });
+  assert.match(files, /x\/ok\.md/);
+  assert.match(files, /x\/creds\.md/);
 });
 
 test("a detached HEAD and an in-progress rebase each stop", async () => {

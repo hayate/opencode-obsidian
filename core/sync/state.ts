@@ -4,6 +4,7 @@
 import { lstat, readFile, readdir, rm, rmdir, stat, writeFile, appendFile } from "node:fs/promises";
 import { join } from "node:path";
 import { git, gitOk, NETWORK_TIMEOUT_MS } from "../git.ts";
+import { scanDiff } from "../secrets.ts";
 import { CONFIG_FILE, type Vault } from "../vault.ts";
 
 export interface SyncConfig {
@@ -103,11 +104,28 @@ async function commitAndPushNew(projectsDir: string, timezone: string, message: 
     await writeFile(join(projectsDir, CONFIG_FILE), `${JSON.stringify({ timezone }, null, 2)}\n`);
   }
   await gitOk(["add", "-A"], { cwd: projectsDir });
+  // Spec 7.5: every staged diff is scanned before commit. At bootstrap there is
+  // no later cycle to hold a hit back in, so any hit stops the whole import.
+  const diff = await gitOk(
+    ["-c", "core.quotePath=false", "diff", "--cached", "--no-color", "--no-ext-diff", "-U0"],
+    { cwd: projectsDir },
+  );
+  const hits = scanDiff(diff);
+  if (hits.size) {
+    const files = [...hits.keys()].sort();
+    return `secret-shaped content in ${files.join(", ")}: redact or move them out of Projects/ and start a new session`;
+  }
   await gitOk([...NO_SIGN, "commit", "-q", "-m", message], { cwd: projectsDir });
   // HEAD, never a literal branch name: the local default decides (spec 5.2).
   const push = await git(["push", "-q", "-u", "origin", "HEAD"], { cwd: projectsDir, timeoutMs: NETWORK_TIMEOUT_MS });
   if (push.code !== 0) return `bootstrap push failed: ${push.stderr.trim() || "timed out"}`;
   return null;
+}
+
+// A failed bootstrap or import must be retryable: only the .git this call
+// created goes, never the user's notes or the .gitignore / config it wrote.
+async function removeCreatedGit(projectsDir: string): Promise<void> {
+  await rm(join(projectsDir, ".git"), { recursive: true, force: true });
 }
 
 async function vaultTracksProjects(vaultRoot: string): Promise<boolean> {
@@ -171,7 +189,10 @@ export async function prepareProjects(vault: Vault, cfg: SyncConfig, timezone: s
       };
     }
     const failed = await commitAndPushNew(dir, timezone, "bootstrap Projects/");
-    if (failed) return { kind: "stopped", reason: failed };
+    if (failed) {
+      await removeCreatedGit(dir);
+      return { kind: "stopped", reason: failed };
+    }
     const ready = await checkRepo(dir, cfg.remote);
     return ready.kind === "ready" ? { ...ready, bootstrapped: true } : ready;
   }
@@ -188,7 +209,10 @@ export async function prepareProjects(vault: Vault, cfg: SyncConfig, timezone: s
   await gitOk(["init", "-q"], { cwd: dir });
   await gitOk(["remote", "add", "origin", cfg.remote], { cwd: dir });
   const failed = await commitAndPushNew(dir, timezone, "import Projects/");
-  if (failed) return { kind: "stopped", reason: failed };
+  if (failed) {
+    await removeCreatedGit(dir);
+    return { kind: "stopped", reason: failed };
+  }
   const ready = await checkRepo(dir, cfg.remote);
   return ready.kind === "ready" ? { ...ready, bootstrapped: true } : ready;
 }
