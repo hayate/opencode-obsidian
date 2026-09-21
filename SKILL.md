@@ -1,5 +1,5 @@
 ---
-name: opencode-obsidian
+name: opencode-superpower-obsidian
 description: Use the Obsidian "Da Vinci" vault as opencode's single home for memory, handoffs, specs, plans, decisions, and notes. Read, search, create, and edit notes; write and archive handoffs (HANDOFF.md), design specs (specs/), implementation plans (plans/), decisions (decisions/), and notes (notes/). Use when asked to read or write a handoff, note, memory, spec, or plan, or to touch the Obsidian vault / "Da Vinci" folder.
 license: MIT
 ---
@@ -56,8 +56,8 @@ Handoff files carry session state across sessions. Conventions:
 
 ## Specs and plans
 
-The vault is the default store for design and planning artifacts, superseding
-repo-local `docs/superpowers/`. Before implementing a feature:
+The vault is the default store for design and planning artifacts.
+Before implementing a feature:
 
 - Write the spec (design doc) to
   `Projects/<project>/specs/YYYY-MM-DD-<topic>-design.md`.
