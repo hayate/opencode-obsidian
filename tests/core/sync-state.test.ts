@@ -198,6 +198,17 @@ test("the bootstrap scan names the real path even when the global git config set
   }
 });
 
+test("the import scan sees notes a .gitattributes marks -diff", async () => {
+  const v = await vault();
+  await writeRel(v.projectsDir, ".gitattributes", "*.md -diff\n");
+  await writeRel(v.projectsDir, "x/creds.md", `token: ${j("gh", "p_", noise(36))}\n`);
+  const remote = await bareRemote();
+  const stopped = await prepareProjects(v, { remote }, TZ);
+  assertKind(stopped, "stopped");
+  assert.match(stopped.kind === "stopped" ? stopped.reason : "", /x\/creds\.md/);
+  assert.equal(await gitOk(["ls-remote", "--heads", remote], { cwd: v.root }), "");
+});
+
 test("a detached HEAD and an in-progress rebase each stop", async () => {
   const v = await vault();
   const remote = await seededRemote();

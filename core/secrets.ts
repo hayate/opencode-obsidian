@@ -1,6 +1,7 @@
 // Defense in depth before anything is committed or journaled (spec 7.5). The
 // boundary is the private remote; this catches the common plaintext credential
 // shapes. It does not see binaries or arbitrary sensitive prose.
+import { gitOk } from "./git.ts";
 
 export interface SecretHit {
   rule: string;
@@ -146,4 +147,34 @@ export function scanDiff(diff: string): Map<string, SecretHit[]> {
     // "\ No newline at end of file" belongs to the line before it and counts nothing.
   }
   return byFile;
+}
+
+// git's empty tree: attributes are read from it, i.e. from nowhere in the tree.
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+// The staged diff exactly as the scan must see it, whatever the user's config or
+// the synced tree says. --attr-source=<empty tree>: a .gitattributes "*.md -diff"
+// (it syncs like any file) would print "Binary files differ" for every note, and a
+// real binary stays binary without it. --no-textconv: a textconv driver rewrites
+// the + lines. --src-prefix/--dst-prefix: diff.mnemonicPrefix / noprefix /
+// dstPrefix change the +++ header, and scanDiff strips only git's own "b/"; a path
+// it cannot parse means the later unstage matches nothing and the secret stays staged.
+export async function scanStaged(cwd: string): Promise<Map<string, SecretHit[]>> {
+  const diff = await gitOk(
+    [
+      `--attr-source=${EMPTY_TREE}`,
+      "-c",
+      "core.quotePath=false",
+      "diff",
+      "--cached",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      "-U0",
+    ],
+    { cwd },
+  );
+  return scanDiff(diff);
 }

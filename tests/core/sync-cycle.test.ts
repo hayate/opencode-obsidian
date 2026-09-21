@@ -203,6 +203,19 @@ test("a note line starting with '++ ' is scanned, not read as a diff header", as
   }
 });
 
+test("a synced .gitattributes marking notes -diff cannot hide a secret from the scan", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  // -diff makes a plain `git diff` print "Binary files differ" for every note.
+  await writeRel(b.projects, ".gitattributes", "*.md -diff\n");
+  assert.ok((await cycle(remote, b)).pushed);
+  assert.ok((await cycle(remote, a)).liveUpdated);
+  await writeRel(a.projects, "x/notes/creds.md", `token ${TOKEN}\n`);
+  const r = await cycle(remote, a);
+  assert.deepEqual(r.heldBack, [{ file: "x/notes/creds.md", rules: ["github-token"] }]);
+  assert.notEqual((await git(["cat-file", "-e", "main:x/notes/creds.md"], { cwd: remote })).code, 0);
+});
+
 test("a held-back file the remote also changed blocks the whole live update", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];

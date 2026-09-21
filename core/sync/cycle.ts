@@ -6,7 +6,7 @@ import { mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock } from "../lock.ts";
-import { scanDiff } from "../secrets.ts";
+import { scanStaged } from "../secrets.ts";
 import { writeAtomic } from "../store.ts";
 import { identityProblem } from "./state.ts";
 
@@ -202,32 +202,15 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
   // otherwise restore the gitlink an older client committed.
   result.embedded = await dropEmbeddedRepos(dir);
 
-  // --src-prefix/--dst-prefix pin the +++ header to git's own "b/" prefix, whatever
-  // the user's diff.mnemonicPrefix / diff.noprefix / diff.dstPrefix config says:
-  // scanDiff only strips a leading "b/", and a header it cannot parse correctly
-  // means the later unstage matches nothing, so the secret stays staged.
-  const diffArgs = [
-    "-c",
-    "core.quotePath=false",
-    "diff",
-    "--cached",
-    "--no-color",
-    "--no-ext-diff",
-    "--no-textconv",
-    "--src-prefix=a/",
-    "--dst-prefix=b/",
-    "-U0",
-  ];
-  const diff = await gitOk(diffArgs, { cwd: dir });
-  for (const [file, hits] of scanDiff(diff)) {
+  for (const [file, hits] of await scanStaged(dir)) {
     await unstage(dir, file);
     result.heldBack.push({ file, rules: [...new Set(hits.map((h) => h.rule))] });
   }
 
   // Defense in depth: nothing with a hit is ever committed, even if the unstage
-  // above somehow left a hit staged. A guard by construction now that the prefixes
-  // above are pinned; this should never trigger.
-  const stillDirty = scanDiff(await gitOk(diffArgs, { cwd: dir }));
+  // above somehow left a hit staged. A guard by construction now that scanStaged
+  // pins the diff's prefixes; this should never trigger.
+  const stillDirty = await scanStaged(dir);
   if (stillDirty.size) {
     await gitOk(["reset", "-q"], { cwd: dir });
     result.outcome = "aborted";
