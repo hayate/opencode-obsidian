@@ -306,6 +306,35 @@ test("a Projects/ repository with no commit (an older failure's leftover) stops 
   }
 });
 
+test("an orphan branch checked out in a repository that has other commits is never told to delete Projects/.git", async () => {
+  const v = await vault();
+  const remote = await seededRemote();
+  assertKind(await prepareProjects(v, { remote }, TZ), "ready");
+  // HEAD now names a branch with no commit of its own, but the repository as a
+  // whole (main, with the seeded commit) has history worth keeping.
+  await gitOk(["checkout", "-q", "--orphan", "orphan-branch"], { cwd: v.projectsDir });
+  const state = await prepareProjects(v, { remote }, TZ);
+  assertKind(state, "stopped");
+  const reason = state.kind === "stopped" ? state.reason : "";
+  assert.doesNotMatch(reason, /delete Projects\/\.git/, reason);
+});
+
+test("git's dubious-ownership refusal is never told to delete Projects/.git", async () => {
+  const v = await vault();
+  const remote = await seededRemote();
+  assertKind(await prepareProjects(v, { remote }, TZ), "ready");
+  process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER = "1";
+  try {
+    const state = await prepareProjects(v, { remote }, TZ);
+    assertKind(state, "stopped");
+    const reason = state.kind === "stopped" ? state.reason : "";
+    assert.doesNotMatch(reason, /delete Projects\/\.git/, reason);
+    assert.match(reason, /dubious ownership/, reason);
+  } finally {
+    delete process.env.GIT_TEST_ASSUME_DIFFERENT_OWNER;
+  }
+});
+
 test("no status echoes the credentials in a remote URL", async () => {
   // Port 1 refuses at once: no network needed.
   const url = (repo: string): string => j("https://deploy", ":", "s3cret", "pass", `@127.0.0.1:1/${repo}.git`);

@@ -203,15 +203,48 @@ async function vaultTracksProjects(vaultRoot: string): Promise<boolean> {
   return r.code === 0 && r.stdout.trim().length > 0;
 }
 
+// A status line, not a transcript: git's first few lines that say something.
+function firstLines(stderr: string, count = 3): string {
+  return stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && line !== "remote:" && !line.startsWith("hint:"))
+    .slice(0, count)
+    .join("; ");
+}
+
+// True only when the repository is reachable by git at all (so this is not,
+// say, a dubious-ownership refusal that blocks every git command) and holds
+// no refs whatsoever: exactly what an interrupted clone, init or bootstrap
+// leaves behind, and nothing else. An orphan branch checked out in a
+// repository that has other branches fails this (their refs are still
+// there), as does anything that stops git from running in the first place.
+async function repoHasNoRefsAtAll(projectsDir: string): Promise<boolean> {
+  const gitDir = await git(["rev-parse", "--git-dir"], { cwd: projectsDir });
+  if (gitDir.code !== 0) return false;
+  const refs = await git(["for-each-ref", "--count=1"], { cwd: projectsDir });
+  return refs.code === 0 && refs.stdout.trim() === "";
+}
+
 async function checkRepo(projectsDir: string, remote: string): Promise<SyncState> {
-  // Only an older version's failed bootstrap, import or killed clone leaves a
-  // repository with no commit. It holds nothing to keep, whatever its origin.
-  if ((await git(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: projectsDir })).code !== 0) {
-    return {
-      kind: "stopped",
-      reason:
-        "Projects/ is a git repository with no commit (left by an interrupted clone, bootstrap or import): delete Projects/.git (the notes stay) and start a new session",
-    };
+  // A non-zero exit here only means HEAD has no commit; it does not mean the
+  // repository has nothing to lose. The "delete Projects/.git" advice is safe
+  // only when the repository truly holds no history, branch or stash: an
+  // interrupted clone, init or bootstrap that never made a ref. Anything
+  // else (an orphan branch checked out where other branches still have
+  // commits, git's own dubious-ownership refusal, a timeout) stops with
+  // git's own explanation instead, and never advises deleting anything.
+  const head = await git(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: projectsDir });
+  if (head.code !== 0) {
+    if (await repoHasNoRefsAtAll(projectsDir)) {
+      return {
+        kind: "stopped",
+        reason:
+          "Projects/ is a git repository with no commit (left by an interrupted clone, bootstrap or import): delete Projects/.git (the notes stay) and start a new session",
+      };
+    }
+    const detail = firstLines(head.stderr) || (head.timedOut ? "timed out" : `git exited ${head.code}`);
+    return { kind: "stopped", reason: `Projects/'s HEAD could not be verified: ${detail}` };
   }
   const origin = await git(["config", "--get", "remote.origin.url"], { cwd: projectsDir });
   if (origin.code !== 0 || origin.stdout.trim() !== remote) {
