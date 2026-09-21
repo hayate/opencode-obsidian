@@ -5,7 +5,7 @@
 import { mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
-import { acquireLock } from "../lock.ts";
+import { acquireLock, type LockHandle } from "../lock.ts";
 import { scanStaged } from "../secrets.ts";
 import { writeAtomic } from "../store.ts";
 import { identityProblem } from "./state.ts";
@@ -260,10 +260,20 @@ async function ensureStateClone(input: CycleInput): Promise<string> {
   return clone;
 }
 
+// A status line, not a transcript: git's first few lines that say something.
+function firstLines(stderr: string, count = 3): string {
+  return stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && line !== "remote:" && !line.startsWith("hint:"))
+    .slice(0, count)
+    .join("; ");
+}
+
 type Integration =
   | { kind: "ok"; next: string; needsPush: boolean }
   | { kind: "conflict"; files: string[] }
-  | { kind: "unreachable"; reason: string };
+  | { kind: "unsynced"; reason: string };
 
 async function integrate(clone: string, input: CycleInput, live: string, last: string | null): Promise<Integration> {
   const b = input.branch;
@@ -272,10 +282,10 @@ async function integrate(clone: string, input: CycleInput, live: string, last: s
     cwd: clone,
     timeoutMs: NETWORK_TIMEOUT_MS,
   });
-  if (fetched.code !== 0) return { kind: "unreachable", reason: fetched.stderr.trim() || "fetch timed out" };
+  if (fetched.code !== 0) return { kind: "unsynced", reason: fetched.stderr.trim() || "fetch timed out" };
   const upstream = `refs/remotes/origin/${b}`;
   const upstreamSha = await rev(clone, upstream);
-  if (upstreamSha === null) return { kind: "unreachable", reason: `remote has no branch ${b}` };
+  if (upstreamSha === null) return { kind: "unsynced", reason: `remote has no branch ${b}` };
   if (await isAncestor(clone, live, upstream)) return { kind: "ok", next: upstreamSha, needsPush: false };
 
   // Replay only what the remote has not seen: commits after last-integrated.
@@ -284,38 +294,51 @@ async function integrate(clone: string, input: CycleInput, live: string, last: s
   await gitOk(["clean", "-q", "-f", "-d", "-x"], { cwd: clone });
   const rebased = await git([...NO_SIGN, "rebase", "-q", "--onto", upstream, base], { cwd: clone });
   if (rebased.code !== 0) {
-    const unmerged = (await git(["diff", "--name-only", "--diff-filter=U"], { cwd: clone })).stdout.trim();
+    const unmerged = await zList(clone, ["diff", "--name-only", "--diff-filter=U"]);
     await git(["rebase", "--abort"], { cwd: clone });
-    return { kind: "conflict", files: unmerged ? unmerged.split("\n") : [`(rebase failed: ${rebased.stderr.trim()})`] };
+    if (unmerged.length) return { kind: "conflict", files: unmerged };
+    // No conflict (a hook refused, a timeout, a broken clone): nothing for the user
+    // to resolve, so it is not a pause. The next cycle tries again.
+    const detail = firstLines(rebased.stderr) || (rebased.timedOut ? "timed out" : `git exited ${rebased.code}`);
+    return { kind: "unsynced", reason: `rebase failed: ${detail}` };
   }
   const next = (await rev(clone, "HEAD")) ?? upstreamSha;
   return { kind: "ok", next, needsPush: next !== upstreamSha };
 }
 
-async function push(clone: string, input: CycleInput, sha: string): Promise<"pushed" | "rejected" | string> {
+type Push = { kind: "pushed" } | { kind: "raced"; detail: string } | { kind: "failed"; reason: string };
+
+async function push(clone: string, input: CycleInput, sha: string): Promise<Push> {
   const r = await git(["push", "--porcelain", "origin", `${sha}:refs/heads/${input.branch}`], {
     cwd: clone,
     timeoutMs: NETWORK_TIMEOUT_MS,
   });
-  if (r.code === 0 && !r.timedOut) return "pushed";
+  if (r.code === 0 && !r.timedOut) return { kind: "pushed" };
+  const detail = firstLines(r.stderr) || (r.timedOut ? "timed out" : `git exited ${r.code}`);
   // --porcelain: the verdict is read from git's own per-ref status, not from hints.
-  if (/^!\t.*\[(remote )?rejected\]/m.test(r.stdout)) return "rejected";
-  return r.stderr.trim() || (r.timedOut ? "push timed out" : `push exited ${r.code}`);
+  // "[rejected]" is git's non-fast-forward check: the remote moved since the fetch,
+  // so integrating again can succeed. "[remote rejected]" is the server refusing
+  // (a pre-receive hook, push protection): no retry changes that.
+  if (/^!\t.*\[rejected\]/m.test(r.stdout)) return { kind: "raced", detail };
+  return { kind: "failed", reason: `push failed: ${detail}` };
 }
 
+// Never throws: every failure, the lock's own included, is an outcome.
 export async function runCycle(input: CycleInput): Promise<CycleResult> {
   const result = emptyResult();
   const dir = input.projectsDir;
-  const lockDir = await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "sro-sync.lock"], { cwd: dir });
-  const lock = await acquireLock(lockDir, { waitMs: input.lockWaitMs ?? 60_000 });
-  if (!lock) return { ...result, outcome: "busy", reason: "another sync holds the lock" };
-  const stillHeld = async (): Promise<boolean> => {
-    if (await lock.held()) return true;
-    result.outcome = "aborted";
-    result.reason = "lost the sync lock";
-    return false;
-  };
+  let lock: LockHandle | null = null;
   try {
+    const lockDir = await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "sro-sync.lock"], { cwd: dir });
+    lock = await acquireLock(lockDir, { waitMs: input.lockWaitMs ?? 60_000 });
+    if (!lock) return { ...result, outcome: "busy", reason: "another sync holds the lock" };
+    const held = lock;
+    const stillHeld = async (): Promise<boolean> => {
+      if (await held.held()) return true;
+      result.outcome = "aborted";
+      result.reason = "lost the sync lock";
+      return false;
+    };
     // Every cycle that runs breaks the streak, whatever its outcome, unless it ends
     // blocked again; a busy cycle never ran and leaves it alone.
     const streak = await readBlocked(input.stateDir);
@@ -325,6 +348,14 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     if (!snap.pushAllowed) {
       result.outcome = "unsynced";
       result.reason = "a file changed while the snapshot was taken; it will be pushed next cycle";
+      return result;
+    }
+    // Spec 5.4's instructions even when nothing was staged: the state clone copies
+    // the identity below and would otherwise stop the cycle with a raw git error.
+    const identity = await identityProblem(dir);
+    if (identity) {
+      result.outcome = "aborted";
+      result.reason = identity;
       return result;
     }
 
@@ -341,7 +372,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
         result.reason = `sync paused: your local changes conflict with the remote in ${integration.files.join(", ")}`;
         return result;
       }
-      if (integration.kind === "unreachable") {
+      if (integration.kind === "unsynced") {
         result.outcome = "unsynced";
         result.reason = integration.reason;
         return result;
@@ -349,13 +380,18 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       next = integration.next;
       if (!integration.needsPush) break;
       const pushed = await push(clone, input, next);
-      if (pushed === "pushed") {
+      if (pushed.kind === "pushed") {
         result.pushed = true;
         break;
       }
-      if (pushed !== "rejected" || attempt >= MAX_PUSH_ATTEMPTS) {
+      if (pushed.kind === "failed") {
         result.outcome = "unsynced";
-        result.reason = pushed === "rejected" ? `push rejected ${attempt} times` : pushed;
+        result.reason = pushed.reason;
+        return result;
+      }
+      if (attempt >= MAX_PUSH_ATTEMPTS) {
+        result.outcome = "unsynced";
+        result.reason = `push rejected ${attempt} times (the remote kept moving): ${pushed.detail}`;
         return result;
       }
     }
@@ -388,6 +424,14 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     result.reason = (err as Error).message;
     return result;
   } finally {
-    await lock.release();
+    // A throw here would replace the cycle's result: report it in the reason.
+    if (lock) {
+      try {
+        await lock.release();
+      } catch (err) {
+        const failed = `releasing the sync lock failed: ${(err as Error).message}`;
+        result.reason = result.reason ? `${result.reason}; ${failed}` : failed;
+      }
+    }
   }
 }

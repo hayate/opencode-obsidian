@@ -28,6 +28,12 @@ test("git passes input on stdin", async () => {
   assert.equal(r.stdout.trim(), "ce013625030ba8dba906f756967f9e9ca394464a");
 });
 
+test("a git that exits without reading its input is its own result, not an uncaught EPIPE", async () => {
+  const r = await git(["--version"], { cwd: process.cwd(), input: "x".repeat(16 * 1024 * 1024) });
+  assert.equal(r.code, 0);
+  assert.match(r.stdout, /^git version \d/);
+});
+
 test("git never prompts: GIT_TERMINAL_PROMPT is 0 and inherited GIT_DIR is dropped", async () => {
   const dir = await tempDir();
   process.env.GIT_DIR = "/nonexistent-git-dir";

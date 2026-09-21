@@ -90,7 +90,15 @@ function runOnce(args: string[], opts: GitOptions): Promise<GitResult> {
       clearTimeout(timer);
       resolve({ code: code ?? -1, stdout, stderr, timedOut });
     });
-    if (opts.input !== undefined) child.stdin?.end(opts.input);
+    if (opts.input !== undefined) {
+      // A git that exits before reading all its input closes the pipe, and the
+      // write fails with EPIPE: unhandled, that stream error would crash the
+      // process. The exit status (the close handler above) is the result.
+      child.stdin?.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code !== "EPIPE") reject(err);
+      });
+      child.stdin?.end(opts.input);
+    }
   });
 }
 

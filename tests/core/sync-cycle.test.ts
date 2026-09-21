@@ -314,18 +314,77 @@ test("last-integrated is set as soon as the push lands, so a step-5 failure neve
   assert.equal(await remoteFile(remote, "x/shared.md"), "a1");
 });
 
-test("a rejected push is retried after integrating again", async () => {
+test("a push that loses a race (the remote moved after the fetch) is retried after integrating again", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];
-  const hook = join(remote, "hooks", "pre-receive");
-  await writeFile(hook, `#!/bin/sh\nf="${join(remote, "reject-once")}"\nif [ -f "$f" ]; then rm -f "$f"; exit 1; fi\nexit 0\n`);
+  await writeRel(a.projects, "x/notes/first.md", "1\n");
+  assert.ok((await cycle(remote, a)).pushed); // builds A's state clone
+  const other = join(await tempDir(), "other");
+  await gitOk(["clone", "-q", remote, other], { cwd: await tempDir() });
+  await commitFile(other, "x/notes/other.md", "o\n", "another machine");
+  // The state clone checks out before it rebases, after the fetch: this hook
+  // pushes the other machine's commit there, once, so A's push is non-fast-forward.
+  const once = join(a.state, "race-once");
+  await writeFile(once, "");
+  const hook = join(a.state, "sync", ".git", "hooks", "post-checkout");
+  await writeFile(
+    hook,
+    `#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\nif [ -f '${once}' ]; then rm -f '${once}'; git -C '${other}' push -q origin HEAD; fi\n`,
+  );
   await chmod(hook, 0o755);
-  await writeFile(join(remote, "reject-once"), "");
   await writeRel(a.projects, "x/notes/n.md", "n\n");
   const r = await cycle(remote, a);
   assert.equal(r.pushed, true, r.reason ?? "");
+  await assert.rejects(stat(once), "the race must have happened");
   assert.equal(await remoteFile(remote, "x/notes/n.md"), "n");
+  assert.equal(await remoteFile(remote, "x/notes/other.md"), "o");
 });
+
+test("a push the remote refuses (a server-side hook, e.g. push protection) is reported once, never retried as a race", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  const attempts = join(remote, "attempts");
+  const hook = join(remote, "hooks", "pre-receive");
+  await writeFile(hook, `#!/bin/sh\necho attempt >> '${attempts}'\necho "GH013: push declined by repository rules" >&2\nexit 1\n`);
+  await chmod(hook, 0o755);
+  await writeRel(a.projects, "x/notes/n.md", "n\n");
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "unsynced");
+  assert.ok(r.committed);
+  assert.match(r.reason ?? "", /GH013: push declined by repository rules/);
+  assert.equal((await readFile(attempts, "utf8")).trim().split("\n").length, 1);
+});
+
+test("runCycle never throws: a Projects/ that does not exist is an aborted cycle", async () => {
+  const base = await tempDir();
+  const r = await runCycle({ projectsDir: join(base, "missing"), remote: join(base, "r.git"), branch: "main", stateDir: join(base, "state"), machine: "a" });
+  assert.equal(r.outcome, "aborted");
+  assert.ok(r.reason);
+});
+
+test(
+  "a sync lock that cannot be released is reported, never thrown over the cycle's result",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const { remote, m } = await setup(["a"]);
+    const [a] = m as [Machine];
+    const lockDir = await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "sro-sync.lock"], { cwd: a.projects });
+    // Runs after the snapshot commit, while the cycle holds the lock: release()
+    // then cannot unlink its owner entry.
+    const hook = join(a.projects, ".git", "hooks", "post-commit");
+    await writeFile(hook, `#!/bin/sh\nchmod 555 '${lockDir}'\n`);
+    await chmod(hook, 0o755);
+    await writeRel(a.projects, "x/notes/n.md", "n\n");
+    let r: CycleResult;
+    try {
+      r = await cycle(remote, a);
+    } finally {
+      await chmod(lockDir, 0o755).catch(() => undefined);
+    }
+    assert.ok(r.pushed, r.reason ?? "");
+    assert.match(r.reason ?? "", /releasing the sync lock failed/);
+  },
+);
 
 test("an unreachable remote keeps the commit local and reports it; the next cycle pushes it", async () => {
   const { remote, m } = await setup(["a"]);
@@ -357,6 +416,48 @@ test("missing identity aborts before committing anything", async () => {
     process.env.GIT_CONFIG_GLOBAL = GIT_CONFIG;
   }
   assert.match(await gitOk(["status", "--porcelain"], { cwd: a.projects }), /x\/notes\//);
+});
+
+test("missing identity with nothing to commit still gives the identity instructions, not a raw git error", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  const emptyConfig = join(await tempDir(), "gitconfig");
+  await writeFile(emptyConfig, "");
+  process.env.GIT_CONFIG_GLOBAL = emptyConfig;
+  try {
+    const r = await cycle(remote, a);
+    assert.equal(r.outcome, "aborted");
+    assert.match(r.reason ?? "", /git config --global user\.name/);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = GIT_CONFIG;
+  }
+});
+
+test("a rebase that fails without a conflict is reported as unsynced with its error, not as a pause", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  assert.equal((await cycle(remote, b)).outcome, "synced"); // builds B's state clone
+  const hook = join(b.state, "sync", ".git", "hooks", "pre-rebase");
+  await writeFile(hook, "#!/bin/sh\necho 'pre-rebase refuses' >&2\nexit 1\n");
+  await chmod(hook, 0o755);
+  await writeRel(a.projects, "x/notes/a.md", "a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  await writeRel(b.projects, "x/notes/b.md", "b\n");
+  const r = await cycle(remote, b);
+  assert.equal(r.outcome, "unsynced", r.reason ?? "");
+  assert.match(r.reason ?? "", /pre-rebase refuses/);
+  assert.deepEqual(r.conflicts, []);
+});
+
+test("conflicting file names are reported as spelled, never C-quoted", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/日本.md", "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  await writeRel(b.projects, "x/日本.md", "from b\n");
+  const r = await cycle(remote, b);
+  assert.equal(r.outcome, "paused", r.reason ?? "");
+  assert.deepEqual(r.conflicts, ["x/日本.md"]);
 });
 
 test("a busy lock returns busy without touching anything", async () => {
