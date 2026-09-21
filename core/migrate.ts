@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { git, literal } from "./git.ts";
-import { createAt, renderDoc, writeAtomic } from "./store.ts";
+import { checkMemoryDir, createAt, readMemoryFile, renderDoc, vaultName, writeAtomic } from "./store.ts";
 
 export const SCHEMA_FILE = ".sro-schema";
 export const SCHEMA_VERSION = 1;
@@ -29,6 +29,15 @@ export interface MigrationReport {
   alreadyDone: string[];
 }
 
+// A step on one project's memory, its error naming the project.
+async function inProject<T>(name: string, step: () => Promise<T>): Promise<T> {
+  try {
+    return await step();
+  } catch (err) {
+    throw new Error(`Projects/${vaultName(name)}/${(err as Error).message}`);
+  }
+}
+
 export async function migrateLegacyHandoffs(projectsDir: string): Promise<MigrationReport> {
   const report: MigrationReport = { migrated: [], alreadyDone: [] };
   const entries = await readdir(projectsDir, { withFileTypes: true }).catch(() => []);
@@ -36,7 +45,11 @@ export async function migrateLegacyHandoffs(projectsDir: string): Promise<Migrat
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
     const rel = `${entry.name}/HANDOFF.md`;
     const source = join(projectsDir, rel);
-    const content = await readFile(source, "utf8").catch(() => null);
+    const projectDir = join(projectsDir, entry.name);
+    // Through the read boundary (store.ts): a symlinked HANDOFF.md would copy its
+    // target into a synced handoff. Any failure but "absent" stops the migration
+    // before the marker, so nothing is silently left behind unmigrated.
+    const content = await inProject(entry.name, () => readMemoryFile(projectDir, "HANDOFF.md"));
     if (content === null) continue;
     const sha12 = createHash("sha256").update(content).digest("hex").slice(0, 12);
     const doc = renderDoc(
@@ -51,12 +64,14 @@ export async function migrateLegacyHandoffs(projectsDir: string): Promise<Migrat
       },
       content,
     );
+    await inProject(entry.name, () => checkMemoryDir(projectDir, "remember/handoffs"));
     const dir = join(projectsDir, entry.name, "remember", "handoffs");
     const target = join(dir, `legacy-${sha12}.md`);
     if (await createAt(target, doc)) {
       report.migrated.push(entry.name);
     } else {
-      if ((await readFile(target, "utf8")) !== doc) throw new Error(`${target} exists with different content`);
+      const existing = await inProject(entry.name, () => readMemoryFile(projectDir, `remember/handoffs/legacy-${sha12}.md`));
+      if (existing !== doc) throw new Error(`${target} exists with different content`);
       report.alreadyDone.push(entry.name);
     }
     await rm(source);

@@ -6,7 +6,18 @@ import { readFile, readdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { Harness, SessionRef, TranscriptChunk } from "./harness.ts";
 import { scanText } from "./secrets.ts";
-import { createExclusive, listMemoryDir, MemoryReadError, parseDoc, quoted, readMemoryFile, renderDoc, sanitizeKey, writeAtomic } from "./store.ts";
+import {
+  checkMemoryDir,
+  createExclusive,
+  listMemoryDir,
+  MemoryPathError,
+  parseDoc,
+  quoted,
+  readMemoryFile,
+  renderDoc,
+  sanitizeKey,
+  writeAtomic,
+} from "./store.ts";
 import { addDays, dayStamp, isoWithOffset, timeStamp } from "./time.ts";
 
 export interface JournalEntryMeta {
@@ -63,17 +74,27 @@ export async function writeJournalEntry(
   const stamp = timeStamp(e.to, e.timezone);
   const machine = sanitizeKey(e.machine);
   const session8 = sanitizeKey(e.session.slice(0, 8));
+  await checkMemoryDir(projectDir, `remember/journal/${day}`);
   return createExclusive(join(projectDir, "remember", "journal", day), (rand) => `${stamp}-${machine}-${session8}-${rand}.md`, content);
 }
 
 // Throws when the journal folder or a day folder exists but cannot be listed.
-// One entry that cannot be read is skipped, never fatal: when the caller passes
-// `problems`, each skip is reported there (session.ts turns them into warnings).
+// One entry that cannot be read, or a day folder the read boundary refuses (a
+// symbolic link), is skipped, never fatal: when the caller passes `problems`,
+// each skip is reported there (session.ts turns them into warnings).
 export async function listEntries(projectDir: string, problems?: string[]): Promise<JournalEntry[]> {
   const out: JournalEntry[] = [];
   for (const day of (await listMemoryDir(projectDir, "remember/journal")).sort()) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
-    for (const name of (await listMemoryDir(projectDir, `remember/journal/${day}`)).sort()) {
+    let names: string[];
+    try {
+      names = await listMemoryDir(projectDir, `remember/journal/${day}`);
+    } catch (err) {
+      if (!(err instanceof MemoryPathError && err.boundary)) throw err;
+      problems?.push(`journal day ${quoted(day)} skipped: ${err.message}`);
+      continue;
+    }
+    for (const name of names.sort()) {
       if (!name.endsWith(".md") || name.startsWith(".")) continue;
       const rel = `remember/journal/${day}/${name}`;
       const path = join(projectDir, rel);
@@ -81,7 +102,7 @@ export async function listEntries(projectDir: string, problems?: string[]): Prom
       try {
         raw = await readMemoryFile(projectDir, rel);
       } catch (err) {
-        const why = err instanceof MemoryReadError ? err.why : (err as Error).message;
+        const why = err instanceof MemoryPathError ? err.why : (err as Error).message;
         problems?.push(`journal entry ${quoted(`${day}/${name}`)} cannot be read (${why}); skipped`);
         continue;
       }

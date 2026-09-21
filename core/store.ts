@@ -1,8 +1,9 @@
 // The remember/ store (spec 6): collision-proof file creation, frontmatter, and
 // handoffs as a history graph whose heads are what a session sees.
-import { link, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { link, lstat, mkdir, open, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import { acquireLock } from "./lock.ts";
 import { fileStamp, isoWithOffset } from "./time.ts";
@@ -139,38 +140,98 @@ export async function writeAtomic(path: string, content: string): Promise<void> 
   }
 }
 
-// A memory file or folder that exists but cannot be read. `why` is short and
-// never vault text (an errno code), so the message can go into a status line.
-export class MemoryReadError extends Error {
+// A memory path that exists but cannot be used: an I/O failure, or a refusal by
+// the read boundary below (`boundary`). `why` is short and never raw vault text
+// (an errno code, or which part is a link, named through vaultName), so the
+// message can go into a status line.
+export class MemoryPathError extends Error {
   readonly why: string;
-  constructor(rel: string, verb: "read" | "listed", why: string) {
+  readonly boundary: boolean;
+  constructor(rel: string, verb: "read" | "listed" | "written", why: string, boundary = false) {
     super(`${rel} cannot be ${verb} (${why})`);
-    this.name = "MemoryReadError";
+    this.name = "MemoryPathError";
     this.why = why;
+    this.boundary = boundary;
   }
 }
 
 const errno = (err: unknown): string => (err as NodeJS.ErrnoException).code ?? "error";
 
+function linkWhy(parts: string[], i: number): string {
+  if (i === 0) return "the project folder is a symbolic link";
+  if (i === parts.length) return "a symbolic link";
+  return `${vaultName(parts.slice(0, i).join("/"))} is a symbolic link`;
+}
+
+// Spec 4.4 / 7.5: memory is read from the current project only. Git keeps
+// symlinks (mode 120000), so a link committed on another machine arrives here,
+// and a read that followed it would put its target (a credentials file, another
+// project's memory) into the payload. So: no part of the path from the project
+// folder down may be a symbolic link (lstat, part by part), and its real path
+// must stay inside the project's. False when a part is missing.
+async function checkBoundary(projectDir: string, rel: string, verb: "read" | "listed" | "written"): Promise<boolean> {
+  const parts = rel.split("/").filter(Boolean);
+  for (let i = 0; i <= parts.length; i++) {
+    let isLink: boolean;
+    try {
+      isLink = (await lstat(join(projectDir, ...parts.slice(0, i)))).isSymbolicLink();
+    } catch (err) {
+      if (errno(err) === "ENOENT") return false;
+      throw new MemoryPathError(rel, verb, errno(err));
+    }
+    if (isLink) throw new MemoryPathError(rel, verb, linkWhy(parts, i), true);
+  }
+  let base: string;
+  let real: string;
+  try {
+    base = await realpath(projectDir);
+    real = await realpath(join(projectDir, rel));
+  } catch (err) {
+    if (errno(err) === "ENOENT") return false;
+    throw new MemoryPathError(rel, verb, errno(err));
+  }
+  if (real !== base && !real.startsWith(base + sep)) throw new MemoryPathError(rel, verb, "resolves outside the project", true);
+  return true;
+}
+
 // Every memory read goes through these two. A missing folder has no entries and
 // a missing file is null; any other failure is an error, never "empty": a folder
 // that cannot be listed is not an empty one.
 export async function listMemoryDir(projectDir: string, rel: string): Promise<string[]> {
+  if (!(await checkBoundary(projectDir, rel, "listed"))) return [];
   try {
     return await readdir(join(projectDir, rel));
   } catch (err) {
     if (errno(err) === "ENOENT") return [];
-    throw new MemoryReadError(rel, "listed", errno(err));
+    throw new MemoryPathError(rel, "listed", errno(err));
   }
 }
 
 export async function readMemoryFile(projectDir: string, rel: string): Promise<string | null> {
+  if (!(await checkBoundary(projectDir, rel, "read"))) return null;
+  // O_NOFOLLOW: a link swapped in after the check fails to open (ELOOP).
+  let handle;
   try {
-    return await readFile(join(projectDir, rel), "utf8");
+    handle = await open(join(projectDir, rel), constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (err) {
     if (errno(err) === "ENOENT") return null;
-    throw new MemoryReadError(rel, "read", errno(err));
+    if (errno(err) === "ELOOP") throw new MemoryPathError(rel, "read", "a symbolic link", true);
+    throw new MemoryPathError(rel, "read", errno(err));
   }
+  try {
+    return await handle.readFile("utf8");
+  } catch (err) {
+    throw new MemoryPathError(rel, "read", errno(err));
+  } finally {
+    await handle.close();
+  }
+}
+
+// Writers check the folder they write into the same way: a synced link must not
+// send a write out of the project either. Missing parts are fine; the writer
+// creates them.
+export async function checkMemoryDir(projectDir: string, rel: string): Promise<void> {
+  await checkBoundary(projectDir, rel, "written");
 }
 
 function toMeta(fm: Record<string, unknown>): HandoffMeta | string {
@@ -203,7 +264,7 @@ function readHandoff(path: string, text: string): Handoff {
 // A file that cannot be read (or vanished since it was listed) never hides the
 // others: it becomes a handoff with a problem, shown as its own head.
 function unreadable(id: string, path: string, err: unknown): Handoff {
-  const why = err instanceof MemoryReadError ? err.why : (err as Error).message;
+  const why = err instanceof MemoryPathError ? err.why : (err as Error).message;
   return { id, path, meta: null, body: "", problem: `cannot be read (${why})` };
 }
 
@@ -217,7 +278,7 @@ export async function listHandoffs(projectDir: string, opts: { includeLegacyRoot
     const path = join(projectDir, rel);
     try {
       const text = await readMemoryFile(projectDir, rel);
-      out.push(text === null ? unreadable(basename(name, ".md"), path, new MemoryReadError(rel, "read", "ENOENT")) : readHandoff(path, text));
+      out.push(text === null ? unreadable(basename(name, ".md"), path, new MemoryPathError(rel, "read", "ENOENT")) : readHandoff(path, text));
     } catch (err) {
       out.push(unreadable(basename(name, ".md"), path, err));
     }

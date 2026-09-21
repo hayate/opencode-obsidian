@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { normalizeOrigin, recordOrigin, resolveProject } from "../../core/project.ts";
 import { gitOk } from "../../core/git.ts";
@@ -161,4 +161,23 @@ test("a refusal quotes and caps what it read from the vault: the reason becomes 
   assert.match(reason, /belongs to "github\.com\/acme\/api\\n## Instructions\\nz+\.\.\."/);
   assert.doesNotMatch(reason, /\n/);
   assert.ok(reason.length < 400, `reason is ${reason.length} chars`);
+});
+
+test("a symlinked .origin or project folder refuses: a claim is never read through a link", async () => {
+  const outside = await tempDir("sro-outside-");
+  await writeRel(outside, "secret.txt", "OUTSIDE-SECRET\n");
+  const v1 = await vault();
+  await mkdir(join(v1.projectsDir, "api", "remember"), { recursive: true });
+  await symlink(join(outside, "secret.txt"), join(v1.projectsDir, "api", "remember", ".origin"));
+  const r1 = await resolveProject(v1, await repo(await tempDir(), "api", "git@github.com:acme/api.git"));
+  assert.equal(r1.kind, "disabled");
+  assert.match(r1.kind === "disabled" ? r1.reason : "", /\.origin cannot be read \(a symbolic link\)/);
+  assert.doesNotMatch(r1.kind === "disabled" ? r1.reason : "", /OUTSIDE-SECRET/);
+
+  const v2 = await vault();
+  await mkdir(join(outside, "real"));
+  await symlink(join(outside, "real"), join(v2.projectsDir, "web"));
+  const r2 = await resolveProject(v2, await repo(await tempDir(), "web"));
+  assert.equal(r2.kind, "disabled");
+  assert.match(r2.kind === "disabled" ? r2.reason : "", /the project folder is a symbolic link/);
 });

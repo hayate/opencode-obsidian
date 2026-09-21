@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readFile, stat, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { initializeSession, statusFromCycle, type SessionOptions } from "../../core/session.ts";
 import type { Harness, SessionRef } from "../../core/harness.ts";
@@ -338,3 +338,80 @@ test("a journal folder that cannot be listed is reported, and the payload is sti
   assert.equal(r.context?.project, "kabin-api", lines);
   assert.match(lines, /remember\/journal cannot be listed \(ENOTDIR\)/);
 });
+
+// Spec 4.4 / 7.5: memory is read from the current project only. Git keeps
+// symlinks, so each of these can arrive by sync from another machine.
+const HANDOFF = (body: string): string => `---\nbranch: main\nwritten: 2026-09-21T10:00:00+09:00\nsupersedes: []\n---\n\n${body}\n`;
+const symlinkCases: Array<{ name: string; secret: string; reported: RegExp; setup(projectDir: string, outside: string): Promise<void> }> = [
+  {
+    name: "a file symlink as remember/identity.md, to a file outside the vault",
+    secret: "OUTSIDE-IDENTITY",
+    reported: /remember\/identity\.md cannot be read \(a symbolic link\)/,
+    async setup(projectDir, outside) {
+      await writeRel(outside, "creds.txt", "OUTSIDE-IDENTITY\n");
+      await mkdir(join(projectDir, "remember"), { recursive: true });
+      await symlink(join(outside, "creds.txt"), join(projectDir, "remember", "identity.md"));
+    },
+  },
+  {
+    name: "a directory symlink as remember/handoffs, to a folder of handoffs elsewhere",
+    secret: "OUTSIDE-HANDOFF",
+    reported: /remember\/handoffs cannot be listed \(a symbolic link\)/,
+    async setup(projectDir, outside) {
+      await writeRel(outside, "handoffs/2026-09-21T100000-main-s-abcd.md", HANDOFF("OUTSIDE-HANDOFF"));
+      await mkdir(join(projectDir, "remember"), { recursive: true });
+      await symlink(join(outside, "handoffs"), join(projectDir, "remember", "handoffs"));
+    },
+  },
+  {
+    name: "a ../ relative link into another project's handoff",
+    secret: "OTHER-PROJECT-MEMORY",
+    reported: /handoff "stolen" is malformed \("cannot be read \(a symbolic link\)"\)/,
+    async setup(projectDir) {
+      await writeRel(join(projectDir, "..", "other"), "remember/handoffs/x.md", HANDOFF("OTHER-PROJECT-MEMORY"));
+      await mkdir(join(projectDir, "remember", "handoffs"), { recursive: true });
+      await symlink("../../../other/remember/handoffs/x.md", join(projectDir, "remember", "handoffs", "stolen.md"));
+    },
+  },
+  {
+    name: "a symlinked journal day directory",
+    secret: "OUTSIDE-JOURNAL",
+    reported: /journal day "2026-09-21" skipped: remember\/journal\/2026-09-21 cannot be listed \(a symbolic link\)/,
+    async setup(projectDir, outside) {
+      await todayEntry(join(outside, "p"), "OUTSIDE-JOURNAL");
+      await mkdir(join(projectDir, "remember", "journal"), { recursive: true });
+      await symlink(join(outside, "p", "remember", "journal", "2026-09-21"), join(projectDir, "remember", "journal", "2026-09-21"));
+    },
+  },
+  {
+    name: "a symlinked legacy root HANDOFF.md",
+    secret: "OUTSIDE-LEGACY",
+    reported: /handoff "HANDOFF" is malformed \("cannot be read \(a symbolic link\)"\)/,
+    async setup(projectDir, outside) {
+      await writeRel(outside, "legacy.md", "OUTSIDE-LEGACY\n");
+      await mkdir(projectDir, { recursive: true });
+      await symlink(join(outside, "legacy.md"), join(projectDir, "HANDOFF.md"));
+    },
+  },
+  {
+    name: "a symlinked project folder",
+    secret: "OUTSIDE-PROJECT-FOLDER",
+    reported: /Projects\/kabin-api\/remember\/\.origin cannot be read \(the project folder is a symbolic link\)/,
+    async setup(projectDir, outside) {
+      await writeRel(outside, "real/remember/identity.md", "OUTSIDE-PROJECT-FOLDER\n");
+      await symlink(join(outside, "real"), projectDir);
+    },
+  },
+];
+
+for (const c of symlinkCases) {
+  test(`memory is never read through a symlink: ${c.name}`, async () => {
+    const w = await localWorld();
+    const outside = await tempDir("sro-outside-");
+    await c.setup(w.projectDir, outside);
+    const r = await initializeSession(localOpts(w));
+    const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+    assert.doesNotMatch(r.payload, new RegExp(c.secret), `the target's content reached the payload:\n${r.payload}`);
+    assert.match(lines, c.reported);
+  });
+}

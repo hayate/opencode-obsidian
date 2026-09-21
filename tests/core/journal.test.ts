@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   buildRollups,
@@ -198,4 +198,34 @@ test("listEntries: one entry that cannot be read is skipped and reported; the re
   assert.equal(problems.length, 1);
   assert.match(problems[0] ?? "", /"2026-09-21\/000000-bad\.md" cannot be read \(EISDIR\)/);
   await assert.doesNotReject(listEntries(projectDir), "a caller that does not ask for problems still gets the entries");
+});
+
+test("listEntries: a symlinked day folder or entry is skipped and reported, never read", async () => {
+  const outside = await tempDir("sro-outside-");
+  const at = new Date("2026-09-21T03:00:00Z");
+  await writeJournalEntry(join(outside, "p"), { machine: "a", session: "s", branch: "main", from: at, to: at, model: "m", summary: "OUTSIDE", timezone: TZ });
+  const [target] = await listEntries(join(outside, "p"));
+  const projectDir = join(await tempDir(), "p");
+  await writeJournalEntry(projectDir, { machine: "a", session: "s", branch: "main", from: at, to: at, model: "m", summary: "inside", timezone: TZ });
+  await symlink(target?.path ?? "", join(projectDir, "remember", "journal", "2026-09-21", "000000-link.md"));
+  await symlink(join(outside, "p", "remember", "journal", "2026-09-21"), join(projectDir, "remember", "journal", "2026-09-20"));
+  const problems: string[] = [];
+  const entries = await listEntries(projectDir, problems);
+  assert.deepEqual(entries.map((e) => e.body), ["inside"]);
+  assert.equal(problems.length, 2, problems.join("\n"));
+  assert.match(problems.join("\n"), /journal day "2026-09-20" skipped: remember\/journal\/2026-09-20 cannot be listed \(a symbolic link\)/);
+  assert.match(problems.join("\n"), /"2026-09-21\/000000-link\.md" cannot be read \(a symbolic link\)/);
+});
+
+test("writeJournalEntry never writes through a symlinked journal folder", async () => {
+  const outside = await tempDir("sro-outside-");
+  const projectDir = join(await tempDir(), "p");
+  await mkdir(join(projectDir, "remember", "journal"), { recursive: true });
+  await symlink(outside, join(projectDir, "remember", "journal", "2026-09-21"));
+  const at = new Date("2026-09-21T03:00:00Z");
+  await assert.rejects(
+    writeJournalEntry(projectDir, { machine: "a", session: "s", branch: "main", from: at, to: at, model: "m", summary: "x", timezone: TZ }),
+    /remember\/journal\/2026-09-21 cannot be written \(a symbolic link\)/,
+  );
+  assert.deepEqual(await readdir(outside), []);
 });

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readdir, readFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { legacyReappeared, migrateLegacyHandoffs, schemaVersion } from "../../core/migrate.ts";
 import { computeHeads, listHandoffs } from "../../core/store.ts";
@@ -80,4 +80,20 @@ test("a HANDOFF.md written by an old client after migration is reported", async 
 test("before migration nothing is reported as reappeared", async () => {
   const projects = await repoWithLegacy();
   assert.equal(await legacyReappeared(projects, "kabin-api"), false);
+});
+
+test("the migration never reads a symlinked HANDOFF.md, nor writes through a symlinked handoffs folder", async () => {
+  const outside = await tempDir("sro-outside-");
+  await writeRel(outside, "secret.txt", "OUTSIDE\n");
+  const a = join(await tempDir(), "Projects");
+  await mkdir(join(a, "p"), { recursive: true });
+  await symlink(join(outside, "secret.txt"), join(a, "p", "HANDOFF.md"));
+  await assert.rejects(migrateLegacyHandoffs(a), /HANDOFF\.md cannot be read \(a symbolic link\)/);
+  assert.equal(await schemaVersion(a), 0, "no marker after a refused migration");
+
+  const b = await repoWithLegacy();
+  await mkdir(join(b, "kabin-api", "remember"), { recursive: true });
+  await symlink(outside, join(b, "kabin-api", "remember", "handoffs"));
+  await assert.rejects(migrateLegacyHandoffs(b), /remember\/handoffs cannot be written \(a symbolic link\)/);
+  assert.deepEqual(await readdir(outside), ["secret.txt"], "nothing was written through the link");
 });

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   branchKey,
@@ -10,6 +10,7 @@ import {
   listHandoffs,
   MALFORMED_BRANCH,
   parseDoc,
+  readMemoryFile,
   renderDoc,
   writeAtomic,
   writeHandoff,
@@ -205,4 +206,36 @@ test("listHandoffs: one file that cannot be read becomes a handoff with a proble
   const heads = computeHeads(list);
   assert.deepEqual(ids(heads.byBranch.get("main")), ["good"]);
   assert.match(heads.problems.join("\n"), /"bad" is malformed \("cannot be read \(EISDIR\)"\)/);
+});
+
+test("readMemoryFile refuses a symlink at any depth from the project folder down, and says which part", async () => {
+  const outside = await tempDir("sro-outside-");
+  await writeRel(outside, "secret.txt", "OUTSIDE\n");
+  const p = await project();
+  await mkdir(join(p.projectDir, "remember"), { recursive: true });
+  await symlink(join(outside, "secret.txt"), join(p.projectDir, "remember", "identity.md"));
+  await assert.rejects(readMemoryFile(p.projectDir, "remember/identity.md"), /remember\/identity\.md cannot be read \(a symbolic link\)/);
+  const q = await project();
+  await mkdir(q.projectDir, { recursive: true });
+  await symlink(outside, join(q.projectDir, "remember"));
+  await writeRel(outside, "recent.md", "OUTSIDE\n");
+  await assert.rejects(readMemoryFile(q.projectDir, "remember/recent.md"), /\(remember is a symbolic link\)/);
+  assert.equal(await readMemoryFile(q.projectDir, "missing/x.md"), null, "a missing part is absent, not an error");
+});
+
+test("listHandoffs: a symlinked handoff is a problem, never content; a symlinked handoffs folder is an error", async () => {
+  const outside = await tempDir("sro-outside-");
+  await writeRel(outside, "h/x.md", "---\nbranch: main\nwritten: 2026-09-21T10:00:00+09:00\nsupersedes: []\n---\n\nOUTSIDE\n");
+  const p = await project();
+  await mkdir(join(p.projectDir, "remember", "handoffs"), { recursive: true });
+  await symlink(join(outside, "h", "x.md"), join(p.projectDir, "remember", "handoffs", "link.md"));
+  const [only] = await listHandoffs(p.projectDir);
+  assert.equal(only?.body, "");
+  assert.match(only?.problem ?? "", /cannot be read \(a symbolic link\)/);
+  const q = await project();
+  await mkdir(join(q.projectDir, "remember"), { recursive: true });
+  await symlink(join(outside, "h"), join(q.projectDir, "remember", "handoffs"));
+  await assert.rejects(listHandoffs(q.projectDir), /remember\/handoffs cannot be listed \(a symbolic link\)/);
+  await assert.rejects(writeHandoff(input(q, "ses_aaaaaaaa1", "through the link", [])), /remember\/handoffs cannot be listed \(a symbolic link\)/);
+  assert.deepEqual(await readdir(join(outside, "h")), ["x.md"], "nothing was written through the link");
 });
