@@ -300,6 +300,21 @@ test("a leftover temp clone from a crashed process is swept before a new clone; 
   assert.equal(await readFile(unrelated, "utf8"), "keep");
 });
 
+test("leftover-sweep removes only 8-hex-char temp clones, not shorter names", async () => {
+  const v = await vault();
+  const remote = await seededRemote();
+  const shortHex = join(v.root, ".Projects.abc.sro-tmp");
+  const eightHex = join(v.root, ".Projects.deadbeef.sro-tmp");
+  await mkdir(shortHex, { recursive: true });
+  await mkdir(eightHex, { recursive: true });
+  await writeFile(join(shortHex, "stale-file"), "keep");
+  await writeFile(join(eightHex, "stale-file"), "remove");
+  const state = await prepareProjects(v, { remote }, TZ);
+  assertKind(state, "ready");
+  await assert.doesNotReject(stat(shortHex), "a 3-hex temp dir must not be swept");
+  await assert.rejects(stat(eightHex), "the 8-hex temp clone must be swept");
+});
+
 test("a Projects/ repository with no commit (an older failure's leftover) stops and says what to do", async () => {
   const remote = await seededRemote();
   const leftovers: Array<[string, (dir: string) => Promise<void>]> = [

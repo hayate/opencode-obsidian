@@ -177,7 +177,7 @@ async function firstPush(projectsDir: string, remote: string, steps: () => Promi
 // pattern this function creates are ever removed here.
 async function sweepLeftoverClones(root: string, projectsDir: string): Promise<void> {
   const prefix = basename(projectsDir).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`^\\.${prefix}\\.[0-9a-f]+\\.sro-tmp$`);
+  const pattern = new RegExp(`^\\.${prefix}\\.[0-9a-f]{8}\\.sro-tmp$`);
   for (const name of await entries(root)) {
     if (pattern.test(name)) await rm(join(root, name), { recursive: true, force: true });
   }
