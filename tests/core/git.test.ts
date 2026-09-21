@@ -176,6 +176,20 @@ test("an index.lock that was already there when a killed command started is neve
   assert.equal(await exists(lock), true);
 });
 
+test("looking up the index.lock path honours the caller's timeout", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  await writeRel(dir, "a.md", "a\n");
+  // Every git command in this repository blocks reading its config.
+  const fifo = join(dir, ".git", "hang.fifo");
+  await execFileAsync("mkfifo", [fifo]);
+  await writeFile(join(dir, ".git", "config"), `${await readFile(join(dir, ".git", "config"), "utf8")}[include]\n\tpath = hang.fifo\n`);
+  const started = Date.now();
+  const r = await git(["add", "a.md"], { cwd: dir, timeoutMs: 500 });
+  assert.equal(r.timedOut, true);
+  assert.ok(Date.now() - started < 5000, `took ${Date.now() - started} ms for a 500 ms timeout`);
+});
+
 test("a killed command that does not take the index lock never removes one", async () => {
   const dir = await tempDir();
   await initRepo(dir);

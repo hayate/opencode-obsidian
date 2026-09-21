@@ -136,7 +136,11 @@ async function exists(path: string): Promise<boolean> {
 }
 
 async function indexLockPath(opts: GitOptions): Promise<string | null> {
-  const r = await runOnce(["rev-parse", "--path-format=absolute", "--git-path", "index.lock"], { cwd: opts.cwd, env: opts.env });
+  const r = await runOnce(["rev-parse", "--path-format=absolute", "--git-path", "index.lock"], {
+    cwd: opts.cwd,
+    env: opts.env,
+    timeoutMs: opts.timeoutMs,
+  });
   return r.code === 0 && !r.timedOut ? r.stdout.trim() : null;
 }
 
