@@ -216,6 +216,20 @@ test("a synced .gitattributes marking notes -diff cannot hide a secret from the 
   assert.notEqual((await git(["cat-file", "-e", "main:x/notes/creds.md"], { cwd: remote })).code, 0);
 });
 
+test("a pre-commit hook cannot add unscanned content to the snapshot commit", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  // What an auto-formatting hook does (lint-staged style): change and re-add after the scan.
+  const hook = join(a.projects, ".git", "hooks", "pre-commit");
+  await writeFile(hook, `#!/bin/sh\nprintf 'token %s\\n' '${TOKEN}' > x/notes/hooked.md\ngit add x/notes/hooked.md\n`);
+  await chmod(hook, 0o755);
+  await writeRel(a.projects, "x/notes/n.md", "n\n");
+  const r = await cycle(remote, a);
+  assert.ok(r.pushed, r.reason ?? "");
+  assert.equal(await remoteFile(remote, "x/notes/n.md"), "n");
+  assert.notEqual((await git(["cat-file", "-e", "main:x/notes/hooked.md"], { cwd: remote })).code, 0);
+});
+
 test("a held-back file the remote also changed blocks the whole live update", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];

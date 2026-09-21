@@ -129,7 +129,9 @@ async function commitAndPushNew(projectsDir: string, timezone: string, message: 
     const files = [...hits.keys()].sort();
     return `secret-shaped content in ${files.join(", ")}: redact or move them out of Projects/ and start a new session`;
   }
-  await gitOk([...NO_SIGN, "commit", "-q", "-m", message], { cwd: projectsDir });
+  // --no-verify: a pre-commit hook (from a global core.hooksPath, or copied in by
+  // init.templateDir) could stage content after the scan above, pushed unscanned.
+  await gitOk([...NO_SIGN, "commit", "-q", "--no-verify", "-m", message], { cwd: projectsDir });
   // HEAD, never a literal branch name: the local default decides (spec 5.2).
   const push = await git(["push", "-q", "-u", "origin", "HEAD"], { cwd: projectsDir, timeoutMs: NETWORK_TIMEOUT_MS });
   if (push.code !== 0) return `bootstrap push failed: ${push.stderr.trim() || "timed out"}`;

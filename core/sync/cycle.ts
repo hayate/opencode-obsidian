@@ -233,7 +233,9 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
   for (const file of staged) before.set(file, await stampOf(join(dir, file)));
   const projects = [...new Set(staged.map((f) => f.split("/")[0]))].sort();
   const message = `sync(${input.machine}): ${staged.length} file${staged.length === 1 ? "" : "s"} [${projects.join(", ")}]`;
-  await gitOk([...NO_SIGN, "commit", "-q", "-m", message], { cwd: dir });
+  // --no-verify: a pre-commit hook (a formatter that re-adds, lint-staged) would
+  // otherwise stage content after the scan above, and it would be pushed unscanned.
+  await gitOk([...NO_SIGN, "commit", "-q", "--no-verify", "-m", message], { cwd: dir });
   result.committed = await rev(dir, "HEAD");
   return { ok: true, pushAllowed: (await changedSince(dir, before)).length === 0 };
 }

@@ -333,6 +333,30 @@ test("no status echoes the credentials in a remote URL", async () => {
   }
 });
 
+test("a global pre-commit hook cannot add unscanned content to the import commit", async () => {
+  const v = await vault();
+  await writeRel(v.projectsDir, "x/ok.md", "just notes\n");
+  const remote = await bareRemote();
+  const hooks = await tempDir("sro-hooks-");
+  await writeFile(join(hooks, "pre-commit"), `#!/bin/sh\nprintf 'token %s\\n' '${j("gh", "p_", noise(36))}' > hooked.md\ngit add hooked.md\n`);
+  await chmod(join(hooks, "pre-commit"), 0o755);
+  // The import runs git init itself, so the hook comes from a global core.hooksPath.
+  const withHooks = join(await tempDir(), "gitconfig");
+  await writeFile(
+    withHooks,
+    "[user]\n\tname = Test\n\temail = test@example.com\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n" +
+      `[core]\n\thooksPath = ${hooks}\n`,
+  );
+  process.env.GIT_CONFIG_GLOBAL = withHooks;
+  try {
+    assertKind(await prepareProjects(v, { remote }, TZ), "ready");
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = GIT_CONFIG;
+  }
+  assert.match(await gitOk(["ls-tree", "-r", "--name-only", "main"], { cwd: remote }), /x\/ok\.md/);
+  assert.notEqual((await git(["cat-file", "-e", "main:hooked.md"], { cwd: remote })).code, 0);
+});
+
 test("a detached HEAD and an in-progress rebase each stop", async () => {
   const v = await vault();
   const remote = await seededRemote();
