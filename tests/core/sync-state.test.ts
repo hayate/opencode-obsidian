@@ -353,6 +353,42 @@ test("ensureGitignore appends only the missing patterns, once", async () => {
   assert.equal((await git(["check-ignore", "-q", "kabin-api/remember/handoffs/a.md"], { cwd: dir })).code, 1);
 });
 
+test("ensureGitignore rejects a .gitignore it cannot read instead of rewriting it", async () => {
+  const dir = await tempDir();
+  // A directory at the path fails the read with EISDIR, as root too.
+  await mkdir(join(dir, ".gitignore", "inside"), { recursive: true });
+  await assert.rejects(ensureGitignore(dir), /EISDIR/);
+  assert.deepEqual(await readdir(join(dir, ".gitignore")), ["inside"]);
+  assert.deepEqual((await readdir(dir)).filter((n) => n.endsWith(".sro-tmp")), []);
+});
+
+test("ensureGitignore never replaces an unreadable .gitignore with only the plugin's lines", { skip: AS_ROOT }, async () => {
+  const dir = await tempDir();
+  const path = join(dir, ".gitignore");
+  await writeFile(path, "private-notes/\n");
+  await chmod(path, 0o000);
+  try {
+    await assert.rejects(ensureGitignore(dir), /EACCES/);
+  } finally {
+    await chmod(path, 0o644);
+  }
+  assert.equal(await readFile(path, "utf8"), "private-notes/\n");
+});
+
+test("an unreadable folder in Projects/ is an error, never read as empty", { skip: AS_ROOT }, async () => {
+  const v = await vault();
+  await writeRel(v.projectsDir, "p/sub/note.md", "note\n");
+  const sub = join(v.projectsDir, "p", "sub");
+  await chmod(sub, 0o000);
+  try {
+    await assert.rejects(prepareProjects(v, { remote: await bareRemote() }, TZ), /EACCES/);
+  } finally {
+    await chmod(sub, 0o755);
+  }
+  assert.equal(await readFile(join(sub, "note.md"), "utf8"), "note\n");
+  await assert.rejects(stat(join(v.projectsDir, ".git")));
+});
+
 test("the emptiness check never follows a symlink, so bootstrap cannot delete outside Projects/", async () => {
   const v = await vault();
   await mkdir(v.projectsDir);

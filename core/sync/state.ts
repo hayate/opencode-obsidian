@@ -45,15 +45,24 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+function isMissing(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+// A directory's entries; a missing directory has none. Any other failure (EACCES,
+// ENOTDIR) is an error: a folder that cannot be listed is not an empty one.
+async function entries(dir: string): Promise<string[]> {
+  try {
+    return await readdir(dir);
+  } catch (err) {
+    if (isMissing(err)) return [];
+    throw err;
+  }
+}
+
 // Absent, or holding only Finder litter and empty directories, counts as empty.
 async function isEffectivelyEmpty(dir: string): Promise<boolean> {
-  let names: string[];
-  try {
-    names = await readdir(dir);
-  } catch {
-    return true;
-  }
-  for (const name of names) {
+  for (const name of await entries(dir)) {
     if (name === ".DS_Store") continue;
     const path = join(dir, name);
     // lstat: a symlink is content, never a directory to walk (or clean) through.
@@ -64,7 +73,7 @@ async function isEffectivelyEmpty(dir: string): Promise<boolean> {
 }
 
 async function clearLitter(dir: string): Promise<void> {
-  for (const name of await readdir(dir).catch(() => [] as string[])) {
+  for (const name of await entries(dir)) {
     const path = join(dir, name);
     if (name === ".DS_Store") await rm(path, { force: true });
     else {
@@ -83,7 +92,16 @@ export async function identityProblem(repo: string): Promise<string | null> {
 
 export async function ensureGitignore(projectsDir: string): Promise<boolean> {
   const path = join(projectsDir, ".gitignore");
-  const current = await readFile(path, "utf8").catch(() => "");
+  // Only a missing file is an empty one: the rewrite below replaces the whole
+  // file, so reading any other failure as "" would replace the user's .gitignore
+  // with the plugin's lines alone, and the next snapshot would push that.
+  let current: string;
+  try {
+    current = await readFile(path, "utf8");
+  } catch (err) {
+    if (!isMissing(err)) throw err;
+    current = "";
+  }
   const have = new Set(current.split("\n").map((l) => l.trim()));
   const missing = REQUIRED_IGNORES.filter((p) => !have.has(p));
   if (!missing.length) return false;
