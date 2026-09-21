@@ -286,6 +286,20 @@ test("a clone killed mid-way, as the network timeout kills it, leaves Projects/ 
   assert.deepEqual(await tempClones(v.root), []);
 });
 
+test("a leftover temp clone from a crashed process is swept before a new clone; other files in the vault root are untouched", async () => {
+  const v = await vault();
+  const remote = await seededRemote();
+  const leftover = join(v.root, ".Projects.deadbeef.sro-tmp");
+  await mkdir(leftover, { recursive: true });
+  await writeFile(join(leftover, "stale-clone-file"), "stale");
+  const unrelated = join(v.root, "keep-me.txt");
+  await writeFile(unrelated, "keep");
+  const state = await prepareProjects(v, { remote }, TZ);
+  assertKind(state, "ready");
+  await assert.rejects(stat(leftover), "the leftover temp clone must be swept");
+  assert.equal(await readFile(unrelated, "utf8"), "keep");
+});
+
 test("a Projects/ repository with no commit (an older failure's leftover) stops and says what to do", async () => {
   const remote = await seededRemote();
   const leftovers: Array<[string, (dir: string) => Promise<void>]> = [

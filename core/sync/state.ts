@@ -172,7 +172,19 @@ async function firstPush(projectsDir: string, remote: string, steps: () => Promi
 // clone, or one killed at its timeout (a killed git cleans nothing up), never
 // leaves a half-made Projects/.git. Returns whether the remote had a commit to
 // check out, or why it stopped.
+// A crash mid-clone (a kill -9, a lost session) leaves its temporary sibling
+// behind: the finally block below never runs. Only names matching exactly the
+// pattern this function creates are ever removed here.
+async function sweepLeftoverClones(root: string, projectsDir: string): Promise<void> {
+  const prefix = basename(projectsDir).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`^\\.${prefix}\\.[0-9a-f]+\\.sro-tmp$`);
+  for (const name of await entries(root)) {
+    if (pattern.test(name)) await rm(join(root, name), { recursive: true, force: true });
+  }
+}
+
 async function cloneIntoPlace(root: string, projectsDir: string, remote: string): Promise<{ populated: boolean } | string> {
+  await sweepLeftoverClones(root, projectsDir);
   const tmp = join(root, `.${basename(projectsDir)}.${randomBytes(4).toString("hex")}.sro-tmp`);
   try {
     const clone = await git(["clone", "-q", remote, tmp], { cwd: root, timeoutMs: NETWORK_TIMEOUT_MS });
