@@ -144,6 +144,20 @@ test("a held-back file stays dirty and does not block unrelated remote changes",
   await assert.rejects(remoteFile(remote, "x/notes/creds.md"));
 });
 
+test("a secret is held back even when the user's git config changes diff prefixes", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  // diff.mnemonicPrefix is a widely recommended setting; it changes +++ headers
+  // from "b/x/..." to "i/x/..." (the staged/index side), which the scan must
+  // see through regardless, since it never controls the user's git config.
+  await gitOk(["config", "diff.mnemonicPrefix", "true"], { cwd: a.projects });
+  await writeRel(a.projects, "x/notes/creds.md", `token ${TOKEN}\n`);
+  const r = await cycle(remote, a);
+  assert.deepEqual(r.heldBack, [{ file: "x/notes/creds.md", rules: ["github-token"] }]);
+  // cat-file, not show: it never falls back to interpreting the path as a pathspec.
+  assert.notEqual((await git(["cat-file", "-e", "main:x/notes/creds.md"], { cwd: remote })).code, 0);
+});
+
 test("a held-back file the remote also changed blocks the whole live update", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
@@ -207,6 +221,39 @@ test("a partly-upstream snapshot is never replayed after a refused live update",
   const second = await cycle(remote, b);
   assert.notEqual(second.outcome, "paused", second.reason ?? "");
   assert.equal(await remoteFile(remote, "x/r.md"), "r2");
+});
+
+test("last-integrated is set as soon as the push lands, so a step-5 failure never replays an already-pushed snapshot", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+
+  // A pushes first, so B's push below needs its own rebase: the commit that
+  // lands upstream differs from B's live HEAD. That is exactly the case
+  // spec 5.3's last-integrated ref exists for.
+  await writeRel(a.projects, "x/other.md", "a0\n");
+  await cycle(remote, a);
+
+  await writeRel(b.projects, "x/shared.md", "b1\n");
+  const blockedAt = await gitOk(["rev-parse", "HEAD"], { cwd: b.projects });
+  // A ref cannot be both a file and a directory: this makes step 5's fetch into
+  // refs/sro/integrated fail in B's live repo, simulating the process dying (or
+  // the lock being lost) between the push landing and the reset --keep.
+  await gitOk(["update-ref", "refs/sro/integrated/block", blockedAt], { cwd: b.projects });
+
+  const first = await cycle(remote, b);
+  assert.equal(first.outcome, "aborted", first.reason ?? "");
+  assert.equal(await gitOk(["rev-parse", LAST_INTEGRATED], { cwd: b.projects }), first.committed);
+  assert.equal(await remoteFile(remote, "x/shared.md"), "b1"); // already upstream before the failure
+
+  await gitOk(["update-ref", "-d", "refs/sro/integrated/block"], { cwd: b.projects });
+
+  await cycle(remote, a); // A receives B's already-pushed change
+  await writeRel(a.projects, "x/shared.md", "a1\n"); // the same file, evolved further
+  await cycle(remote, a);
+
+  const second = await cycle(remote, b);
+  assert.notEqual(second.outcome, "paused", second.reason ?? "");
+  assert.equal(await remoteFile(remote, "x/shared.md"), "a1");
 });
 
 test("a rejected push is retried after integrating again", async () => {

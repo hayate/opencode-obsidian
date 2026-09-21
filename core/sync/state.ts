@@ -106,8 +106,21 @@ async function commitAndPushNew(projectsDir: string, timezone: string, message: 
   await gitOk(["add", "-A"], { cwd: projectsDir });
   // Spec 7.5: every staged diff is scanned before commit. At bootstrap there is
   // no later cycle to hold a hit back in, so any hit stops the whole import.
+  // --src-prefix/--dst-prefix pin the +++ header to git's own "b/" prefix, whatever
+  // the user's diff.mnemonicPrefix / diff.noprefix / diff.dstPrefix config says;
+  // scanDiff only strips a leading "b/".
   const diff = await gitOk(
-    ["-c", "core.quotePath=false", "diff", "--cached", "--no-color", "--no-ext-diff", "-U0"],
+    [
+      "-c",
+      "core.quotePath=false",
+      "diff",
+      "--cached",
+      "--no-color",
+      "--no-ext-diff",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      "-U0",
+    ],
     { cwd: projectsDir },
   );
   const hits = scanDiff(diff);

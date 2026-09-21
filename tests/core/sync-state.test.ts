@@ -171,6 +171,33 @@ test("an import whose notes hold a credential-shaped string stops before anythin
   assert.match(files, /x\/creds\.md/);
 });
 
+test("the bootstrap scan names the real path even when the global git config sets diff.mnemonicPrefix", async () => {
+  const v = await vault();
+  const token = j("gh", "p_", noise(36));
+  await writeRel(v.projectsDir, "x/creds.md", `token: ${token}\n`);
+  const remote = await bareRemote();
+
+  // The import runs `git init` itself, so a repo-local setting cannot be
+  // placed in advance: the global config is swapped instead, as the missing
+  // identity test above does, and restored in a finally.
+  const mnemonicConfig = join(await tempDir(), "gitconfig");
+  await writeFile(
+    mnemonicConfig,
+    "[user]\n\tname = Test\n\temail = test@example.com\n" +
+      "[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n[diff]\n\tmnemonicPrefix = true\n",
+  );
+  process.env.GIT_CONFIG_GLOBAL = mnemonicConfig;
+  try {
+    const stopped = await prepareProjects(v, { remote }, TZ);
+    assertKind(stopped, "stopped");
+    const reason = stopped.kind === "stopped" ? stopped.reason : "";
+    assert.match(reason, /x\/creds\.md/);
+    assert.doesNotMatch(reason, /i\/x\/creds\.md/);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = GIT_CONFIG;
+  }
+});
+
 test("a detached HEAD and an in-progress rebase each stop", async () => {
   const v = await vault();
   const remote = await seededRemote();

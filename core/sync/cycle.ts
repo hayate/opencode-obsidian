@@ -202,10 +202,36 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
   // otherwise restore the gitlink an older client committed.
   result.embedded = await dropEmbeddedRepos(dir);
 
-  const diff = await gitOk(["-c", "core.quotePath=false", "diff", "--cached", "--no-color", "--no-ext-diff", "-U0"], { cwd: dir });
+  // --src-prefix/--dst-prefix pin the +++ header to git's own "b/" prefix, whatever
+  // the user's diff.mnemonicPrefix / diff.noprefix / diff.dstPrefix config says:
+  // scanDiff only strips a leading "b/", and a header it cannot parse correctly
+  // means the later unstage matches nothing, so the secret stays staged.
+  const diffArgs = [
+    "-c",
+    "core.quotePath=false",
+    "diff",
+    "--cached",
+    "--no-color",
+    "--no-ext-diff",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "-U0",
+  ];
+  const diff = await gitOk(diffArgs, { cwd: dir });
   for (const [file, hits] of scanDiff(diff)) {
     await unstage(dir, file);
     result.heldBack.push({ file, rules: [...new Set(hits.map((h) => h.rule))] });
+  }
+
+  // Defense in depth: nothing with a hit is ever committed, even if the unstage
+  // above somehow left a hit staged. A guard by construction now that the prefixes
+  // above are pinned; this should never trigger.
+  const stillDirty = scanDiff(await gitOk(diffArgs, { cwd: dir }));
+  if (stillDirty.size) {
+    await gitOk(["reset", "-q"], { cwd: dir });
+    result.outcome = "aborted";
+    result.reason = `the secret scan could not hold back ${[...stillDirty.keys()].sort().join(", ")}: nothing was committed`;
+    return { ok: false, pushAllowed: false };
   }
 
   const staged = await stagedFiles(dir);
@@ -349,6 +375,12 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
         return result;
       }
     }
+
+    // Spec 5.4 step 4: our snapshot is confirmed upstream now (pushed, or already
+    // there), so record it before the step-5 lock check. If step 5 never finishes
+    // (the lock lost here, the fetch/reset below failing, or the process exiting),
+    // the next cycle must not replay a snapshot that is already on the remote.
+    await gitOk(["update-ref", LAST_INTEGRATED, live], { cwd: dir });
 
     if (!(await stillHeld())) return result;
     await gitOk(["update-ref", INTEGRATED, next], { cwd: clone });
