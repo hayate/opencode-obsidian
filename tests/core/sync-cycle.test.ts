@@ -456,6 +456,14 @@ test("an unreachable remote keeps the commit local and reports it; the next cycl
   const first = await cycle(remote, a);
   assert.equal(first.outcome, "unsynced");
   assert.ok(first.committed);
+  // git's own fetch failure here is several lines, including a blank one: the
+  // reason must be a single status line, capped like the push and rebase
+  // failure reasons, never the raw multi-line stderr.
+  const reason = first.reason ?? "";
+  assert.match(reason, /^fetch failed: /, reason);
+  assert.doesNotMatch(reason, /\n/, reason);
+  assert.match(reason, /does not appear to be a git repository/, reason);
+  assert.doesNotMatch(reason, /and the repository exists\./, "capped to the first 3 non-blank lines");
   await rename(`${remote}.away`, remote);
   const second = await cycle(remote, a);
   assert.ok(second.pushed);

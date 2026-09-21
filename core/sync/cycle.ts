@@ -293,7 +293,10 @@ async function integrate(clone: string, input: CycleInput, live: string, last: s
     cwd: clone,
     timeoutMs: NETWORK_TIMEOUT_MS,
   });
-  if (fetched.code !== 0) return { kind: "unsynced", reason: fetched.stderr.trim() || "fetch timed out" };
+  if (fetched.code !== 0) {
+    const detail = firstLines(fetched.stderr) || (fetched.timedOut ? "timed out" : `git exited ${fetched.code}`);
+    return { kind: "unsynced", reason: `fetch failed: ${detail}` };
+  }
   const upstream = `refs/remotes/origin/${b}`;
   const upstreamSha = await rev(clone, upstream);
   if (upstreamSha === null) return { kind: "unsynced", reason: `remote has no branch ${b}` };
