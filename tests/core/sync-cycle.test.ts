@@ -767,7 +767,7 @@ test("a lock file a killed command left in the state clone is rebuilt away", asy
   const [a] = m as [Machine];
   await writeRel(a.projects, "x/first.md", "1\n");
   await cycle(remote, a);
-  for (const leftover of ["index.lock", "HEAD.lock", "config.lock", "refs/remotes/origin/main.lock"]) {
+  for (const leftover of ["index.lock", "HEAD.lock", "config.lock", "refs/remotes/live/main.lock"]) {
     await writeRel(join(a.state, "sync", ".git"), leftover, "");
     const note = `x/${leftover.replaceAll("/", "-")}.md`;
     await writeRel(a.projects, note, "n\n");
