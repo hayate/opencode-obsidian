@@ -163,6 +163,14 @@ async function checkRepo(projectsDir: string, remote: string): Promise<SyncState
   }
   const unmerged = await gitOk(["diff", "--name-only", "--diff-filter=U"], { cwd: projectsDir });
   if (unmerged) return { kind: "stopped", reason: `Projects/ has unmerged files: ${unmerged.split("\n").join(", ")}` };
+  // Every repository that comes out ready gets the required ignores, not only
+  // one this call bootstrapped or imported: an existing Projects/ (Andrea's
+  // real vault: already a repo, never ran commitAndPushNew) and a fresh clone
+  // of an already-populated remote (a plugin session may be the first to ever
+  // clone that remote's history) both skip commitAndPushNew, so neither would
+  // otherwise ever gain them. The write itself is committed by the next
+  // snapshot like any other file.
+  await ensureGitignore(projectsDir);
   return { kind: "ready", branch: branch.stdout.trim(), bootstrapped: false };
 }
 
@@ -185,16 +193,7 @@ export async function prepareProjects(vault: Vault, cfg: SyncConfig, timezone: s
     };
   }
 
-  if (isRepo) {
-    // A repository this call did not just bootstrap or import (Andrea's real
-    // vault: already a repo, never ran commitAndPushNew) never gets the
-    // required ignores otherwise. Only on the way out ready: a stopped state
-    // touches nothing. The write itself is committed by the next snapshot
-    // like any other file.
-    const state = await checkRepo(dir, cfg.remote);
-    if (state.kind === "ready") await ensureGitignore(dir);
-    return state;
-  }
+  if (isRepo) return checkRepo(dir, cfg.remote);
 
   if (await isEffectivelyEmpty(dir)) {
     await clearLitter(dir);

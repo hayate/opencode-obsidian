@@ -211,6 +211,15 @@ test("a detached HEAD and an in-progress rebase each stop", async () => {
   assert.match(rebasing.kind === "stopped" ? rebasing.reason : "", /rebase-merge/);
 });
 
+test("a fresh clone of a remote without .gitignore gets the required ignore lines", async () => {
+  const v = await vault();
+  const remote = await seededRemote(); // populated, never carried a .gitignore
+  const state = await prepareProjects(v, { remote }, TZ);
+  assertKind(state, "ready");
+  const ignore = await readFile(join(v.projectsDir, ".gitignore"), "utf8");
+  for (const p of REQUIRED_IGNORES) assert.ok(ignore.includes(p), p);
+});
+
 test("an existing Projects/ repository gets the required ignore lines", async () => {
   const v = await vault();
   const remote = await seededRemote();

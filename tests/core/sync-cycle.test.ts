@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { changedSince, LAST_INTEGRATED, runCycle, type CycleResult } from "../../core/sync/cycle.ts";
-import { prepareProjects } from "../../core/sync/state.ts";
+import { prepareProjects, REQUIRED_IGNORES } from "../../core/sync/state.ts";
 import { acquireLock } from "../../core/lock.ts";
 import { git, gitOk } from "../../core/git.ts";
 import { GIT_CONFIG, commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
@@ -11,6 +11,10 @@ import { GIT_CONFIG, commitFile, initRepo, tempDir, writeRel } from "./helpers.t
 const TZ = "Asia/Tokyo";
 const j = (...parts: string[]): string => parts.join("");
 const TOKEN = j("gh", "p_", "Qm7Zr2Kx9Lp4Tw8Vb3Nc6Hd1Fg5Js0YtQm7Z");
+// A remote a plugin-bootstrapped repository would have: the required ignores
+// already committed, so a fresh clone never has to write and commit its own
+// before the first cycle can run.
+const SEEDED_GITIGNORE = `${REQUIRED_IGNORES.join("\n")}\n`;
 
 interface Machine {
   name: string;
@@ -23,6 +27,7 @@ async function setup(names: string[]): Promise<{ remote: string; m: Machine[] }>
   await gitOk(["init", "-q", "--bare", "-b", "main", remote], { cwd: await tempDir() });
   const seed = join(await tempDir(), "seed");
   await gitOk(["clone", "-q", remote, seed], { cwd: await tempDir() });
+  await commitFile(seed, ".gitignore", SEEDED_GITIGNORE, "seed gitignore");
   await commitFile(seed, "x/HANDOFF.md", "base\n", "seed");
   await commitFile(seed, "x/plans/old.md", "plan\n", "seed plan");
   await commitFile(seed, "x/t.md", "t0\n", "seed t");
@@ -47,13 +52,18 @@ async function machineFor(remote: string): Promise<Machine> {
   return x;
 }
 
-// A remote whose tree only a case-sensitive machine could have committed.
+// A remote whose tree only a case-sensitive machine could have committed. It
+// always carries the required ignores, like any remote a plugin bootstrapped:
+// otherwise the fresh clone below would have to write and commit its own
+// before the first cycle, forcing the checkout+rebase path in the state clone
+// (a known wedge on a case-colliding tree; see the two tests below).
 async function remoteWithTree(files: Record<string, string>): Promise<string> {
   const remote = join(await tempDir("sro-remote-"), "projects.git");
   await gitOk(["init", "-q", "--bare", "-b", "main", remote], { cwd: await tempDir() });
+  const withGitignore = { ".gitignore": SEEDED_GITIGNORE, ...files };
   const build = async (prefix: string): Promise<string> => {
     const entries = new Map<string, string>();
-    for (const [path, content] of Object.entries(files)) {
+    for (const [path, content] of Object.entries(withGitignore)) {
       if (!path.startsWith(prefix)) continue;
       const [name = "", ...rest] = path.slice(prefix.length).split("/");
       if (rest.length) entries.set(name, `040000 tree ${await build(`${prefix}${name}/`)}`);
@@ -393,6 +403,7 @@ test("a gitlink an old client committed is removed even while its repository was
   await gitOk(["init", "-q", "--bare", "-b", "main", remote], { cwd: await tempDir() });
   const seed = join(await tempDir(), "seed");
   await gitOk(["clone", "-q", remote, seed], { cwd: await tempDir() });
+  await commitFile(seed, ".gitignore", SEEDED_GITIGNORE, "seed gitignore");
   await initRepo(join(seed, "x", "nested"));
   await commitFile(join(seed, "x", "nested"), "inside.md", "seeded\n", "nested seed");
   await gitOk(["add", "x/nested"], { cwd: seed });
@@ -466,7 +477,7 @@ test("tracked files differing only by case are never inferred as a rename, and a
   const r = await cycle(remote, a);
   assert.equal(r.outcome, "synced", r.reason ?? "");
   assert.deepEqual(r.caseCollisions, insensitive ? ["x/Note.md", "x/note.md"] : []);
-  assert.deepEqual(await remoteNames(remote), ["x/Note.md", "x/note.md"]);
+  assert.deepEqual(await remoteNames(remote), [".gitignore", "x/Note.md", "x/note.md"]);
   assert.equal(await remoteFile(remote, "x/Note.md"), "upper");
   assert.equal(await remoteFile(remote, "x/note.md"), "lower");
 });
@@ -476,7 +487,7 @@ test("tracked directories differing only by case are never merged into one spell
   const a = await machineFor(remote);
   const r = await cycle(remote, a);
   assert.equal(r.outcome, "synced", r.reason ?? "");
-  assert.deepEqual(await remoteNames(remote), ["x/Dir/a.md", "x/dir/b.md"]);
+  assert.deepEqual(await remoteNames(remote), [".gitignore", "x/Dir/a.md", "x/dir/b.md"]);
 });
 
 test("a case-only rename reaches the remote (case-insensitive filesystems included)", async () => {
