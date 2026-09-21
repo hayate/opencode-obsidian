@@ -282,6 +282,29 @@ test("a path changing during the snapshot suppresses the push; the next cycle pu
   assert.ok(log.split("\n").includes(first.committed), "the intermediate commit was pushed too");
 });
 
+test("a note whose mtime is far in the future (a clock corrected backwards) is snapshotted, never deferred forever", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  await writeRel(a.projects, "x/notes/future.md", "written under a wrong clock\n");
+  const future = new Date(Date.now() + 3 * 365 * 24 * 3600 * 1000);
+  await utimes(join(a.projects, "x/notes/future.md"), future, future);
+  const r = await cycle(remote, a, 2000);
+  assert.deepEqual(r.deferred, []);
+  assert.ok(r.committed && r.pushed, r.reason ?? "");
+  assert.equal(await remoteFile(remote, "x/notes/future.md"), "written under a wrong clock");
+});
+
+test("an mtime just ahead of the clock, as a fresh write's usually is, is still inside the quiet period", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  await writeRel(a.projects, "x/notes/fresh.md", "fresh\n");
+  const ahead = new Date(Date.now() + 500);
+  await utimes(join(a.projects, "x/notes/fresh.md"), ahead, ahead);
+  const r = await cycle(remote, a, 2000);
+  assert.deepEqual(r.deferred, ["x/notes/fresh.md"]);
+  assert.equal(r.committed, null);
+});
+
 test("changedSince reports size, mtime, creation and deletion changes", async () => {
   const dir = await tempDir();
   await writeRel(dir, "a.md", "one");

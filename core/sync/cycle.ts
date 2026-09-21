@@ -190,10 +190,16 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
   await gitOk(["add", "-A"], { cwd: dir });
   result.caseCollisions = await stageCaseRenames(dir);
 
-  const now = Date.now();
+  // Deferred while its mtime is within the quiet period of now, on either side. A
+  // fresh write's sub-millisecond mtime is usually just ahead of Date.now()'s whole
+  // milliseconds, and the clock is read after each stat so a write during this
+  // pass is never far "ahead". An mtime further in the future (the clock was
+  // corrected backwards) is quiet: deferring it would defer the file every cycle,
+  // silently, for as long as the skew lasts.
+  const quietMs = input.quietMs ?? 2000;
   for (const file of await stagedFiles(dir)) {
     const s = await stampOf(join(dir, file));
-    if (s && now - s.mtimeMs < (input.quietMs ?? 2000)) {
+    if (s && Math.abs(Date.now() - s.mtimeMs) < quietMs) {
       await unstage(dir, file); // may still be being written; next cycle
       result.deferred.push(file);
     }
