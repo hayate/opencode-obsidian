@@ -19,28 +19,32 @@ base=$2
 head=$3
 [ -f "$plan" ] || { echo "no such plan file: $plan" >&2; exit 2; }
 
-git rev-parse --verify --quiet "$base" >/dev/null || { echo "bad BASE: $base" >&2; exit 2; }
-git rev-parse --verify --quiet "$head" >/dev/null || { echo "bad HEAD: $head" >&2; exit 2; }
+root="${SDD_REPO_ROOT:-$(git rev-parse --show-toplevel)}"
+[ -n "$root" ] && [ -d "$root/.git" ] \
+  || { echo "cannot resolve the code repo: set SDD_REPO_ROOT to the code repo, or run from inside it" >&2; exit 2; }
+
+git -C "$root" rev-parse --verify --quiet "$base" >/dev/null || { echo "bad BASE: $base" >&2; exit 2; }
+git -C "$root" rev-parse --verify --quiet "$head" >/dev/null || { echo "bad HEAD: $head" >&2; exit 2; }
 
 if [ $# -eq 4 ]; then
   out=$4
 else
   dir=$("$(cd "$(dirname "$0")" && pwd)/sdd-workspace" "$plan")
-  out="$dir/review-$(git rev-parse --short "$base")..$(git rev-parse --short "$head").diff"
+  out="$dir/review-$(git -C "$root" rev-parse --short "$base")..$(git -C "$root" rev-parse --short "$head").diff"
 fi
 
 {
   echo "# Review package: ${base}..${head}"
   echo
   echo "## Commits"
-  git log --oneline "${base}..${head}"
+  git -C "$root" log --oneline "${base}..${head}"
   echo
   echo "## Files changed"
-  git diff --stat "${base}..${head}"
+  git -C "$root" diff --stat "${base}..${head}"
   echo
   echo "## Diff"
-  git diff -U10 "${base}..${head}"
+  git -C "$root" diff -U10 "${base}..${head}"
 } > "$out"
 
-commits=$(git rev-list --count "${base}..${head}")
+commits=$(git -C "$root" rev-list --count "${base}..${head}")
 echo "wrote ${out}: ${commits} commit(s), $(wc -c < "$out" | tr -d ' ') bytes"

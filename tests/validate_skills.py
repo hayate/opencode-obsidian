@@ -82,10 +82,21 @@ def main():
             errors.append(f"duplicate skill name '{n}' ({c}x)")
 
     cross_ref_re = re.compile(r"superpowers:([a-z0-9-]+)")
+    banned = [
+        "visual-companion",
+        "using-superpowers/references",
+        "brainstorming/scripts",
+        "start-server",
+        "stop-server",
+        "server.cjs",
+    ]
     for path in walk_text_files():
         text = open(path, encoding="utf-8", errors="ignore").read()
         if "docs/superpowers" in text:
             errors.append(f"{path}: leftover docs/superpowers reference")
+        for b in banned:
+            if b in text:
+                errors.append(f"{path}: reference to dropped path '{b}'")
         for ref in cross_ref_re.findall(text):
             if ref not in names:
                 errors.append(
