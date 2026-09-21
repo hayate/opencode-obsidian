@@ -1,0 +1,377 @@
+// Spec 5.3-5.4: one sync cycle. The live repo (Projects/) only ever gets a
+// snapshot commit (changes no file) and a `reset --keep` (all-or-nothing). All
+// fetch/rebase/push happens in a private state clone nobody else touches, so a
+// conflict or a half-applied rebase is never visible in the vault.
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
+import { acquireLock } from "../lock.ts";
+import { scanDiff } from "../secrets.ts";
+import { identityProblem } from "./state.ts";
+
+export interface CycleInput {
+  projectsDir: string;
+  remote: string;
+  branch: string;
+  stateDir: string;
+  machine: string;
+  quietMs?: number;
+  lockWaitMs?: number;
+}
+
+export interface CycleResult {
+  outcome: "synced" | "busy" | "aborted" | "paused" | "unsynced";
+  reason: string | null;
+  committed: string | null;
+  heldBack: Array<{ file: string; rules: string[] }>;
+  deferred: string[];
+  pushed: boolean;
+  liveUpdated: boolean;
+  blockedBy: string[];
+  blockedCycles: number;
+  conflicts: string[];
+  embedded: string[];
+  caseCollisions: string[];
+}
+
+export const LAST_INTEGRATED = "refs/sro/last-integrated";
+const INTEGRATED = "refs/sro/integrated";
+const NO_SIGN = ["-c", "commit.gpgsign=false"];
+const MAX_PUSH_ATTEMPTS = 3;
+
+type Stamp = { size: number; mtimeMs: number } | null;
+
+async function stampOf(path: string): Promise<Stamp> {
+  try {
+    const s = await stat(path);
+    return { size: s.size, mtimeMs: s.mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+// Paths whose size or mtime moved since `before` was taken (spec 5.4 step 2).
+export async function changedSince(root: string, before: Map<string, Stamp>): Promise<string[]> {
+  const changed: string[] = [];
+  for (const [file, then] of before) {
+    const now = await stampOf(join(root, file));
+    if (then === null ? now !== null : now === null || now.size !== then.size || now.mtimeMs !== then.mtimeMs) {
+      changed.push(file);
+    }
+  }
+  return changed;
+}
+
+// Raw stdout, never gitOk's trimmed form: a -z listing's last name may end in a space.
+async function zList(cwd: string, args: string[]): Promise<string[]> {
+  const r = await git(["-c", "core.quotePath=false", ...args, "-z"], { cwd });
+  if (r.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim()}`);
+  return r.stdout.split("\0").filter(Boolean);
+}
+
+async function stagedFiles(cwd: string): Promise<string[]> {
+  return zList(cwd, ["diff", "--cached", "--name-only"]);
+}
+
+const fold = (name: string): string => name.normalize("NFC").toLowerCase();
+
+function prefixes(rel: string): string[] {
+  return rel.split("/").map((_, i, parts) => parts.slice(0, i + 1).join("/"));
+}
+
+// Tracked paths that differ only by case (Note.md and note.md, or Dir/a.md and
+// dir/b.md) share one entry on a case-insensitive filesystem, so no rename can be
+// inferred for them. Whole files that collide are also reported: this machine
+// holds one file for both names.
+function caseAmbiguous(tracked: string[]): { ambiguous: Set<string>; collisions: string[] } {
+  const spellings = new Map<string, Set<string>>();
+  for (const rel of tracked) {
+    for (const prefix of prefixes(rel)) {
+      const key = fold(prefix);
+      spellings.set(key, (spellings.get(key) ?? new Set<string>()).add(prefix));
+    }
+  }
+  const clash = (prefix: string): boolean => (spellings.get(fold(prefix))?.size ?? 0) > 1;
+  return { ambiguous: new Set(tracked.filter((rel) => prefixes(rel).some(clash))), collisions: tracked.filter(clash) };
+}
+
+// rel as spelled on disk, component by component; null when it is gone.
+async function onDisk(dir: string, rel: string, listings: Map<string, string[]>): Promise<string | null> {
+  let actual = "";
+  for (const part of rel.split("/")) {
+    let names = listings.get(actual);
+    if (!names) {
+      names = await readdir(join(dir, actual)).catch(() => [] as string[]);
+      listings.set(actual, names);
+    }
+    const exact = names.some((n) => n.normalize("NFC") === part.normalize("NFC"));
+    const found = exact ? part : names.find((n) => fold(n) === fold(part));
+    if (found === undefined) return null;
+    actual = actual ? `${actual}/${found}` : found;
+  }
+  return actual;
+}
+
+// On a case-insensitive filesystem git does not see Note.md -> note.md or
+// Dir/ -> dir/; stage it. Returns the tracked files that collide by case.
+async function stageCaseRenames(dir: string): Promise<string[]> {
+  if ((await git(["config", "--bool", "core.ignorecase"], { cwd: dir })).stdout.trim() !== "true") return [];
+  const tracked = await zList(dir, ["ls-files"]);
+  const { ambiguous, collisions } = caseAmbiguous(tracked);
+  const listings = new Map<string, string[]>();
+  for (const rel of tracked) {
+    if (ambiguous.has(rel)) continue;
+    const actual = await onDisk(dir, rel, listings);
+    if (actual === null || actual === rel) continue;
+    await gitOk(["rm", "-q", "--cached", "--", literal(rel)], { cwd: dir });
+    await gitOk(["add", "--", literal(actual)], { cwd: dir });
+  }
+  return collisions;
+}
+
+// A git repository cloned inside Projects/ would be committed as an empty gitlink;
+// untrack it and report it instead.
+async function dropEmbeddedRepos(dir: string): Promise<string[]> {
+  const links = (await zList(dir, ["ls-files", "--stage"]))
+    .filter((line) => line.startsWith("160000 "))
+    .map((line) => line.slice(line.indexOf("\t") + 1));
+  // --cached -f: index only (the nested repository stays on disk), and it also drops
+  // a gitlink an older client already committed.
+  for (const path of links) await gitOk(["rm", "-q", "--cached", "-f", "--", literal(path)], { cwd: dir });
+  return links;
+}
+
+// Spec 5.4 step 5 escalates after 3 blocked live updates in a row.
+async function readBlocked(stateDir: string): Promise<number> {
+  return Number(await readFile(join(stateDir, "blocked-cycles"), "utf8").catch(() => "0")) || 0;
+}
+
+async function writeBlocked(stateDir: string, count: number): Promise<void> {
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(join(stateDir, "blocked-cycles"), String(count));
+}
+
+async function unstage(cwd: string, file: string): Promise<void> {
+  await gitOk(["reset", "-q", "--", literal(file)], { cwd });
+}
+
+async function rev(cwd: string, ref: string): Promise<string | null> {
+  const r = await git(["rev-parse", "-q", "--verify", `${ref}^{commit}`], { cwd });
+  return r.code === 0 ? r.stdout.trim() : null;
+}
+
+async function isAncestor(cwd: string, a: string, b: string): Promise<boolean> {
+  return (await git(["merge-base", "--is-ancestor", a, b], { cwd })).code === 0;
+}
+
+async function exists(path: string): Promise<boolean> {
+  return (await stampOf(path)) !== null;
+}
+
+function emptyResult(): CycleResult {
+  return {
+    outcome: "synced",
+    reason: null,
+    committed: null,
+    heldBack: [],
+    deferred: [],
+    pushed: false,
+    liveUpdated: false,
+    blockedBy: [],
+    blockedCycles: 0,
+    conflicts: [],
+    embedded: [],
+    caseCollisions: [],
+  };
+}
+
+async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: boolean; pushAllowed: boolean }> {
+  const dir = input.projectsDir;
+  await gitOk(["add", "-A"], { cwd: dir });
+  result.caseCollisions = await stageCaseRenames(dir);
+
+  const now = Date.now();
+  for (const file of await stagedFiles(dir)) {
+    const s = await stampOf(join(dir, file));
+    if (s && now - s.mtimeMs < (input.quietMs ?? 2000)) {
+      await unstage(dir, file); // may still be being written; next cycle
+      result.deferred.push(file);
+    }
+  }
+  // After the quiet pass: unstaging a freshly written nested repository would
+  // otherwise restore the gitlink an older client committed.
+  result.embedded = await dropEmbeddedRepos(dir);
+
+  const diff = await gitOk(["-c", "core.quotePath=false", "diff", "--cached", "--no-color", "--no-ext-diff", "-U0"], { cwd: dir });
+  for (const [file, hits] of scanDiff(diff)) {
+    await unstage(dir, file);
+    result.heldBack.push({ file, rules: [...new Set(hits.map((h) => h.rule))] });
+  }
+
+  const staged = await stagedFiles(dir);
+  if (!staged.length) return { ok: true, pushAllowed: true };
+
+  const identity = await identityProblem(dir);
+  if (identity) {
+    await gitOk(["reset", "-q"], { cwd: dir });
+    result.outcome = "aborted";
+    result.reason = identity;
+    return { ok: false, pushAllowed: false };
+  }
+
+  const before = new Map<string, Stamp>();
+  for (const file of staged) before.set(file, await stampOf(join(dir, file)));
+  const projects = [...new Set(staged.map((f) => f.split("/")[0]))].sort();
+  const message = `sync(${input.machine}): ${staged.length} file${staged.length === 1 ? "" : "s"} [${projects.join(", ")}]`;
+  await gitOk([...NO_SIGN, "commit", "-q", "-m", message], { cwd: dir });
+  result.committed = await rev(dir, "HEAD");
+  return { ok: true, pushAllowed: (await changedSince(dir, before)).length === 0 };
+}
+
+async function ensureStateClone(input: CycleInput): Promise<string> {
+  const clone = join(input.stateDir, "sync");
+  // The clone is disposable: a crash mid-rebase (either backend) means rebuild it.
+  for (const marker of ["rebase-merge", "rebase-apply"]) {
+    if (await exists(join(clone, ".git", marker))) await rm(clone, { recursive: true, force: true });
+  }
+  if (!(await exists(join(clone, ".git")))) {
+    await rm(clone, { recursive: true, force: true });
+    await mkdir(input.stateDir, { recursive: true });
+    await gitOk(["clone", "-q", "--no-checkout", input.projectsDir, clone], { cwd: input.stateDir });
+    await gitOk(["remote", "rename", "origin", "live"], { cwd: clone });
+    await gitOk(["remote", "add", "origin", input.remote], { cwd: clone });
+  }
+  // Re-pointed every cycle: moving the vault or changing the remote cannot strand it.
+  await gitOk(["remote", "set-url", "live", input.projectsDir], { cwd: clone });
+  await gitOk(["remote", "set-url", "origin", input.remote], { cwd: clone });
+  for (const key of ["user.name", "user.email"]) {
+    await gitOk(["config", key, await gitOk(["config", key], { cwd: input.projectsDir })], { cwd: clone });
+  }
+  return clone;
+}
+
+type Integration =
+  | { kind: "ok"; next: string; needsPush: boolean }
+  | { kind: "conflict"; files: string[] }
+  | { kind: "unreachable"; reason: string };
+
+async function integrate(clone: string, input: CycleInput, live: string, last: string | null): Promise<Integration> {
+  const b = input.branch;
+  await gitOk(["fetch", "-q", "live", `+refs/heads/${b}:refs/remotes/live/${b}`], { cwd: clone });
+  const fetched = await git(["fetch", "-q", "origin", `+refs/heads/${b}:refs/remotes/origin/${b}`], {
+    cwd: clone,
+    timeoutMs: NETWORK_TIMEOUT_MS,
+  });
+  if (fetched.code !== 0) return { kind: "unreachable", reason: fetched.stderr.trim() || "fetch timed out" };
+  const upstream = `refs/remotes/origin/${b}`;
+  const upstreamSha = await rev(clone, upstream);
+  if (upstreamSha === null) return { kind: "unreachable", reason: `remote has no branch ${b}` };
+  if (await isAncestor(clone, live, upstream)) return { kind: "ok", next: upstreamSha, needsPush: false };
+
+  // Replay only what the remote has not seen: commits after last-integrated.
+  const base = last && (await isAncestor(clone, last, live)) ? last : await gitOk(["merge-base", live, upstream], { cwd: clone });
+  await gitOk(["checkout", "-q", "-f", "--detach", live], { cwd: clone });
+  await gitOk(["clean", "-q", "-f", "-d", "-x"], { cwd: clone });
+  const rebased = await git([...NO_SIGN, "rebase", "-q", "--onto", upstream, base], { cwd: clone });
+  if (rebased.code !== 0) {
+    const unmerged = (await git(["diff", "--name-only", "--diff-filter=U"], { cwd: clone })).stdout.trim();
+    await git(["rebase", "--abort"], { cwd: clone });
+    return { kind: "conflict", files: unmerged ? unmerged.split("\n") : [`(rebase failed: ${rebased.stderr.trim()})`] };
+  }
+  const next = (await rev(clone, "HEAD")) ?? upstreamSha;
+  return { kind: "ok", next, needsPush: next !== upstreamSha };
+}
+
+async function push(clone: string, input: CycleInput, sha: string): Promise<"pushed" | "rejected" | string> {
+  const r = await git(["push", "--porcelain", "origin", `${sha}:refs/heads/${input.branch}`], {
+    cwd: clone,
+    timeoutMs: NETWORK_TIMEOUT_MS,
+  });
+  if (r.code === 0 && !r.timedOut) return "pushed";
+  // --porcelain: the verdict is read from git's own per-ref status, not from hints.
+  if (/^!\t.*\[(remote )?rejected\]/m.test(r.stdout)) return "rejected";
+  return r.stderr.trim() || (r.timedOut ? "push timed out" : `push exited ${r.code}`);
+}
+
+export async function runCycle(input: CycleInput): Promise<CycleResult> {
+  const result = emptyResult();
+  const dir = input.projectsDir;
+  const lockDir = await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "sro-sync.lock"], { cwd: dir });
+  const lock = await acquireLock(lockDir, { waitMs: input.lockWaitMs ?? 60_000 });
+  if (!lock) return { ...result, outcome: "busy", reason: "another sync holds the lock" };
+  const stillHeld = async (): Promise<boolean> => {
+    if (await lock.held()) return true;
+    result.outcome = "aborted";
+    result.reason = "lost the sync lock";
+    return false;
+  };
+  try {
+    // Every cycle that runs breaks the streak, whatever its outcome, unless it ends
+    // blocked again; a busy cycle never ran and leaves it alone.
+    const streak = await readBlocked(input.stateDir);
+    await writeBlocked(input.stateDir, 0);
+    const snap = await snapshot(input, result);
+    if (!snap.ok || !(await stillHeld())) return result;
+    if (!snap.pushAllowed) {
+      result.outcome = "unsynced";
+      result.reason = "a file changed while the snapshot was taken; it will be pushed next cycle";
+      return result;
+    }
+
+    const live = (await rev(dir, "HEAD")) ?? "";
+    const last = await rev(dir, LAST_INTEGRATED);
+    const clone = await ensureStateClone(input);
+    let next = "";
+    for (let attempt = 1; ; attempt++) {
+      if (!(await stillHeld())) return result;
+      const integration = await integrate(clone, input, live, last);
+      if (integration.kind === "conflict") {
+        result.outcome = "paused";
+        result.conflicts = integration.files;
+        result.reason = `sync paused: your local changes conflict with the remote in ${integration.files.join(", ")}`;
+        return result;
+      }
+      if (integration.kind === "unreachable") {
+        result.outcome = "unsynced";
+        result.reason = integration.reason;
+        return result;
+      }
+      next = integration.next;
+      if (!integration.needsPush) break;
+      const pushed = await push(clone, input, next);
+      if (pushed === "pushed") {
+        result.pushed = true;
+        break;
+      }
+      if (pushed !== "rejected" || attempt >= MAX_PUSH_ATTEMPTS) {
+        result.outcome = "unsynced";
+        result.reason = pushed === "rejected" ? `push rejected ${attempt} times` : pushed;
+        return result;
+      }
+    }
+
+    if (!(await stillHeld())) return result;
+    await gitOk(["update-ref", INTEGRATED, next], { cwd: clone });
+    await gitOk(["fetch", "-q", clone, `+${INTEGRATED}:${INTEGRATED}`], { cwd: dir });
+    const reset = await git(["reset", "-q", "--keep", next], { cwd: dir });
+    if (reset.code === 0) {
+      result.liveUpdated = true;
+      await gitOk(["update-ref", LAST_INTEGRATED, next], { cwd: dir });
+      await gitOk(["update-ref", `refs/remotes/origin/${input.branch}`, next], { cwd: dir });
+    } else {
+      const blocked = [...reset.stderr.matchAll(/Entry '(.+)' not uptodate/g)].map((m) => m[1] ?? "");
+      result.blockedBy = blocked.length ? blocked : [`(reset --keep refused: ${reset.stderr.trim().split("\n")[0]})`];
+      result.blockedCycles = streak + 1;
+      await writeBlocked(input.stateDir, result.blockedCycles);
+      // Our snapshot is on the remote now; never replay it again.
+      await gitOk(["update-ref", LAST_INTEGRATED, live], { cwd: dir });
+    }
+    return result;
+  } catch (err) {
+    result.outcome = "aborted";
+    result.reason = (err as Error).message;
+    return result;
+  } finally {
+    await lock.release();
+  }
+}
