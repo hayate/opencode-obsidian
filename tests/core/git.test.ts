@@ -140,6 +140,27 @@ test("a command killed on timeout is never retried, and the index.lock it left i
   assert.match(r.stderr, /removed .*index\.lock/);
 });
 
+test(
+  "a killed command whose index.lock cannot be removed says so, and is still never retried",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const dir = await tempDir();
+    await initRepo(dir);
+    // The filter prints git's lock message, so only the timeout rule stops a retry
+    // once the lock is still there; a read-only .git keeps it there.
+    await fakeFilter(dir, "chmod 555 .git; exec sleep 10");
+    await writeRel(dir, "a.md", "a\n");
+    try {
+      const r = await git(["add", "a.md"], { cwd: dir, timeoutMs: 500 });
+      assert.equal(r.timedOut, true, "a retry would have returned a later, non-timed-out attempt");
+      assert.match(r.stderr, /could not remove .*index\.lock, which this command left when it was stopped: .*EACCES/);
+      assert.equal(await exists(join(dir, ".git", "index.lock")), true);
+    } finally {
+      await chmod(join(dir, ".git"), 0o755);
+    }
+  },
+);
+
 test("an index.lock that was already there when a killed command started is never removed", async () => {
   const dir = await tempDir();
   await initRepo(dir);
