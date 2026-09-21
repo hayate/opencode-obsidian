@@ -87,6 +87,68 @@ test("scanDiff reports only added lines, by file, with new-file line numbers", (
   assert.equal(hits.get("p/notes/a.md")?.[0]?.line, 5);
 });
 
+// With -U0 a note line beginning "++ " is the diff line "+++ ...": inside a hunk it
+// is content, never a file header.
+test("a '+++ ' line inside a hunk is an added line, scanned and credited to the real file", () => {
+  const token = j("gh", "p_", noise(36));
+  const diff = [
+    "diff --git a/x/note.md b/x/note.md",
+    "--- a/x/note.md",
+    "+++ b/x/note.md",
+    "@@ -1,0 +2,3 @@",
+    "+intro",
+    `+++ ${token}`,
+    "+after",
+    "diff --git a/x/next.md b/x/next.md",
+    "--- a/x/next.md",
+    "+++ b/x/next.md",
+    "@@ -1 +1 @@",
+    "--- removed line that looks like a header",
+    `+key ${token}`,
+  ].join("\n");
+  const hits = scanDiff(diff);
+  assert.deepEqual([...hits.keys()], ["x/note.md", "x/next.md"]);
+  assert.equal(hits.get("x/note.md")?.[0]?.line, 3);
+  assert.equal(hits.get("x/next.md")?.[0]?.line, 1);
+});
+
+test("a '++ harmless' note line does not re-credit the hunk's later lines to a bogus file", () => {
+  const token = j("gh", "p_", noise(36));
+  const diff = [
+    "diff --git a/x/note.md b/x/note.md",
+    "--- a/x/note.md",
+    "+++ b/x/note.md",
+    "@@ -3,0 +4,2 @@",
+    "+++ harmless",
+    `+key ${token}`,
+  ].join("\n");
+  const hits = scanDiff(diff);
+  assert.deepEqual([...hits.keys()], ["x/note.md"]);
+  assert.equal(hits.get("x/note.md")?.[0]?.line, 5);
+});
+
+test("hunk counts: context lines, a missing count meaning 1, and git's no-newline marker", () => {
+  const token = j("gh", "p_", noise(36));
+  const diff = [
+    "diff --git a/x/a.md b/x/a.md",
+    "--- a/x/a.md",
+    "+++ b/x/a.md",
+    "@@ -1,2 +1,3 @@ heading",
+    " context",
+    "-old",
+    "+++ first",
+    "+++ second",
+    "@@ -5 +6 @@",
+    "-gone",
+    "\\ No newline at end of file",
+    `+++ ${token}`,
+    "\\ No newline at end of file",
+  ].join("\n");
+  const hits = scanDiff(diff);
+  assert.deepEqual([...hits.keys()], ["x/a.md"]);
+  assert.deepEqual(hits.get("x/a.md")?.map((h) => h.line), [6]);
+});
+
 test("git's C-quoted paths are unquoted, so a secret in an odd file name is still attributed", () => {
   assert.equal(unquoteGitPath('"b/a\\nb.md"'), "b/a\nb.md");
   assert.equal(unquoteGitPath('"b/c\\td.md"'), "b/c\td.md");

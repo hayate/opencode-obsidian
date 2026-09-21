@@ -99,29 +99,51 @@ function diffPath(header: string): string | null {
   return unquoteGitPath(raw).replace(/^b\//, "");
 }
 
+const HUNK = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
 // Scans only added lines of a unified diff (git diff --cached -U0), by file.
+// "--- " / "+++ " are file headers only between hunks: with -U0 a note line
+// starting "++ " is the diff line "+++ ...", and it is content. The hunk header's
+// counts say how many lines belong to the hunk (a missing count means 1).
 export function scanDiff(diff: string): Map<string, SecretHit[]> {
   const byFile = new Map<string, SecretHit[]>();
   let file: string | null = null;
   let newLine = 0;
+  let oldLeft = 0;
+  let newLeft = 0;
   for (const line of diff.split("\n")) {
-    if (line.startsWith("+++ ")) {
-      file = diffPath(line);
+    // No content line starts with "d" or "@": these two are always structure.
+    if (line.startsWith("diff --git ")) {
+      file = null;
+      oldLeft = newLeft = 0;
       continue;
     }
-    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    const hunk = HUNK.exec(line);
     if (hunk) {
-      newLine = Number(hunk[1]);
+      oldLeft = Number(hunk[1] ?? 1);
+      newLine = Number(hunk[2]);
+      newLeft = Number(hunk[3] ?? 1);
       continue;
     }
-    if (file === null) continue;
+    if (oldLeft === 0 && newLeft === 0) {
+      if (line.startsWith("+++ ")) file = diffPath(line);
+      continue;
+    }
     if (line.startsWith("+")) {
-      const hits = scanLine(line.slice(1), newLine);
-      if (hits.length) byFile.set(file, [...(byFile.get(file) ?? []), ...hits]);
+      if (file !== null) {
+        const hits = scanLine(line.slice(1), newLine);
+        if (hits.length) byFile.set(file, [...(byFile.get(file) ?? []), ...hits]);
+      }
       newLine++;
+      newLeft--;
+    } else if (line.startsWith("-")) {
+      oldLeft--;
     } else if (line.startsWith(" ")) {
       newLine++;
+      oldLeft--;
+      newLeft--;
     }
+    // "\ No newline at end of file" belongs to the line before it and counts nothing.
   }
   return byFile;
 }

@@ -183,6 +183,26 @@ test("a secret is held back even when a textconv driver rewrites the diff", asyn
   assert.notEqual((await git(["cat-file", "-e", "main:x/notes/creds.md"], { cwd: remote })).code, 0);
 });
 
+test("a note line starting with '++ ' is scanned, not read as a diff header", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  // With -U0 these lines appear as "+++ ..." in the scanned diff.
+  await writeRel(a.projects, "x/notes/inline.md", `intro\n++ ${TOKEN}\nafter\n`);
+  await writeRel(a.projects, "x/notes/after.md", `intro\n++ harmless\nkey ${TOKEN}\n`);
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  assert.deepEqual(
+    [...r.heldBack].sort((p, q) => p.file.localeCompare(q.file)),
+    [
+      { file: "x/notes/after.md", rules: ["github-token"] },
+      { file: "x/notes/inline.md", rules: ["github-token"] },
+    ],
+  );
+  for (const rel of ["x/notes/inline.md", "x/notes/after.md"]) {
+    assert.notEqual((await git(["cat-file", "-e", `main:${rel}`], { cwd: remote })).code, 0, rel);
+  }
+});
+
 test("a held-back file the remote also changed blocks the whole live update", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
