@@ -172,15 +172,25 @@ test("rollups: a late entry from another machine regenerates only its own day", 
   assert.match(await readFile(join(projectDir, "remember", "recent.md"), "utf8"), /day 2026-09-18: 2 item\(s\)/);
 });
 
-test("listEntries: a journal or day directory that cannot be listed is an error, never an empty list", async () => {
+test("listEntries: a journal directory that cannot be listed is an error, never an empty list", async () => {
   const a = join(await tempDir(), "p");
   await mkdir(join(a, "remember"), { recursive: true });
   await writeFile(join(a, "remember", "journal"), "a file where the directory should be");
   await assert.rejects(listEntries(a), /ENOTDIR/);
-  const b = join(await tempDir(), "p");
-  await mkdir(join(b, "remember", "journal"), { recursive: true });
-  await writeFile(join(b, "remember", "journal", "2026-09-21"), "a file named like a day");
-  await assert.rejects(listEntries(b), /ENOTDIR/);
+});
+
+test("listEntries: a day entry that is actually a file (a synced FILE named like a day) is skipped and reported, never fatal", async () => {
+  const projectDir = join(await tempDir(), "p");
+  const at = new Date("2026-09-20T03:00:00Z");
+  await writeJournalEntry(projectDir, { machine: "a", session: "s", branch: "main", from: at, to: at, model: "m", summary: "ok", timezone: TZ });
+  await mkdir(join(projectDir, "remember", "journal"), { recursive: true });
+  await writeFile(join(projectDir, "remember", "journal", "2026-09-21"), "a file named like a day");
+  const problems: string[] = [];
+  const entries = await listEntries(projectDir, problems);
+  assert.deepEqual(entries.map((e) => e.body), ["ok"]);
+  assert.equal(problems.length, 1, problems.join("\n"));
+  assert.match(problems[0] ?? "", /journal day "2026-09-21" skipped: remember\/journal\/2026-09-21 cannot be listed \(ENOTDIR\)/);
+  await assert.doesNotReject(listEntries(projectDir), "a caller that does not ask for problems still gets the entries, never throws");
 });
 
 test("listEntries: a missing journal directory has no entries", async () => {

@@ -90,7 +90,10 @@ export async function listEntries(projectDir: string, problems?: string[]): Prom
     try {
       names = await listMemoryDir(projectDir, `remember/journal/${day}`);
     } catch (err) {
-      if (!(err instanceof MemoryPathError && err.boundary)) throw err;
+      // A boundary refusal (a symlink) or a non-directory entry synced in where
+      // a day folder belongs (ENOTDIR: a FILE named like a day) drops only that
+      // day, never the whole listing. Anything else is unexpected and fatal.
+      if (!(err instanceof MemoryPathError && (err.boundary || err.why === "ENOTDIR"))) throw err;
       problems?.push(`journal day ${quoted(day)} skipped: ${err.message}`);
       continue;
     }
