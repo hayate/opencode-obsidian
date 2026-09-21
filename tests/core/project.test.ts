@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { normalizeOrigin, recordOrigin, resolveProject } from "../../core/project.ts";
 import { gitOk } from "../../core/git.ts";
@@ -129,4 +129,25 @@ test("recordOrigin writes once and never overwrites", async () => {
   await recordOrigin(dir, "github.com/a/b");
   await recordOrigin(dir, "github.com/c/d");
   assert.equal(await readFile(join(dir, "remember", ".origin"), "utf8"), "github.com/a/b\n");
+  const leftovers = await readdir(join(dir, "remember"));
+  assert.deepEqual(leftovers.filter((f) => f.endsWith(".sro-tmp")), []);
+});
+
+test("an unreadable or empty .origin refuses instead of reading as unclaimed", async () => {
+  // (a) remember/.origin is a directory (EISDIR): deterministic even as root.
+  const v1 = await vault();
+  const eisdir = await repo(await tempDir(), "gamma");
+  await mkdir(join(v1.projectsDir, "gamma", "remember", ".origin"), { recursive: true });
+  const r1 = await resolveProject(v1, eisdir);
+  assert.equal(r1.kind, "disabled");
+  assert.match(r1.kind === "disabled" ? r1.reason : "", /\.origin/);
+
+  // (b) a fresh vault, remember/.origin exists but is empty (a torn write).
+  const v2 = await vault();
+  const empty = await repo(await tempDir(), "delta");
+  await mkdir(join(v2.projectsDir, "delta", "remember"), { recursive: true });
+  await writeFile(join(v2.projectsDir, "delta", "remember", ".origin"), "");
+  const r2 = await resolveProject(v2, empty);
+  assert.equal(r2.kind, "disabled");
+  assert.match(r2.kind === "disabled" ? r2.reason : "", /\.origin/);
 });
