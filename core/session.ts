@@ -138,21 +138,25 @@ export function statusFromCycle(r: CycleResult): StatusItem[] {
   return out;
 }
 
-// No project: the bootstrap and the status lines only. The sync lines gathered
-// before the refusal stay, and so does the background work, if any.
+// No project and no memory: the bootstrap and the status lines only.
+function statusOnly(bootstrap: string, status: StatusItem[], background: Promise<StatusItem[]>): InitResult {
+  return {
+    payload: `${PAYLOAD_MARKER}\n${bootstrap.trim()}\n\n## Project and status\n${status.map((s) => `- [${s.level}] ${s.text}`).join("\n")}`,
+    status,
+    context: null,
+    background,
+  };
+}
+
+// A refusal. The sync lines gathered before it stay, and so does the background
+// work, if any.
 function disabled(
   bootstrap: string,
   reason: string,
   status: StatusItem[] = [],
   background: Promise<StatusItem[]> = Promise.resolve([]),
 ): InitResult {
-  const all: StatusItem[] = [{ level: "error", text: `memory and sync disabled: ${reason}` }, ...status];
-  return {
-    payload: `${PAYLOAD_MARKER}\n${bootstrap.trim()}\n\n## Project and status\n${all.map((s) => `- [${s.level}] ${s.text}`).join("\n")}`,
-    status: all,
-    context: null,
-    background,
-  };
+  return statusOnly(bootstrap, [{ level: "error", text: `memory and sync disabled: ${reason}` }, ...status], background);
 }
 
 // The sync work's own lines, once it ends after the payload was built, plus what
@@ -323,16 +327,6 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
     return { items: out, project };
   })();
   return { kind: "started", vault, status, cfg, stateDir, code, machine, shared, work };
-}
-
-// No project and no memory: the bootstrap and the status lines only.
-function statusOnly(bootstrap: string, status: StatusItem[], background: Promise<StatusItem[]>): InitResult {
-  return {
-    payload: `${PAYLOAD_MARKER}\n${bootstrap.trim()}\n\n## Project and status\n${status.map((s) => `- [${s.level}] ${s.text}`).join("\n")}`,
-    status,
-    context: null,
-    background,
-  };
 }
 
 const NOT_SHOWN: ProjectResolution = { kind: "disabled", reason: "memory initialization timed out", bare: false };
