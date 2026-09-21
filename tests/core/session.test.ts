@@ -622,3 +622,51 @@ test("one session that fails catch-up is named, the others are journaled, and th
   assert.deepEqual((await listEntries(w.projectDir)).map((e) => e.body), ["journal of ses_fine"]);
   await stat(join(w.projectDir, "remember", "recent.md")); // the rollups ran
 });
+
+test("sync work that fails outright is reported as 'sync failed', and the payload is still built", async () => {
+  const w = await world();
+  // The state root is a file, so the machine-wide preparation lock cannot be
+  // created: the sync work rejects.
+  const stateRoot = join(await tempDir(), "state-is-a-file");
+  await writeFile(stateRoot, "");
+  const r = await initializeSession(opts({ ...w, stateRoot }));
+  const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+  assert.match(lines, /\[error\] sync failed: .*ENOTDIR/);
+  assert.equal(r.context?.project, "kabin-api", lines);
+});
+
+test("an exception after the sync race gives the 'unexpected error' payload, never a throw", async () => {
+  const w = await localWorld();
+  let clockBroken = false;
+  const harness = new ListedHarness([]);
+  harness.listSessions = async () => {
+    clockBroken = true; // from the journal step on, every reading of the clock fails
+    return [];
+  };
+  const r = await initializeSession(
+    localOpts(w, {
+      harness,
+      now: () => {
+        if (clockBroken) throw new Error("clock failed");
+        return new Date("2026-09-21T07:00:00Z");
+      },
+    }),
+  );
+  assert.equal(r.context, null);
+  assert.match(r.payload, /memory and sync disabled: unexpected error: clock failed/);
+});
+
+test("a sync that outlives the wait warns in the background that this repository maps to another folder: restart", async () => {
+  const w = await identityWorld();
+  const lock = await holdPrepareLock(w); // the work cannot reach the post-pull identity
+  let r;
+  try {
+    r = await initializeSession(opts(w, { waitMs: 1_500 }));
+  } finally {
+    await lock.release();
+  }
+  assert.equal(r.context?.project, "different-local-name", "shown with the identity known before the pull");
+  assert.match(r.payload, /sync still running/);
+  const later = (await r.background).map((s) => s.text).join("\n");
+  assert.match(later, /after sync this repository maps to Projects\/canonical, not different-local-name; restart the session/);
+});

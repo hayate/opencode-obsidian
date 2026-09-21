@@ -16,6 +16,7 @@ import {
   writeHandoff,
   type Handoff,
 } from "../../core/store.ts";
+import { acquireLock } from "../../core/lock.ts";
 import { tempDir, writeRel } from "./helpers.ts";
 
 const TZ = "Asia/Tokyo";
@@ -238,4 +239,30 @@ test("listHandoffs: a symlinked handoff is a problem, never content; a symlinked
   await assert.rejects(listHandoffs(q.projectDir), /remember\/handoffs cannot be listed \(a symbolic link\)/);
   await assert.rejects(writeHandoff(input(q, "ses_aaaaaaaa1", "through the link", [])), /remember\/handoffs cannot be listed \(a symbolic link\)/);
   assert.deepEqual(await readdir(join(outside, "h")), ["x.md"], "nothing was written through the link");
+});
+
+test("writeHandoff: two writes racing on one branch with the same seen heads: one is written, the other refused naming it", async () => {
+  const p = await project();
+  const results = await Promise.all([
+    writeHandoff(input(p, "ses_aaaaaaaa1", "from a", [])),
+    writeHandoff(input(p, "ses_bbbbbbbb2", "from b", [])),
+  ]);
+  const written = results.filter((r) => r.kind === "written");
+  const refused = results.filter((r) => r.kind === "refused");
+  assert.equal(written.length, 1);
+  assert.equal(refused.length, 1);
+  const [w] = written;
+  const [f] = refused;
+  assert.deepEqual(f?.kind === "refused" ? f.unseen.map((x) => x.id) : [], [w?.kind === "written" ? w.handoff.id : ""]);
+});
+
+test("writeHandoff throws when another holder keeps the handoff lock", async () => {
+  const p = await project();
+  const held = await acquireLock(p.lockDir);
+  assert.ok(held);
+  try {
+    await assert.rejects(writeHandoff(input(p, "ses_aaaaaaaa1", "blocked", [])), /is busy/);
+  } finally {
+    await held.release();
+  }
 });
