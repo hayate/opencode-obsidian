@@ -120,7 +120,13 @@ test("a fresh machine uses the vault's timezone from the pulled config, not its 
 
 test("a slow sync does not block the payload; its outcome arrives in the background", async () => {
   const w = await world();
-  const r = await initializeSession(opts(w, { waitMs: 0 }));
+  const lock = await holdPrepareLock(w); // the sync cannot start until released
+  let r;
+  try {
+    r = await initializeSession(opts(w, { waitMs: 1_500 }));
+  } finally {
+    await lock.release();
+  }
   assert.match(r.payload, /sync still running - memory may be stale/);
   const later = await r.background;
   assert.deepEqual(later.filter((s) => s.level === "error"), []);
@@ -669,4 +675,34 @@ test("a sync that outlives the wait warns in the background that this repository
   assert.match(r.payload, /sync still running/);
   const later = (await r.background).map((s) => s.text).join("\n");
   assert.match(later, /after sync this repository maps to Projects\/canonical, not different-local-name; restart the session/);
+});
+
+test("a git call that hangs before the sync starts still returns within the wait, saying initialization timed out", async () => {
+  const w = await world();
+  const marker = join(await tempDir(), "slept");
+  // The first git command in the session directory (the early identity) hangs 3 s.
+  const slowOnce = `if [ "$here" = ${JSON.stringify(w.code)} ] && mkdir ${JSON.stringify(marker)} 2>/dev/null; then sleep 3; fi`;
+  await withGitWrapper(slowOnce, async () => {
+    const t0 = Date.now();
+    const r = await initializeSession(opts(w, { waitMs: 1_000 }));
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 2_000, `initializeSession returned after ${elapsed} ms for a 1000 ms wait`);
+    assert.equal(r.context, null);
+    assert.ok(r.payload.startsWith(`${PAYLOAD_MARKER}\nBOOTSTRAP\n`), "the bootstrap is still sent");
+    assert.match(r.payload, /memory initialization timed out/);
+    const later = (await r.background).map((s) => s.text).join("\n");
+    assert.match(later, /after sync this repository maps to Projects\/kabin-api; restart the session/);
+  });
+});
+
+test("a session that timed out before the sync learns in the background why memory stays off", async () => {
+  const w = await twoClaimsWorld();
+  const marker = join(await tempDir(), "slept");
+  const slowOnce = `if [ "$here" = ${JSON.stringify(w.code)} ] && mkdir ${JSON.stringify(marker)} 2>/dev/null; then sleep 3; fi`;
+  await withGitWrapper(slowOnce, async () => {
+    const r = await initializeSession(opts(w, { waitMs: 1_000 }));
+    assert.match(r.payload, /memory initialization timed out/);
+    const later = (await r.background).map((s) => s.text).join("\n");
+    assert.match(later, /after sync memory and sync are disabled: .*claimed by several folders/);
+  });
 });
