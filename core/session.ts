@@ -87,6 +87,8 @@ export function statusFromCycle(r: CycleResult): StatusItem[] {
   if (r.outcome === "unsynced") out.push({ level: "warn", text: `unsynced: ${r.reason ?? "push did not happen"}` });
   if (r.outcome === "aborted") out.push({ level: "error", text: `sync aborted: ${r.reason ?? ""}` });
   if (r.outcome === "busy") out.push({ level: "info", text: "another session is syncing; this one will sync when idle" });
+  // runCycle records a problem that did not stop the sync (a failed lock release) here.
+  if (r.outcome === "synced" && r.reason) out.push({ level: "warn", text: r.reason });
   for (const h of r.heldBack) out.push({ level: "warn", text: `held back by the secret scan (${h.rules.join(", ")}): ${h.file}` });
   for (const e of r.embedded) out.push({ level: "warn", text: `not synced: ${e} is a git repository inside Projects/ (move it out, or remove its .git)` });
   if (r.caseCollisions.length) {

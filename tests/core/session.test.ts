@@ -165,6 +165,24 @@ test("statusFromCycle turns every non-clean outcome into a visible line", () => 
   assert.match(items[4]?.text ?? "", /3 cycles in a row/);
 });
 
+test("statusFromCycle shows a reason recorded on a synced outcome (a failed lock release)", () => {
+  const items = statusFromCycle({
+    outcome: "synced",
+    reason: "releasing the sync lock failed: EACCES",
+    committed: null,
+    heldBack: [],
+    deferred: [],
+    pushed: true,
+    liveUpdated: true,
+    blockedBy: [],
+    blockedCycles: 0,
+    conflicts: [],
+    embedded: [],
+    caseCollisions: [],
+  });
+  assert.deepEqual(items, [{ level: "warn", text: "releasing the sync lock failed: EACCES" }]);
+});
+
 async function identityWorld(): Promise<{ vaultRoot: string; remote: string; code: string; stateRoot: string }> {
   const remote = join(await tempDir("sro-remote-"), "projects.git");
   await gitOk(["init", "-q", "--bare", "-b", "main", remote], { cwd: await tempDir() });
