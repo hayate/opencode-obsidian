@@ -2,6 +2,7 @@
 // vault-wide settings in Projects/.sro-config.json.
 import { readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { quoted } from "./store.ts";
 
 export interface Vault {
   root: string;
@@ -77,7 +78,10 @@ export async function readVaultConfig(projectsDir: string): Promise<VaultConfig>
   }
   const timezone = (parsed as { timezone?: unknown }).timezone;
   if (typeof timezone !== "string" || !isValidTimezone(timezone)) {
-    throw new VaultError(`${CONFIG_FILE} has no valid IANA "timezone" (got ${JSON.stringify(timezone)})`);
+    // The value came from the synced config file, so it may be arbitrarily
+    // large; quoted() caps and escapes it before it reaches this status line.
+    const shown = typeof timezone === "string" ? timezone : (JSON.stringify(timezone) ?? "undefined");
+    throw new VaultError(`${CONFIG_FILE} has no valid IANA "timezone" (got ${quoted(shown)})`);
   }
   return { timezone };
 }

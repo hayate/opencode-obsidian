@@ -46,6 +46,19 @@ test("readVaultConfig: missing file means this machine's zone; a broken file is 
   await assert.rejects(readVaultConfig(projects), VaultError);
 });
 
+test("readVaultConfig: an oversized synced timezone value never reaches the error message uncapped", async () => {
+  const projects = await tempDir();
+  const huge = "x".repeat(5000);
+  await writeFile(join(projects, CONFIG_FILE), JSON.stringify({ timezone: huge }));
+  await assert.rejects(readVaultConfig(projects), (err: unknown) => {
+    assert.ok(err instanceof VaultError);
+    assert.ok(err.message.length < 300, `message should be capped, was ${err.message.length} chars`);
+    assert.doesNotMatch(err.message, new RegExp(huge));
+    assert.match(err.message, /\.\.\."/);
+    return true;
+  });
+});
+
 test("readVaultConfig: a config file that exists but cannot be read is an error", async () => {
   const projects = await tempDir();
   await mkdir(join(projects, CONFIG_FILE));
