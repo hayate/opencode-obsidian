@@ -6,6 +6,7 @@ import { initializeSession, statusFromCycle, type SessionOptions } from "../../c
 import type { Harness, SessionRef } from "../../core/harness.ts";
 import { PAYLOAD_MARKER } from "../../core/inject.ts";
 import { gitOk } from "../../core/git.ts";
+import { systemTimezone } from "../../core/vault.ts";
 import { commitFile, initRepo, tempDir } from "./helpers.ts";
 
 class QuietHarness implements Harness {
@@ -89,6 +90,28 @@ test("happy path: clone, sync, record the origin, inject this branch's handoff",
     await readFile(join(w.vaultRoot, "Projects", "kabin-api", "remember", ".origin"), "utf8"),
     "github.com/acme/kabin-api\n",
   );
+});
+
+test("a fresh machine uses the vault's timezone from the pulled config, not its own", async () => {
+  // No Projects/ dir exists yet on this "machine": the config is only visible
+  // after prepareProjects clones the remote. Pick a seeded zone that differs
+  // from this machine's own, so the assertion cannot pass by coincidence.
+  const zone = systemTimezone() === "Pacific/Kiritimati" ? "UTC" : "Pacific/Kiritimati";
+  const remote = join(await tempDir("sro-remote-"), "projects.git");
+  await gitOk(["init", "-q", "--bare", "-b", "main", remote], { cwd: await tempDir() });
+  const seed = join(await tempDir(), "seed");
+  await gitOk(["clone", "-q", remote, seed], { cwd: await tempDir() });
+  await commitFile(seed, ".sro-config.json", JSON.stringify({ timezone: zone }), "config");
+  await gitOk(["push", "-q", "origin", "HEAD"], { cwd: seed });
+
+  const vaultRoot = await tempDir("sro-vault-");
+  await mkdir(join(vaultRoot, ".obsidian"));
+  const code = join(await tempDir(), "some-repo");
+  await initRepo(code);
+  await commitFile(code, "README.md", "x", "init");
+
+  const r = await initializeSession(opts({ vaultRoot, remote, code, stateRoot: await tempDir("sro-state-") }));
+  assert.equal(r.context?.timezone, zone);
 });
 
 test("a slow sync does not block the payload; its outcome arrives in the background", async () => {

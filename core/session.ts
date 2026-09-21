@@ -174,6 +174,17 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       if (state.kind === "ready" && cfg.remote) {
         out.push(...statusFromCycle(await runCycle({ projectsDir: vault.projectsDir, remote: cfg.remote, branch: state.branch, stateDir, machine })));
       }
+      // The top-level read above ran before Projects/ existed on a fresh machine,
+      // so it could only ever see this machine's own zone. Now that Projects/ is
+      // prepared (and, when sync ran, pulled), .sro-config.json is the vault's,
+      // brought down by the clone or the cycle: re-read it so the journal context,
+      // rollups, and (after the race) the payload's day and SessionContext.timezone
+      // all use the vault's zone, not this machine's.
+      try {
+        timezone = (await readVaultConfig(vault.projectsDir)).timezone;
+      } catch (err) {
+        out.push({ level: "warn", text: `${(err as Error).message}; using ${timezone}` });
+      }
       // Spec 4.2 after the pull: a first session must see the folders other machines
       // already claimed, or it would claim a duplicate one under its own clone name.
       const project = await resolveProject(vault, opts.sessionDir);
