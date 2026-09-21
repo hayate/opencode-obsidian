@@ -57,13 +57,17 @@ export function isValidTimezone(timeZone: string): boolean {
 }
 
 // Missing file: this machine's zone (the file is written at bootstrap). A file
-// that exists but is broken is an error: machines must agree on "today".
+// that exists but is broken or cannot be read is an error: machines must agree on "today".
 export async function readVaultConfig(projectsDir: string): Promise<VaultConfig> {
   let text: string;
   try {
     text = await readFile(join(projectsDir, CONFIG_FILE), "utf8");
-  } catch {
-    return { timezone: systemTimezone() };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return { timezone: systemTimezone() };
+    }
+    throw new VaultError(`${CONFIG_FILE} cannot be read: ${(err as Error).message}`);
   }
   let parsed: unknown;
   try {

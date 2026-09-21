@@ -46,6 +46,12 @@ test("readVaultConfig: missing file means this machine's zone; a broken file is 
   await assert.rejects(readVaultConfig(projects), VaultError);
 });
 
+test("readVaultConfig: a config file that exists but cannot be read is an error", async () => {
+  const projects = await tempDir();
+  await mkdir(join(projects, CONFIG_FILE));
+  await assert.rejects(readVaultConfig(projects), VaultError);
+});
+
 test("stamps are computed in the given zone, not the machine's", () => {
   const instant = new Date("2026-09-21T16:30:05Z");
   assert.equal(dayStamp(instant, "Asia/Tokyo"), "2026-09-22");
