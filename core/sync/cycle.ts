@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock, type LockHandle } from "../lock.ts";
 import { redactUrlCredentials, scanStaged } from "../secrets.ts";
-import { writeAtomic } from "../store.ts";
+import { quoted, writeAtomic } from "../store.ts";
 import { identityProblem } from "./state.ts";
 
 export interface CycleInput {
@@ -220,7 +220,10 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
   if (stillDirty.size) {
     await gitOk(["reset", "-q"], { cwd: dir });
     result.outcome = "aborted";
-    result.reason = `the secret scan could not hold back ${[...stillDirty.keys()].sort().join(", ")}: nothing was committed`;
+    result.reason = `the secret scan could not hold back ${[...stillDirty.keys()]
+      .sort()
+      .map((f) => quoted(f))
+      .join(", ")}: nothing was committed`;
     return { ok: false, pushAllowed: false };
   }
 
@@ -377,7 +380,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       if (integration.kind === "conflict") {
         result.outcome = "paused";
         result.conflicts = integration.files;
-        result.reason = `sync paused: your local changes conflict with the remote in ${integration.files.join(", ")}`;
+        result.reason = `sync paused: your local changes conflict with the remote in ${integration.files.map((f) => quoted(f)).join(", ")}`;
         return result;
       }
       if (integration.kind === "unsynced") {

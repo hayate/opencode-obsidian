@@ -159,7 +159,9 @@ test("an import whose notes hold a credential-shaped string stops before anythin
 
   const stopped = await prepareProjects(v, { remote }, TZ);
   assertKind(stopped, "stopped");
-  assert.match(stopped.kind === "stopped" ? stopped.reason : "", /x\/creds\.md/);
+  // The reason is plugin status text, outside the data block: the vault path
+  // must appear quoted, not raw (spec: a file name is never plugin text).
+  assert.match(stopped.kind === "stopped" ? stopped.reason : "", /"x\/creds\.md"/);
   assert.equal(await gitOk(["ls-remote", "--heads", remote], { cwd: v.root }), "");
   await assert.rejects(stat(join(v.projectsDir, ".git")));
 
@@ -368,6 +370,27 @@ test("a detached HEAD and an in-progress rebase each stop", async () => {
   await mkdir(join(v.projectsDir, ".git", "rebase-merge"));
   const rebasing = await prepareProjects(v, { remote }, TZ);
   assert.match(rebasing.kind === "stopped" ? rebasing.reason : "", /rebase-merge/);
+});
+
+test("an unmerged file name is quoted and capped in the stopped reason", async () => {
+  const v = await vault();
+  const remote = await seededRemote();
+  await prepareProjects(v, { remote }, TZ);
+  // Stage 2/3 entries for one path, with no stage 0, is exactly what a real
+  // conflicted merge leaves behind; built directly with plumbing so the fixture
+  // is deterministic and the name can be long without a real merge in the way.
+  const longName = `x/${"a".repeat(200)}.md`;
+  const oursBlob = await gitOk(["hash-object", "-w", "--stdin"], { cwd: v.projectsDir, input: "ours\n" });
+  const theirsBlob = await gitOk(["hash-object", "-w", "--stdin"], { cwd: v.projectsDir, input: "theirs\n" });
+  await gitOk(["update-index", "--index-info"], {
+    cwd: v.projectsDir,
+    input: `100644 ${oursBlob} 2\t${longName}\n100644 ${theirsBlob} 3\t${longName}\n`,
+  });
+  const stopped = await prepareProjects(v, { remote }, TZ);
+  assertKind(stopped, "stopped");
+  const reason = stopped.kind === "stopped" ? stopped.reason : "";
+  assert.match(reason, /^Projects\/ has unmerged files: "x\/a{115}\.\.\."$/);
+  assert.ok(reason.length < 160, `reason should be capped, was ${reason.length} chars: ${reason}`);
 });
 
 test("a fresh clone of a remote without .gitignore gets the required ignore lines", async () => {

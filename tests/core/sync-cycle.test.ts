@@ -522,6 +522,22 @@ test("conflicting file names are reported as spelled, never C-quoted", async () 
   assert.deepEqual(r.conflicts, ["x/日本.md"]);
 });
 
+test("a conflicting file name holding a raw newline is quoted in the paused reason, so it can never break the status line", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  const name = `x/two${"\n"}lines.md`;
+  await writeRel(a.projects, name, "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  await writeRel(b.projects, name, "from b\n");
+  const r = await cycle(remote, b);
+  assert.equal(r.outcome, "paused", r.reason ?? "");
+  // r.conflicts is data, kept exactly as spelled (see the test above); the
+  // reason is plugin status text, so the same name must appear quoted there.
+  assert.deepEqual(r.conflicts, [name]);
+  assert.match(r.reason ?? "", /"x\/two\\nlines\.md"/);
+  assert.doesNotMatch(r.reason ?? "", /\n/, r.reason ?? "");
+});
+
 test("a busy lock returns busy without touching anything", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];

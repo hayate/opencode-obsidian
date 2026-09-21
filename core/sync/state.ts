@@ -6,7 +6,7 @@ import { lstat, readFile, readdir, rename, rm, rmdir, stat } from "node:fs/promi
 import { basename, join } from "node:path";
 import { git, gitOk, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { redactUrlCredentials, scanStaged } from "../secrets.ts";
-import { createAt, writeAtomic } from "../store.ts";
+import { createAt, quoted, writeAtomic } from "../store.ts";
 import { CONFIG_FILE, type Vault } from "../vault.ts";
 
 export interface SyncConfig {
@@ -127,7 +127,7 @@ async function commitAndPushNew(projectsDir: string, timezone: string, message: 
   const hits = await scanStaged(projectsDir);
   if (hits.size) {
     const files = [...hits.keys()].sort();
-    return `secret-shaped content in ${files.join(", ")}: redact or move them out of Projects/ and start a new session`;
+    return `secret-shaped content in ${files.map((f) => quoted(f)).join(", ")}: redact or move them out of Projects/ and start a new session`;
   }
   // --no-verify: a pre-commit hook (from a global core.hooksPath, or copied in by
   // init.templateDir) could stage content after the scan above, pushed unscanned.
@@ -227,7 +227,15 @@ async function checkRepo(projectsDir: string, remote: string): Promise<SyncState
     if (await exists(path)) return { kind: "stopped", reason: `Projects/ has a ${marker} in progress; finish or abort it` };
   }
   const unmerged = await gitOk(["diff", "--name-only", "--diff-filter=U"], { cwd: projectsDir });
-  if (unmerged) return { kind: "stopped", reason: `Projects/ has unmerged files: ${unmerged.split("\n").join(", ")}` };
+  if (unmerged) {
+    return {
+      kind: "stopped",
+      reason: `Projects/ has unmerged files: ${unmerged
+        .split("\n")
+        .map((f) => quoted(f))
+        .join(", ")}`,
+    };
+  }
   // Every repository that comes out ready gets the required ignores, not only
   // one this call bootstrapped or imported: a Projects/ that was a repository
   // before the plugin (it never ran commitAndPushNew) and a fresh clone
