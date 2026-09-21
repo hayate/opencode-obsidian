@@ -215,6 +215,15 @@ async function vaultTracksProjects(vaultRoot: string): Promise<boolean> {
   return r.code === 0 && r.stdout.trim().length > 0;
 }
 
+// A status line, not a transcript: at most the first 10 names, quoted and
+// capped like any other, then a count of what was left out. The full list
+// (never capped) is always available separately for callers that need it.
+function joinNames(names: string[], max = 10): string {
+  const shown = names.slice(0, max).map((n) => quoted(n));
+  if (names.length > max) shown.push(`and ${names.length - max} more`);
+  return shown.join(", ");
+}
+
 // A status line, not a transcript: git's first few lines that say something.
 function firstLines(stderr: string, count = 3): string {
   return stderr
@@ -273,13 +282,7 @@ async function checkRepo(projectsDir: string, remote: string): Promise<SyncState
   }
   const unmerged = await gitOk(["diff", "--name-only", "--diff-filter=U"], { cwd: projectsDir });
   if (unmerged) {
-    return {
-      kind: "stopped",
-      reason: `Projects/ has unmerged files: ${unmerged
-        .split("\n")
-        .map((f) => quoted(f))
-        .join(", ")}`,
-    };
+    return { kind: "stopped", reason: `Projects/ has unmerged files: ${joinNames(unmerged.split("\n"))}` };
   }
   // Every repository that comes out ready gets the required ignores, not only
   // one this call bootstrapped or imported: a Projects/ that was a repository

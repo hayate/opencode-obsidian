@@ -271,6 +271,15 @@ async function ensureStateClone(input: CycleInput): Promise<string> {
   return clone;
 }
 
+// A status line, not a transcript: at most the first 10 names, quoted and
+// capped like any other, then a count of what was left out. The full list
+// (never capped) is still reported separately in the result.
+function joinNames(names: string[], max = 10): string {
+  const shown = names.slice(0, max).map((n) => quoted(n));
+  if (names.length > max) shown.push(`and ${names.length - max} more`);
+  return shown.join(", ");
+}
+
 // A status line, not a transcript: git's first few lines that say something.
 function firstLines(stderr: string, count = 3): string {
   return stderr
@@ -383,7 +392,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       if (integration.kind === "conflict") {
         result.outcome = "paused";
         result.conflicts = integration.files;
-        result.reason = `sync paused: your local changes conflict with the remote in ${integration.files.map((f) => quoted(f)).join(", ")}`;
+        result.reason = `sync paused: your local changes conflict with the remote in ${joinNames(integration.files)}`;
         return result;
       }
       if (integration.kind === "unsynced") {

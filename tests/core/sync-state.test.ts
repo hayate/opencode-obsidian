@@ -436,6 +436,23 @@ test("an unmerged file name is quoted and capped in the stopped reason", async (
   assert.ok(reason.length < 160, `reason should be capped, was ${reason.length} chars: ${reason}`);
 });
 
+test("more than 10 unmerged files cap the reason to the first 10 names, then 'and N more'", async () => {
+  const v = await vault();
+  const remote = await seededRemote();
+  await prepareProjects(v, { remote }, TZ);
+  const names = Array.from({ length: 12 }, (_, i) => `x/conflict-${String(i + 1).padStart(2, "0")}.md`);
+  const oursBlob = await gitOk(["hash-object", "-w", "--stdin"], { cwd: v.projectsDir, input: "ours\n" });
+  const theirsBlob = await gitOk(["hash-object", "-w", "--stdin"], { cwd: v.projectsDir, input: "theirs\n" });
+  const indexInfo = names.map((n) => `100644 ${oursBlob} 2\t${n}\n100644 ${theirsBlob} 3\t${n}\n`).join("");
+  await gitOk(["update-index", "--index-info"], { cwd: v.projectsDir, input: indexInfo });
+  const stopped = await prepareProjects(v, { remote }, TZ);
+  assertKind(stopped, "stopped");
+  const reason = stopped.kind === "stopped" ? stopped.reason : "";
+  for (const n of names.slice(0, 10)) assert.ok(reason.includes(n), `${n} missing from: ${reason}`);
+  for (const n of names.slice(10)) assert.ok(!reason.includes(n), `${n} should be dropped from: ${reason}`);
+  assert.match(reason, /and 2 more/, reason);
+});
+
 test("a fresh clone of a remote without .gitignore gets the required ignore lines", async () => {
   const v = await vault();
   const remote = await seededRemote(); // populated, never carried a .gitignore

@@ -546,6 +546,22 @@ test("a conflicting file name holding a raw newline is quoted in the paused reas
   assert.doesNotMatch(r.reason ?? "", /\n/, r.reason ?? "");
 });
 
+test("more than 10 conflicting files cap the paused reason to the first 10 names, then 'and N more'", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  const names = Array.from({ length: 12 }, (_, i) => `x/conflict-${String(i + 1).padStart(2, "0")}.md`);
+  for (const name of names) await writeRel(a.projects, name, "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  for (const name of names) await writeRel(b.projects, name, "from b\n");
+  const r = await cycle(remote, b);
+  assert.equal(r.outcome, "paused", r.reason ?? "");
+  assert.equal(r.conflicts.length, 12, "the raw conflict list is never capped, only the reason text");
+  const reason = r.reason ?? "";
+  for (const name of names.slice(0, 10)) assert.ok(reason.includes(name), `${name} missing from: ${reason}`);
+  for (const name of names.slice(10)) assert.ok(!reason.includes(name), `${name} should be dropped from: ${reason}`);
+  assert.match(reason, /and 2 more/, reason);
+});
+
 test("a busy lock returns busy without touching anything", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];
