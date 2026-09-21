@@ -604,3 +604,21 @@ test("catch-up journals only the sessions whose directory is this project's repo
   assert.deepEqual(bodies, ["journal of mine", "journal of mine-again", "journal of worktree"]);
   assert.deepEqual(harness.transcriptsRead.sort(), ["mine", "mine-again", "worktree"]);
 });
+
+test("one session that fails catch-up is named, the others are journaled, and the rollups are still built", async () => {
+  const w = await localWorld();
+  const harness = new ListedHarness([
+    { id: "ses_broken", directory: w.code, updated: 3000, parentId: null },
+    { id: "ses_fine", directory: w.code, updated: 2000, parentId: null },
+  ]);
+  const read = harness.readTranscript.bind(harness);
+  harness.readTranscript = async (id: string) => {
+    if (id === "ses_broken") throw new Error("transcript store unavailable");
+    return read(id);
+  };
+  const r = await initializeSession(localOpts(w, { harness }));
+  const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+  assert.match(lines, /\[warn\] journal catch-up failed for session ses_broken: transcript store unavailable/);
+  assert.deepEqual((await listEntries(w.projectDir)).map((e) => e.body), ["journal of ses_fine"]);
+  await stat(join(w.projectDir, "remember", "recent.md")); // the rollups ran
+});

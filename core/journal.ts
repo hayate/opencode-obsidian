@@ -202,19 +202,30 @@ export async function journalSession(
   return "written";
 }
 
+export interface CatchUpResult {
+  written: number;
+  failed: Array<{ session: string; error: string }>;
+}
+
 // Idle events are not awaited by the runtime, so a headless session can exit
 // before its entry is written. Every initialization journals what was missed.
-export async function catchUp(ctx: JournalContext, sessions: SessionRef[], limit = CATCH_UP_LIMIT): Promise<number> {
+// One session that fails (its transcript, the model, the write) is reported and
+// never stops the others.
+export async function catchUp(ctx: JournalContext, sessions: SessionRef[], limit = CATCH_UP_LIMIT): Promise<CatchUpResult> {
   const state = await loadJournalState(ctx.stateFile);
   const candidates = sessions
     .filter((s) => s.parentId === null && s.updated > (state.sessions[s.id]?.journaledAt ?? 0))
     .sort((a, b) => b.updated - a.updated)
     .slice(0, limit);
-  let written = 0;
+  const result: CatchUpResult = { written: 0, failed: [] };
   for (const s of candidates) {
-    if ((await journalSession(ctx, s.id, { force: true })) === "written") written++;
+    try {
+      if ((await journalSession(ctx, s.id, { force: true })) === "written") result.written++;
+    } catch (err) {
+      result.failed.push({ session: s.id, error: (err as Error).message });
+    }
   }
-  return written;
+  return result;
 }
 
 export interface RollupContext {

@@ -96,9 +96,9 @@ test("catch-up journals sessions whose idle event never completed, newest first,
     sessions.push({ id: `s${i}`, directory: "/code", updated: 1000 + i, parentId: null });
   }
   sessions.push({ id: "child", directory: "/code", updated: 5000, parentId: "s1" });
-  assert.equal(await catchUp(c, sessions, 5), 5);
-  assert.equal(await catchUp(c, sessions, 5), 2, "the two older sessions are caught up next time");
-  assert.equal(await catchUp(c, sessions, 5), 0);
+  assert.equal((await catchUp(c, sessions, 5)).written, 5);
+  assert.equal((await catchUp(c, sessions, 5)).written, 2, "the two older sessions are caught up next time");
+  assert.equal((await catchUp(c, sessions, 5)).written, 0);
 });
 
 async function entryOn(projectDir: string, iso: string, summary: string): Promise<void> {
@@ -228,4 +228,23 @@ test("writeJournalEntry never writes through a symlinked journal folder", async 
     /remember\/journal\/2026-09-21 cannot be written \(a symbolic link\)/,
   );
   assert.deepEqual(await readdir(outside), []);
+});
+
+test("catch-up continues past a session that fails, and names it", async () => {
+  const h = new FakeHarness();
+  const c = await ctx(h, { t: new Date("2026-09-21T03:00:00Z") });
+  h.transcripts.set("good", [msg("m1", "2026-09-21T02:00:00Z")]);
+  const read = h.readTranscript.bind(h);
+  h.readTranscript = async (id: string, after?: string) => {
+    if (id === "bad") throw new Error("transcript store unavailable");
+    return read(id, after);
+  };
+  const sessions: SessionRef[] = [
+    { id: "bad", directory: "/code", updated: 2000, parentId: null },
+    { id: "good", directory: "/code", updated: 1000, parentId: null },
+  ];
+  const r = await catchUp(c, sessions);
+  assert.equal(r.written, 1);
+  assert.deepEqual(r.failed, [{ session: "bad", error: "transcript store unavailable" }]);
+  assert.deepEqual((await listEntries(c.projectDir)).map((e) => e.body), ["worked on the sync engine"]);
 });

@@ -266,8 +266,10 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       resolved = project;
       if (project.kind === "disabled") return { items: out, project };
       if (project.origin && state.kind !== "stopped") await recordOrigin(project.dir, project.origin);
+      const projectStateDir = join(stateDir, project.name);
+      // Catch-up and rollups fail separately: a catch-up that failed (one session,
+      // or the session list) never costs the rollups of what is already journaled.
       try {
-        const projectStateDir = join(stateDir, project.name);
         const journal: JournalContext = {
           harness: opts.harness,
           projectDir: project.dir,
@@ -280,7 +282,12 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
         };
         const listed = (await opts.harness.listSessions()).filter((s) => s.id !== opts.sessionId);
         const others = await sessionsOfProject(vault, project.name, listed);
-        await catchUp(journal, others);
+        const caught = await catchUp(journal, others);
+        for (const f of caught.failed) out.push({ level: "warn", text: `journal catch-up failed for session ${f.session}: ${f.error}` });
+      } catch (err) {
+        out.push({ level: "warn", text: `journal catch-up: ${(err as Error).message}` });
+      }
+      try {
         await buildRollups({
           projectDir: project.dir,
           digestDir: join(projectStateDir, "digests"),
@@ -294,7 +301,7 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
             }),
         });
       } catch (err) {
-        out.push({ level: "warn", text: `journal: ${(err as Error).message}` });
+        out.push({ level: "warn", text: `journal rollups: ${(err as Error).message}` });
       }
       return { items: out, project };
     })();
