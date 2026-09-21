@@ -1,12 +1,12 @@
 ---
 name: opencode-superpower-obsidian
-description: Use the Obsidian "Da Vinci" vault as opencode's single home for memory, handoffs, specs, plans, decisions, and notes. Read, search, create, and edit notes; write and archive handoffs (HANDOFF.md), design specs (specs/), implementation plans (plans/), decisions (decisions/), and notes (notes/). Use when asked to read or write a handoff, note, memory, spec, or plan, or to touch the Obsidian vault / "Da Vinci" folder.
+description: Use your Obsidian vault as opencode's single home for memory, handoffs, specs, plans, decisions, and notes. Read, search, create, and edit notes; write and archive handoffs (HANDOFF.md), design specs (specs/), implementation plans (plans/), decisions (decisions/), and notes (notes/). Use when asked to read or write a handoff, note, memory, spec, or plan, or to touch the Obsidian vault folder.
 license: MIT
 ---
 
 # Obsidian Vault (memory + handoff + specs + plans)
 
-Use this skill for filesystem-first work in the Obsidian "Da Vinci" vault:
+Use this skill for filesystem-first work in your Obsidian vault:
 reading, searching, and writing notes, and carrying state between sessions.
 The vault is the default store for everything these systems used to keep
 separately: memory (decisions/ and notes/), handoffs (HANDOFF.md), and design
@@ -14,15 +14,21 @@ and planning artifacts (specs/ and plans/).
 
 ## Vault path
 
-The vault is a git-only repo checked out at `~/Documents/Da Vinci` on every
-machine. Resolve it from the `OBSIDIAN_VAULT_PATH` environment variable when
-set; otherwise use `~/Documents/Da Vinci`. If neither is reachable, ask the
-user for the path and set `OBSIDIAN_VAULT_PATH`.
+Resolve the vault location from the `OBSIDIAN_VAULT_PATH` environment variable.
+It is required: if it is unset, fail loudly - stop and
+tell the user to set `OBSIDIAN_VAULT_PATH` to the absolute path of their
+Obsidian vault (see README.md for setup). Do not guess, and do not fall back to
+any default path. If the variable is set but the path is unreachable, stop and
+tell the user the path is invalid rather than proceeding.
 
-File tools do not expand shell variables and the path contains a space, so
-always resolve to a concrete absolute path (e.g. `/Users/andrea/Documents/Da
-Vinci` on moonveil) before calling `read`, `write`, `edit`, `glob`, or
-`grep`. Use `bash` to check whether the path exists when unsure.
+File tools do not expand shell variables and the path may contain spaces, so
+always resolve to a concrete absolute path (e.g. `/Users/<name>/Documents/My
+Vault`) before calling `read`, `write`, `edit`, `glob`, or `grep`. Use `bash`
+to check whether the path exists when unsure.
+
+The user does not need to create any directory - on first use, opencode creates
+a `Projects/` directory at the vault root (and the `<project>/` folder plus its
+subfolders) if they do not already exist.
 
 ## Layout
 
@@ -32,10 +38,15 @@ Vinci` on moonveil) before calling `read`, `write`, `edit`, `glob`, or
 - `Projects/<project>/decisions/` - durable decisions (`YYYY-MM-DD-slug.md`).
 - `Projects/<project>/notes/` - durable notes (gotchas, procedures).
 - `Projects/<project>/archive/` - dated copies of superseded handoffs and plans.
-- `Agents/<machine>/` - per-machine working notes (astromaya, astrolinux).
+- `Agents/<machine>/` - per-machine working notes.
 
 The project folder is named after the repo/project. A session working in a
 repo maps its state to `Projects/<that-name>/`.
+
+Create the `Projects/` directory (and the `<project>/` folder plus its
+subfolders) with `bash mkdir -p` if they do not already exist inside the vault
+before writing any handoff, spec, plan, decision, or note. The user does not
+create these; opencode does.
 
 ## Handoff lifecycle
 
@@ -112,9 +123,42 @@ related content (e.g. link a HANDOFF to its plan with
 
 ## Sync
 
-The vault is git-only, synced across three machines - moonveil (this Mac),
-astrolinux, and astromaya - against the bare store
-`root@astromaya:/srv/vault.git`. A sync timer on each machine auto-commits and
-pushes roughly every 10 minutes. Write files and move on; you do not need to
-commit the vault manually. Canonical design lives in
-`Agents/astromaya/vault-sync-design.md` (the repo wins over any doc).
+`Projects/` is its own git repository. Syncing is governed by the
+`OBSIDIAN_PROJECTS_REMOTE` environment variable, which doubles as the on/off
+switch. The rule is the same everywhere: if it is unset or empty, sync is off;
+if it is nonempty, sync is on and its value is the remote URL or path. Treat an
+exported empty string the same as unset - both mean off.
+
+When sync is off: create `Projects/` and its subfolders with `mkdir -p` as
+needed, and do no git operations at all.
+
+When sync is on, follow this ordered procedure on first use and on every session:
+
+1. Determine the `Projects/` state and act accordingly:
+   - Absent or empty directory: clone `OBSIDIAN_PROJECTS_REMOTE` into
+     `Projects/`. If the remote is an empty repo (no commits yet), bootstrap it:
+     create the first commit locally and `git push -u origin main` (use the
+     remote's default branch name if it differs).
+   - Nonempty but not a git repo: stop and tell the user - their existing notes
+     need an explicit import or migration; do not overwrite them with a clone.
+   - Already a git repo: verify `origin` matches `OBSIDIAN_PROJECTS_REMOTE`
+     before any pull or push. Fail loudly on a mismatch rather than silently
+     changing it or pushing to a stale remote. After the first clone, `origin` -
+     not the env var - governs pull/push; the env var is only re-read to confirm
+     the remote has not changed.
+2. On session start, pull before reading or writing anything: `git -C
+   <vault>/Projects pull --rebase --autostash`.
+3. After edits under `Projects/`, commit noninteractively and push. First confirm
+   `user.name` and `user.email` are configured (fail with instructions if not),
+   then check `git status`, stage the intended files (`git add -A` only when the
+   whole tree is the intended change), `git commit -m "..."`, and `git push`.
+4. If the push is rejected as non-fast-forward, fetch and rebase, then retry a
+   bounded number of times. If rebasing conflicts, stop, preserve both versions,
+   and ask the user to resolve. Simultaneous edits to the same file (a shared
+   HANDOFF.md, for example) are not automatically merge-safe.
+
+Because `Projects/` is its own repo, the vault repo (if it is one) must not also
+track it. Add `Projects/` to the vault repo's root `.gitignore`. If the vault
+already tracks it, remove it from the index without deleting the files
+(`git rm -r --cached Projects`), commit that removal, and only then establish
+the nested repo.
