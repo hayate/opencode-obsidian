@@ -1,15 +1,16 @@
 ---
 name: opencode-obsidian
-description: Read, search, create, and edit notes in the Obsidian "Da Vinci" vault, and use it as a handoff and memory tool. Write and archive handoff notes (HANDOFF.md plus archive/plans/decisions/notes siblings) to carry session state across sessions. Use when asked to read or write a handoff, note, or memory, or to touch the Obsidian vault / "Da Vinci" folder.
+description: Use the Obsidian "Da Vinci" vault as opencode's single home for memory, handoffs, specs, plans, decisions, and notes. Read, search, create, and edit notes; write and archive handoffs (HANDOFF.md), design specs (specs/), implementation plans (plans/), decisions (decisions/), and notes (notes/). Use when asked to read or write a handoff, note, memory, spec, or plan, or to touch the Obsidian vault / "Da Vinci" folder.
 license: MIT
 ---
 
-# Obsidian Vault (handoff + memory)
+# Obsidian Vault (memory + handoff + specs + plans)
 
 Use this skill for filesystem-first work in the Obsidian "Da Vinci" vault:
-reading and searching notes, and carrying session state between sessions via
-the handoff convention (`HANDOFF.md` plus its `archive/`, `plans/`,
-`decisions/`, `notes/` siblings).
+reading, searching, and writing notes, and carrying state between sessions.
+The vault is the default store for everything these systems used to keep
+separately: memory (decisions/ and notes/), handoffs (HANDOFF.md), and design
+and planning artifacts (specs/ and plans/).
 
 ## Vault path
 
@@ -26,10 +27,11 @@ Vinci` on moonveil) before calling `read`, `write`, `edit`, `glob`, or
 ## Layout
 
 - `Projects/<project>/HANDOFF.md` - current in-flight state for that project.
-- `Projects/<project>/archive/` - dated copies of superseded handoffs.
-- `Projects/<project>/plans/` - dated plan files (`YYYY-MM-DD-slug.md`).
+- `Projects/<project>/specs/` - design docs / specs (`YYYY-MM-DD-<topic>-design.md`).
+- `Projects/<project>/plans/` - implementation plans (`YYYY-MM-DD-<feature-name>.md`).
 - `Projects/<project>/decisions/` - durable decisions (`YYYY-MM-DD-slug.md`).
 - `Projects/<project>/notes/` - durable notes (gotchas, procedures).
+- `Projects/<project>/archive/` - dated copies of superseded handoffs and plans.
 - `Agents/<machine>/` - per-machine working notes (astromaya, astrolinux).
 
 The project folder is named after the repo/project. A session working in a
@@ -51,6 +53,26 @@ Handoff files carry session state across sessions. Conventions:
   (e.g. `2026-09-19-handoff.md` or `HANDOFF-2026-09-20-pre28.md`).
 - Durable knowledge (decisions, gotchas, procedures) belongs in `decisions/`
   or `notes/`, not in `HANDOFF.md`. Link them with wikilinks.
+
+## Specs and plans
+
+The vault is the default store for design and planning artifacts, superseding
+repo-local `docs/superpowers/`. Before implementing a feature:
+
+- Write the spec (design doc) to
+  `Projects/<project>/specs/YYYY-MM-DD-<topic>-design.md`.
+- Write the implementation plan to
+  `Projects/<project>/plans/YYYY-MM-DD-<feature-name>.md`.
+- Link HANDOFF.md to its plan and spec with wikilinks; archive superseded
+  plans the same way as handoffs.
+
+## Memory
+
+The vault is the default store for memory. Two tiers:
+
+- Durable per-project knowledge -> `decisions/` and `notes/` (what the
+  automatic memory plugins used to keep elsewhere).
+- Session state -> `HANDOFF.md` (rewritten on stop) plus `archive/`.
 
 ## Read a note
 
