@@ -1,10 +1,11 @@
 // Spec 5.1-5.2: is sync on, and is Projects/ in a state the cycle may touch?
 // Every branch here either returns "ready" or stops with a reason a human can
 // act on. Nothing is created under Projects/ before this has run.
-import { lstat, readFile, readdir, rm, rmdir, stat, writeFile, appendFile } from "node:fs/promises";
+import { lstat, readFile, readdir, rm, rmdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { git, gitOk, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { scanDiff } from "../secrets.ts";
+import { createAt, writeAtomic } from "../store.ts";
 import { CONFIG_FILE, type Vault } from "../vault.ts";
 
 export interface SyncConfig {
@@ -86,7 +87,7 @@ export async function ensureGitignore(projectsDir: string): Promise<boolean> {
   const missing = REQUIRED_IGNORES.filter((p) => !have.has(p));
   if (!missing.length) return false;
   const prefix = current && !current.endsWith("\n") ? "\n" : "";
-  await appendFile(path, `${prefix}# superpower-remember-obsidian\n${missing.join("\n")}\n`);
+  await writeAtomic(path, `${current}${prefix}# superpower-remember-obsidian\n${missing.join("\n")}\n`);
   return true;
 }
 
@@ -100,9 +101,7 @@ async function commitAndPushNew(projectsDir: string, timezone: string, message: 
   const identity = await identityProblem(projectsDir);
   if (identity) return identity;
   await ensureGitignore(projectsDir);
-  if (!(await exists(join(projectsDir, CONFIG_FILE)))) {
-    await writeFile(join(projectsDir, CONFIG_FILE), `${JSON.stringify({ timezone }, null, 2)}\n`);
-  }
+  await createAt(join(projectsDir, CONFIG_FILE), `${JSON.stringify({ timezone }, null, 2)}\n`);
   await gitOk(["add", "-A"], { cwd: projectsDir });
   // Spec 7.5: every staged diff is scanned before commit. At bootstrap there is
   // no later cycle to hold a hit back in, so any hit stops the whole import.
@@ -117,6 +116,7 @@ async function commitAndPushNew(projectsDir: string, timezone: string, message: 
       "--cached",
       "--no-color",
       "--no-ext-diff",
+      "--no-textconv",
       "--src-prefix=a/",
       "--dst-prefix=b/",
       "-U0",
@@ -185,7 +185,16 @@ export async function prepareProjects(vault: Vault, cfg: SyncConfig, timezone: s
     };
   }
 
-  if (isRepo) return checkRepo(dir, cfg.remote);
+  if (isRepo) {
+    // A repository this call did not just bootstrap or import (Andrea's real
+    // vault: already a repo, never ran commitAndPushNew) never gets the
+    // required ignores otherwise. Only on the way out ready: a stopped state
+    // touches nothing. The write itself is committed by the next snapshot
+    // like any other file.
+    const state = await checkRepo(dir, cfg.remote);
+    if (state.kind === "ready") await ensureGitignore(dir);
+    return state;
+  }
 
   if (await isEffectivelyEmpty(dir)) {
     await clearLitter(dir);

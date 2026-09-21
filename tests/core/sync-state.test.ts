@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ensureGitignore, prepareProjects, REQUIRED_IGNORES, syncConfig, type SyncState } from "../../core/sync/state.ts";
 import { git, gitOk } from "../../core/git.ts";
@@ -211,6 +211,17 @@ test("a detached HEAD and an in-progress rebase each stop", async () => {
   assert.match(rebasing.kind === "stopped" ? rebasing.reason : "", /rebase-merge/);
 });
 
+test("an existing Projects/ repository gets the required ignore lines", async () => {
+  const v = await vault();
+  const remote = await seededRemote();
+  await gitOk(["clone", "-q", remote, v.projectsDir], { cwd: v.root });
+  await assert.rejects(stat(join(v.projectsDir, ".gitignore")));
+  const state = await prepareProjects(v, { remote }, TZ);
+  assertKind(state, "ready");
+  const ignore = await readFile(join(v.projectsDir, ".gitignore"), "utf8");
+  for (const p of REQUIRED_IGNORES) assert.ok(ignore.includes(p), p);
+});
+
 test("ensureGitignore appends only the missing patterns, once", async () => {
   const dir = await tempDir();
   await writeFile(join(dir, ".gitignore"), "node_modules\n.DS_Store");
@@ -219,6 +230,7 @@ test("ensureGitignore appends only the missing patterns, once", async () => {
   const lines = (await readFile(join(dir, ".gitignore"), "utf8")).split("\n");
   assert.equal(lines.filter((l) => l === ".DS_Store").length, 1);
   assert.ok(lines.includes("*.sro-tmp"));
+  assert.deepEqual((await readdir(dir)).filter((n) => n.endsWith(".sro-tmp")), []);
   await initRepo(dir);
   for (const path of ["kabin-api/remember/recent.md", "kabin-api/remember/archive.md", "x/.a1b2.sro-tmp"]) {
     assert.equal((await git(["check-ignore", "-q", path], { cwd: dir })).code, 0, path);

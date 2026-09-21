@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   branchKey,
   computeHeads,
+  createAt,
   createExclusive,
   listHandoffs,
   MALFORMED_BRANCH,
@@ -47,6 +48,15 @@ test("createExclusive never overwrites and leaves no temp file behind", async ()
   assert.equal(await readFile(join(dir, "x.md"), "utf8"), "original");
   assert.equal(await readFile(path, "utf8"), "new");
   assert.deepEqual((await readdir(dir)).filter((n) => n.endsWith(".sro-tmp")), []);
+});
+
+test("createAt creates once, never overwrites, and leaves no temp file behind", async () => {
+  const dir = await tempDir();
+  const path = join(dir, "sub", "origin");
+  assert.equal(await createAt(path, "first"), true);
+  assert.equal(await createAt(path, "second"), false);
+  assert.equal(await readFile(path, "utf8"), "first");
+  assert.deepEqual((await readdir(join(dir, "sub"))).filter((n) => n.endsWith(".sro-tmp")), []);
 });
 
 test("writeAtomic replaces content through a rename", async () => {

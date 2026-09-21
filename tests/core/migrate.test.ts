@@ -31,6 +31,8 @@ test("each root HANDOFF.md becomes a legacy handoff with generated frontmatter, 
   assert.match(text, /supersedes: \[\]\n---\n\n# kabin-api - handoff\nstate\n$/);
   const heads = computeHeads(await listHandoffs(join(projects, "kabin-api")));
   assert.equal(heads.byBranch.get("legacy")?.length, 1, "the migrated handoff is a valid head");
+  assert.deepEqual((await readdir(join(projects, "kabin-api", "remember", "handoffs"))).filter((n) => n.endsWith(".sro-tmp")), []);
+  assert.deepEqual((await readdir(projects)).filter((n) => n.endsWith(".sro-tmp")), []);
 });
 
 test("a project folder named p* dates its handoff from its own history, not a neighbour's", async () => {

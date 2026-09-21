@@ -1,9 +1,9 @@
 // Which Projects/<name>/ folder a session belongs to (spec 4.2). The folder name
 // is the plain repo name; remember/.origin makes it stable across machines.
-import { link, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
+import { readFile, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { git, gitOk } from "./git.ts";
+import { createAt } from "./store.ts";
 import type { Vault } from "./vault.ts";
 
 export type ProjectResolution =
@@ -131,20 +131,9 @@ export async function resolveProject(vault: Vault, sessionDir: string): Promise<
   }
 }
 
-// Written once, on first use; never overwritten. Per the plan's global constraints,
-// files the plugin creates go through a temp sibling + link, never a direct write:
-// a crash between create and write must never leave an empty, permanently-torn .origin.
+// Written once, on first use; never overwritten. createAt's temp sibling + link
+// means a crash between create and write never leaves an empty, permanently-torn
+// .origin; a false return means another writer recorded it first.
 export async function recordOrigin(projectDir: string, origin: string): Promise<void> {
-  const dir = join(projectDir, "remember");
-  await mkdir(dir, { recursive: true });
-  const tmp = join(dir, `.origin.${randomBytes(8).toString("hex")}.sro-tmp`);
-  await writeFile(tmp, `${origin}\n`);
-  try {
-    await link(tmp, join(dir, ORIGIN_FILE));
-  } catch (err) {
-    // EEXIST: another writer recorded it first. Written once, never overwritten.
-    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-  } finally {
-    await rm(tmp, { force: true });
-  }
+  await createAt(join(projectDir, "remember", ORIGIN_FILE), `${origin}\n`);
 }

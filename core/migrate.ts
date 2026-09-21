@@ -2,10 +2,10 @@
 // remember/handoffs/legacy-<sha12>.md. Every field derives from the repository,
 // so two machines migrating the same file produce byte-identical results.
 import { createHash } from "node:crypto";
-import { readFile, readdir, rm, stat, writeFile, mkdir } from "node:fs/promises";
+import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { git, literal } from "./git.ts";
-import { renderDoc } from "./store.ts";
+import { createAt, renderDoc, writeAtomic } from "./store.ts";
 
 export const SCHEMA_FILE = ".sro-schema";
 export const SCHEMA_VERSION = 1;
@@ -52,19 +52,16 @@ export async function migrateLegacyHandoffs(projectsDir: string): Promise<Migrat
       content,
     );
     const dir = join(projectsDir, entry.name, "remember", "handoffs");
-    await mkdir(dir, { recursive: true });
     const target = join(dir, `legacy-${sha12}.md`);
-    try {
-      await writeFile(target, doc, { flag: "wx" });
+    if (await createAt(target, doc)) {
       report.migrated.push(entry.name);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    } else {
       if ((await readFile(target, "utf8")) !== doc) throw new Error(`${target} exists with different content`);
       report.alreadyDone.push(entry.name);
     }
     await rm(source);
   }
-  await writeFile(join(projectsDir, SCHEMA_FILE), `${SCHEMA_VERSION}\n`);
+  await writeAtomic(join(projectsDir, SCHEMA_FILE), `${SCHEMA_VERSION}\n`);
   return report;
 }
 

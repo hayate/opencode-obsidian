@@ -2,11 +2,12 @@
 // snapshot commit (changes no file) and a `reset --keep` (all-or-nothing). All
 // fetch/rebase/push happens in a private state clone nobody else touches, so a
 // conflict or a half-applied rebase is never visible in the vault.
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock } from "../lock.ts";
 import { scanDiff } from "../secrets.ts";
+import { writeAtomic } from "../store.ts";
 import { identityProblem } from "./state.ts";
 
 export interface CycleInput {
@@ -147,8 +148,7 @@ async function readBlocked(stateDir: string): Promise<number> {
 }
 
 async function writeBlocked(stateDir: string, count: number): Promise<void> {
-  await mkdir(stateDir, { recursive: true });
-  await writeFile(join(stateDir, "blocked-cycles"), String(count));
+  await writeAtomic(join(stateDir, "blocked-cycles"), String(count));
 }
 
 async function unstage(cwd: string, file: string): Promise<void> {
@@ -213,6 +213,7 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
     "--cached",
     "--no-color",
     "--no-ext-diff",
+    "--no-textconv",
     "--src-prefix=a/",
     "--dst-prefix=b/",
     "-U0",

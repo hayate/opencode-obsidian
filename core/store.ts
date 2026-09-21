@@ -86,6 +86,26 @@ export async function createExclusive(dir: string, makeName: (rand: string) => s
   }
 }
 
+// Create a file at a fixed path without ever overwriting: write a hidden temp
+// sibling, then hard-link it to the final name (link fails if the name exists).
+// Returns whether this call created the file; when it did not, the existing
+// file is left untouched.
+export async function createAt(path: string, content: string): Promise<boolean> {
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true });
+  const tmp = join(dir, `.${basename(path)}.${randomHex(4)}.sro-tmp`);
+  await writeFile(tmp, content);
+  try {
+    await link(tmp, path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    return false;
+  } finally {
+    await rm(tmp, { force: true });
+  }
+}
+
 // Rewrite a plugin-owned file: temp sibling, then a checked rename.
 export async function writeAtomic(path: string, content: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });

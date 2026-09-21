@@ -158,6 +158,21 @@ test("a secret is held back even when the user's git config changes diff prefixe
   assert.notEqual((await git(["cat-file", "-e", "main:x/notes/creds.md"], { cwd: remote })).code, 0);
 });
 
+test("a secret is held back even when a textconv driver rewrites the diff", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  // A textconv driver configured through git attributes rewrites the diff a
+  // naive `git diff` would show; the scan must disable it, since it never
+  // controls the user's git attributes or config either.
+  await writeRel(a.projects, ".git/info/attributes", "*.md diff=hide\n");
+  await gitOk(["config", "diff.hide.textconv", "sh -c 'echo CLEAN'"], { cwd: a.projects });
+  await writeRel(a.projects, "x/notes/creds.md", `token ${TOKEN}\n`);
+  const r = await cycle(remote, a);
+  assert.deepEqual(r.heldBack, [{ file: "x/notes/creds.md", rules: ["github-token"] }]);
+  // cat-file, not show: it never falls back to interpreting the path as a pathspec.
+  assert.notEqual((await git(["cat-file", "-e", "main:x/notes/creds.md"], { cwd: remote })).code, 0);
+});
+
 test("a held-back file the remote also changed blocks the whole live update", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
@@ -522,6 +537,7 @@ test("a blocked live update counts consecutive cycles, for the escalation at 3",
   const counts: number[] = [];
   for (let i = 0; i < 3; i++) counts.push((await cycle(remote, b)).blockedCycles);
   assert.deepEqual(counts, [1, 2, 3]);
+  assert.deepEqual((await readdir(b.state)).filter((n) => n.endsWith(".sro-tmp")), []);
 });
 
 // Spec 5.4 step 5 counts blocked cycles in a row: any other cycle that runs breaks the streak.
