@@ -33,8 +33,8 @@ slug=$(basename "$plan" .md)
   || { echo "cannot derive a workspace name from: $plan" >&2; exit 2; }
 
 root="${SDD_REPO_ROOT:-$(git rev-parse --show-toplevel)}"
-[ -n "$root" ] && [ -d "$root/.git" ] \
-  || { echo "cannot resolve the code repo: set SDD_REPO_ROOT to the code repo, or run from inside it" >&2; exit 2; }
+root="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" \
+  || { echo "cannot resolve the code repo: set SDD_REPO_ROOT to the code repo (or worktree), or run from inside it" >&2; exit 2; }
 base="$root/.superpowers/sdd"
 dir="$base/$slug"
 mkdir -p "$dir"

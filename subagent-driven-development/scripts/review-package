@@ -20,8 +20,8 @@ head=$3
 [ -f "$plan" ] || { echo "no such plan file: $plan" >&2; exit 2; }
 
 root="${SDD_REPO_ROOT:-$(git rev-parse --show-toplevel)}"
-[ -n "$root" ] && [ -d "$root/.git" ] \
-  || { echo "cannot resolve the code repo: set SDD_REPO_ROOT to the code repo, or run from inside it" >&2; exit 2; }
+root="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" \
+  || { echo "cannot resolve the code repo: set SDD_REPO_ROOT to the code repo (or worktree), or run from inside it" >&2; exit 2; }
 
 git -C "$root" rev-parse --verify --quiet "$base" >/dev/null || { echo "bad BASE: $base" >&2; exit 2; }
 git -C "$root" rev-parse --verify --quiet "$head" >/dev/null || { echo "bad HEAD: $head" >&2; exit 2; }

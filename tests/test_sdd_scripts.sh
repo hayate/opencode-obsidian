@@ -43,4 +43,10 @@ SDD_REPO_ROOT="$code" "$SCRIPTS/review-package" "$plan" base tip "$pkg"
 [ -s "$pkg" ] || { echo "review-package produced no package" >&2; exit 1; }
 grep -q 'base..tip' "$pkg" || { echo "review-package missing range" >&2; exit 1; }
 
-echo "SDD scripts OK (workspace in code repo, not the vault)"
+wt="$TMP/wt"
+git -C "$code" worktree add -q "$wt" base
+SDD_REPO_ROOT="$wt" "$SCRIPTS/sdd-workspace" "$plan" >/dev/null
+[ -d "$wt/.superpowers/sdd/feature-plan" ] \
+  || { echo "workspace not created in the linked worktree" >&2; exit 1; }
+
+echo "SDD scripts OK (workspace in code repo/worktree, not the vault)"
