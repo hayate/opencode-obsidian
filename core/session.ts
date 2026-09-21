@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { git } from "./git.ts";
-import type { Harness } from "./harness.ts";
+import type { Harness, SessionRef } from "./harness.ts";
 import { buildPayload, PAYLOAD_MARKER, type StatusItem } from "./inject.ts";
 import { buildRollups, catchUp, listEntries, type JournalContext, type JournalEntry } from "./journal.ts";
 import { legacyReappeared, schemaVersion, SCHEMA_VERSION } from "./migrate.ts";
@@ -169,6 +169,24 @@ function afterSync(shown: ProjectResolution, later: { items: StatusItem[]; proje
   return items;
 }
 
+// Spec 6.2: catch-up journals this project's sessions only. A session belongs when
+// its directory resolves to this project (a worktree of the repository does);
+// one resolution per distinct directory, and one that cannot be resolved (gone,
+// unreadable, refused) is skipped.
+async function sessionsOfProject(vault: Vault, project: string, sessions: SessionRef[]): Promise<SessionRef[]> {
+  const byDirectory = new Map<string, Promise<boolean>>();
+  const mine: SessionRef[] = [];
+  for (const s of sessions) {
+    let belongs = byDirectory.get(s.directory);
+    if (!belongs) {
+      belongs = resolveSafely(vault, s.directory).then((r) => r.kind === "ok" && r.name === project);
+      byDirectory.set(s.directory, belongs);
+    }
+    if (await belongs) mine.push(s);
+  }
+  return mine;
+}
+
 export async function initializeSession(opts: SessionOptions): Promise<InitResult> {
   const now = opts.now ?? (() => new Date());
   let vault: Vault;
@@ -260,7 +278,8 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
           timezone,
           now,
         };
-        const others = (await opts.harness.listSessions()).filter((s) => s.id !== opts.sessionId);
+        const listed = (await opts.harness.listSessions()).filter((s) => s.id !== opts.sessionId);
+        const others = await sessionsOfProject(vault, project.name, listed);
         await catchUp(journal, others);
         await buildRollups({
           projectDir: project.dir,

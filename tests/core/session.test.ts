@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { access, constants, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { initializeSession, statusFromCycle, statusFromPrivacy, vaultId, type SessionOptions } from "../../core/session.ts";
-import type { Harness, SessionRef } from "../../core/harness.ts";
+import type { Harness, SessionRef, TranscriptChunk } from "../../core/harness.ts";
 import { PAYLOAD_MARKER } from "../../core/inject.ts";
 import { gitOk } from "../../core/git.ts";
 import { systemTimezone } from "../../core/vault.ts";
-import { writeJournalEntry } from "../../core/journal.ts";
+import { listEntries, writeJournalEntry } from "../../core/journal.ts";
 import { acquireLock, type LockHandle } from "../../core/lock.ts";
 import { REQUIRED_IGNORES } from "../../core/sync/state.ts";
 import { remoteVisibility } from "../../core/sync/privacy.ts";
@@ -15,11 +15,11 @@ import { commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
 
 class QuietHarness implements Harness {
   modelCalls = 0;
-  async callModel(): Promise<string> {
+  async callModel(_req: { system: string; prompt: string; parentSessionId: string }): Promise<string> {
     this.modelCalls++;
     return "digest";
   }
-  async readTranscript(sessionId: string) {
+  async readTranscript(sessionId: string): Promise<TranscriptChunk> {
     return { sessionId, messages: [] };
   }
   async listSessions(): Promise<SessionRef[]> {
@@ -561,4 +561,46 @@ test("a remote the privacy check cannot look at gets one line saying so", async 
   const items = statusFromPrivacy(alias, await remoteVisibility(alias));
   assert.deepEqual(items.map((i) => i.level), ["info"]);
   assert.match(items[0]?.text ?? "", /privacy check did not run for host github-work/);
+});
+
+// Lists the given sessions; every transcript has one message, every journal entry
+// names its session.
+class ListedHarness extends QuietHarness {
+  readonly sessions: SessionRef[];
+  readonly transcriptsRead: string[] = [];
+  constructor(sessions: SessionRef[]) {
+    super();
+    this.sessions = sessions;
+  }
+  override async listSessions(): Promise<SessionRef[]> {
+    return this.sessions;
+  }
+  override async readTranscript(sessionId: string): Promise<TranscriptChunk> {
+    this.transcriptsRead.push(sessionId);
+    return { sessionId, messages: [{ id: `${sessionId}-m1`, role: "user", text: "hello", time: Date.parse("2026-09-21T05:00:00Z") }] };
+  }
+  override async callModel(req: { system: string; prompt: string; parentSessionId: string }): Promise<string> {
+    return `journal of ${req.parentSessionId}`;
+  }
+}
+
+test("catch-up journals only the sessions whose directory is this project's repository", async () => {
+  const w = await localWorld();
+  const other = join(await tempDir(), "other-repo");
+  await initRepo(other);
+  await commitFile(other, "README.md", "x", "init");
+  await gitOk(["remote", "add", "origin", "git@github.com:acme/other.git"], { cwd: other });
+  const worktree = join(w.code, "..", "kabin-api-wt");
+  await gitOk(["worktree", "add", "-q", "-b", "wt", worktree], { cwd: w.code });
+  const harness = new ListedHarness([
+    { id: "mine", directory: w.code, updated: 2000, parentId: null },
+    { id: "worktree", directory: worktree, updated: 2001, parentId: null },
+    { id: "mine-again", directory: w.code, updated: 2002, parentId: null },
+    { id: "theirs", directory: other, updated: 3000, parentId: null },
+    { id: "gone", directory: join(w.code, "..", "does-not-exist"), updated: 4000, parentId: null },
+  ]);
+  await initializeSession(localOpts(w, { harness }));
+  const bodies = (await listEntries(w.projectDir)).map((e) => e.body).sort();
+  assert.deepEqual(bodies, ["journal of mine", "journal of mine-again", "journal of worktree"]);
+  assert.deepEqual(harness.transcriptsRead.sort(), ["mine", "mine-again", "worktree"]);
 });
