@@ -35,6 +35,26 @@ function randomHex(bytes: number): string {
   return randomBytes(bytes).toString("hex");
 }
 
+const STATUS_TEXT_MAX = 120;
+
+// A string read from the vault, shown inside plugin text such as a status line
+// (which sits outside the payload's data block): quoted, escaped (JSON, plus the
+// line and format characters JSON leaves raw) and capped, so it can neither pass
+// for plugin text nor add lines of its own.
+export function quoted(value: string): string {
+  const chars = [...value];
+  const short = chars.length > STATUS_TEXT_MAX ? `${chars.slice(0, STATUS_TEXT_MAX - 3).join("")}...` : value;
+  return JSON.stringify(short).replace(/[\u007f-\u009f\u2028\u2029\p{Cf}]/gu, (c) => {
+    const cp = c.codePointAt(0) ?? 0;
+    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, "0")}`;
+  });
+}
+
+// A folder name from the vault, shown as is when it is plain, quoted otherwise.
+export function vaultName(name: string): string {
+  return /^[^\p{Cc}\p{Cf}\u2028\u2029`]{1,120}$/u.test(name) ? name : quoted(name);
+}
+
 export function sanitizeKey(value: string): string {
   return value.replace(/\//g, "--").replace(/[^A-Za-z0-9._-]/g, "-");
 }
@@ -173,19 +193,20 @@ export async function listHandoffs(projectDir: string, opts: { includeLegacyRoot
 
 // Heads: valid handoffs no valid handoff supersedes. The rules only ever keep
 // more heads visible, never fewer: a malformed file cannot hide a valid one, an
-// unknown reference is ignored, and every member of a cycle is a head.
+// unknown reference is ignored, and every member of a cycle is a head. Problems
+// become status lines, so every vault string in them is quoted.
 export function computeHeads(handoffs: Handoff[]): Heads {
   const problems: string[] = [];
   const valid = new Map<string, HandoffMeta>();
   for (const h of handoffs) {
     if (h.meta) valid.set(h.id, h.meta);
-    else problems.push(`handoff ${h.id} is malformed (${h.problem}); shown as its own head`);
+    else problems.push(`handoff ${quoted(h.id)} is malformed (${quoted(h.problem ?? "")}); shown as its own head`);
   }
   const superseded = new Set<string>();
   for (const [id, meta] of valid) {
     for (const parent of meta.supersedes) {
       if (valid.has(parent)) superseded.add(parent);
-      else problems.push(`handoff ${id} supersedes unknown ${parent}`);
+      else problems.push(`handoff ${quoted(id)} supersedes unknown ${quoted(parent)}`);
     }
   }
   const inCycle = new Set<string>();
@@ -203,7 +224,9 @@ export function computeHeads(handoffs: Handoff[]): Heads {
       stack.push(...(valid.get(id)?.supersedes ?? []));
     }
   }
-  if (inCycle.size) problems.push(`supersedes cycle among ${[...inCycle].sort().join(", ")}; all shown as heads`);
+  if (inCycle.size) {
+    problems.push(`supersedes cycle among ${[...inCycle].sort().map((id) => quoted(id)).join(", ")}; all shown as heads`);
+  }
 
   const byBranch = new Map<string, Handoff[]>();
   for (const h of handoffs) {

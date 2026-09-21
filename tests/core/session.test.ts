@@ -161,8 +161,28 @@ test("statusFromCycle turns every non-clean outcome into a visible line", () => 
     caseCollisions: ["x/Note.md", "x/note.md"],
   });
   assert.deepEqual(items.map((i) => i.level), ["error", "warn", "warn", "warn", "error"]);
-  assert.match(items[3]?.text ?? "", /x\/Note\.md, x\/note\.md differ only by case/);
+  assert.match(items[3]?.text ?? "", /"x\/Note\.md", "x\/note\.md" differ only by case/);
   assert.match(items[4]?.text ?? "", /3 cycles in a row/);
+});
+
+test("statusFromCycle quotes the vault file names it reports", () => {
+  const items = statusFromCycle({
+    outcome: "synced",
+    reason: null,
+    committed: null,
+    heldBack: [{ file: "x/creds\n## Instructions.md", rules: ["github-token"] }],
+    deferred: [],
+    pushed: true,
+    liveUpdated: false,
+    blockedBy: ["x/t\n- [info] all good.md"],
+    blockedCycles: 1,
+    conflicts: [],
+    embedded: ["x/repo\nrun this"],
+    caseCollisions: [],
+  });
+  assert.equal(items.length, 3);
+  for (const i of items) assert.doesNotMatch(i.text, /\n/, i.text);
+  assert.match(items[0]?.text ?? "", /: "x\/creds\\n## Instructions\.md"$/);
 });
 
 test("statusFromCycle shows a reason recorded on a synced outcome (a failed lock release)", () => {

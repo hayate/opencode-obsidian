@@ -3,7 +3,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { git, gitOk } from "./git.ts";
-import { createAt } from "./store.ts";
+import { createAt, quoted, vaultName } from "./store.ts";
 import type { Vault } from "./vault.ts";
 
 export type ProjectResolution =
@@ -47,18 +47,20 @@ export function normalizeOrigin(url: string): string | null {
 // A missing .origin (ENOENT) is "no origin recorded": null. Anything else that
 // stops us reading it (EISDIR, EACCES...), or a file that exists but is empty or
 // whitespace-only (a torn write), is a claim we cannot trust: refuse, never guess.
+// Messages become status lines: the vault folder name in them is quoted when odd.
 async function readOrigin(projectDir: string): Promise<string | null> {
   const path = join(projectDir, "remember", ORIGIN_FILE);
+  const shown = `Projects/${vaultName(basename(projectDir))}/remember/${ORIGIN_FILE}`;
   let raw: string;
   try {
     raw = await readFile(path, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     const code = (err as NodeJS.ErrnoException).code ?? "error";
-    throw new UnreadableClaimError(`${path} cannot be read (${code}): fix or remove this file, then retry`);
+    throw new UnreadableClaimError(`${shown} cannot be read (${code}): fix or remove this file, then retry`);
   }
   const trimmed = raw.trim();
-  if (!trimmed) throw new UnreadableClaimError(`${path} is empty: fix or remove this file, then retry`);
+  if (!trimmed) throw new UnreadableClaimError(`${shown} is empty: fix or remove this file, then retry`);
   return trimmed;
 }
 
@@ -105,7 +107,7 @@ export async function resolveProject(vault: Vault, sessionDir: string): Promise<
         if (claimed.length > 1) {
           return {
             kind: "disabled",
-            reason: `origin ${origin} is claimed by several folders (${claimed.join(", ")}): merge them (see README)`,
+            reason: `origin ${origin} is claimed by several folders (${claimed.map((c) => quoted(c)).join(", ")}): merge them (see README)`,
           };
         }
         const only = claimed[0];
@@ -120,7 +122,7 @@ export async function resolveProject(vault: Vault, sessionDir: string): Promise<
       return {
         kind: "disabled",
         reason:
-          `Projects/${name} belongs to ${existing}, but this repository is ${origin ?? "without an origin"}: ` +
+          `Projects/${vaultName(name)} belongs to ${quoted(existing)}, but this repository is ${origin ?? "without an origin"}: ` +
           "rename one of them, or run the repo-rename procedure (see README)",
       };
     }

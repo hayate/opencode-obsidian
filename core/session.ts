@@ -13,7 +13,7 @@ import { buildRollups, catchUp, listEntries, type JournalContext } from "./journ
 import { legacyReappeared, schemaVersion, SCHEMA_VERSION } from "./migrate.ts";
 import { recordOrigin, resolveProject, type ProjectResolution } from "./project.ts";
 import { acquireLock } from "./lock.ts";
-import { branchKey, computeHeads, listHandoffs, sanitizeKey } from "./store.ts";
+import { branchKey, computeHeads, listHandoffs, quoted, sanitizeKey, vaultName } from "./store.ts";
 import { runCycle, type CycleResult } from "./sync/cycle.ts";
 import { remoteVisibility } from "./sync/privacy.ts";
 import { prepareProjects, syncConfig, type SyncState } from "./sync/state.ts";
@@ -81,27 +81,30 @@ export function statusFromSync(state: SyncState): StatusItem[] {
   }
 }
 
+// File names come from the vault, and status lines sit outside the payload's data
+// block: every one is quoted.
 export function statusFromCycle(r: CycleResult): StatusItem[] {
   const out: StatusItem[] = [];
+  const files = (list: string[]): string => list.map((f) => quoted(f)).join(", ");
   if (r.outcome === "paused") out.push({ level: "error", text: r.reason ?? "sync paused" });
   if (r.outcome === "unsynced") out.push({ level: "warn", text: `unsynced: ${r.reason ?? "push did not happen"}` });
   if (r.outcome === "aborted") out.push({ level: "error", text: `sync aborted: ${r.reason ?? ""}` });
   if (r.outcome === "busy") out.push({ level: "info", text: "another session is syncing; this one will sync when idle" });
   // runCycle records a problem that did not stop the sync (a failed lock release) here.
   if (r.outcome === "synced" && r.reason) out.push({ level: "warn", text: r.reason });
-  for (const h of r.heldBack) out.push({ level: "warn", text: `held back by the secret scan (${h.rules.join(", ")}): ${h.file}` });
-  for (const e of r.embedded) out.push({ level: "warn", text: `not synced: ${e} is a git repository inside Projects/ (move it out, or remove its .git)` });
+  for (const h of r.heldBack) out.push({ level: "warn", text: `held back by the secret scan (${h.rules.join(", ")}): ${quoted(h.file)}` });
+  for (const e of r.embedded) out.push({ level: "warn", text: `not synced: ${quoted(e)} is a git repository inside Projects/ (move it out, or remove its .git)` });
   if (r.caseCollisions.length) {
     out.push({
       level: "warn",
-      text: `${r.caseCollisions.join(", ")} differ only by case; this filesystem holds one file for them, so only that one syncs (rename one on a case-sensitive machine)`,
+      text: `${files(r.caseCollisions)} differ only by case; this filesystem holds one file for them, so only that one syncs (rename one on a case-sensitive machine)`,
     });
   }
   if (r.blockedBy.length) {
     // Spec 5.4 step 5: after 3 blocked cycles in a row the status escalates (the adapter notifies on errors).
     out.push({
       level: r.blockedCycles >= 3 ? "error" : "warn",
-      text: `live update blocked by local edits to: ${r.blockedBy.join(", ")}${r.blockedCycles > 1 ? ` (${r.blockedCycles} cycles in a row)` : ""}`,
+      text: `live update blocked by local edits to: ${files(r.blockedBy)}${r.blockedCycles > 1 ? ` (${r.blockedCycles} cycles in a row)` : ""}`,
     });
   }
   return out;
@@ -256,7 +259,7 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       remote: cfg.remote,
     };
     if (await legacyReappeared(vault.projectsDir, project.name)) {
-      status.push({ level: "warn", text: `Projects/${project.name}/HANDOFF.md reappeared after migration (an old client?); it is not read` });
+      status.push({ level: "warn", text: `Projects/${vaultName(project.name)}/HANDOFF.md reappeared after migration (an old client?); it is not read` });
     }
     const includeLegacyRoot = (await schemaVersion(vault.projectsDir)) < SCHEMA_VERSION;
     const heads = computeHeads(await listHandoffs(project.dir, { includeLegacyRoot }));

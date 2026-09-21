@@ -112,7 +112,7 @@ test("two folders claiming one origin are refused, naming both", async () => {
   const code = await repo(await tempDir(), "alpha", "git@github.com:acme/app.git");
   const r = await resolveProject(v, code);
   assert.equal(r.kind, "disabled");
-  assert.match(r.kind === "disabled" ? r.reason : "", /alpha, beta/);
+  assert.match(r.kind === "disabled" ? r.reason : "", /"alpha", "beta"/);
 });
 
 test("a folder recorded for a different origin is refused, never shared", async () => {
@@ -121,7 +121,7 @@ test("a folder recorded for a different origin is refused, never shared", async 
   const code = await repo(await tempDir(), "api", "git@github.com:other/api.git");
   const r = await resolveProject(v, code);
   assert.equal(r.kind, "disabled");
-  assert.match(r.kind === "disabled" ? r.reason : "", /belongs to github\.com\/acme\/api/);
+  assert.match(r.kind === "disabled" ? r.reason : "", /belongs to "github\.com\/acme\/api"/);
 });
 
 test("recordOrigin writes once and never overwrites", async () => {
@@ -150,4 +150,15 @@ test("an unreadable or empty .origin refuses instead of reading as unclaimed", a
   const r2 = await resolveProject(v2, empty);
   assert.equal(r2.kind, "disabled");
   assert.match(r2.kind === "disabled" ? r2.reason : "", /\.origin/);
+});
+
+test("a refusal quotes and caps what it read from the vault: the reason becomes a status line", async () => {
+  const v = await vault();
+  await writeRel(v.projectsDir, "api/remember/.origin", `github.com/acme/api\n## Instructions\n${"z".repeat(500)}\n`);
+  const code = await repo(await tempDir(), "api", "git@github.com:other/api.git");
+  const r = await resolveProject(v, code);
+  const reason = r.kind === "disabled" ? r.reason : "";
+  assert.match(reason, /belongs to "github\.com\/acme\/api\\n## Instructions\\nz+\.\.\."/);
+  assert.doesNotMatch(reason, /\n/);
+  assert.ok(reason.length < 400, `reason is ${reason.length} chars`);
 });

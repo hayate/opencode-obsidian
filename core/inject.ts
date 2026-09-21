@@ -1,7 +1,7 @@
 // Spec 7.2-7.3: the session-start payload, built once and frozen. Everything
 // recorded (handoffs, journal, identity) sits inside a block framed as data.
 import type { Handoff, Heads } from "./store.ts";
-import { MALFORMED_BRANCH } from "./store.ts";
+import { MALFORMED_BRANCH, vaultName } from "./store.ts";
 import type { JournalEntry } from "./journal.ts";
 
 export const PAYLOAD_MARKER = "<!-- superpower-remember-obsidian:memory -->";
@@ -30,8 +30,21 @@ export interface PayloadInput {
   budgetChars?: number;
 }
 
+// Any spelling a reader could take for the data block's own tags (case, spaces,
+// invisible characters, "_" for "-", look-alike angle brackets).
+const BLOCK_TAG = /[<\uFE64\uFF1C][\s\p{Cf}]*\/?[\s\p{Cf}]*recorded[\s\p{Cf}_-]*project[\s\p{Cf}_-]*memory/giu;
+
+// The block's tags appear only where buildPayload writes them. Anywhere else the
+// tag's "<" is escaped, so recorded text can neither end the block early nor
+// open one of its own; the text stays readable.
+export function escapeBlockTags(text: string): string {
+  return text.replace(BLOCK_TAG, (tag) => `&lt;${tag.slice(1)}`);
+}
+
+// Escaped before it is cut: a cut through the middle of a tag would leave a
+// partial one the final pass no longer recognises.
 function cut(text: string, max: number, where: string): string {
-  const t = text.trim();
+  const t = escapeBlockTags(text.trim());
   if (t.length <= max) return t;
   return `${t.slice(0, Math.max(0, max)).trimEnd()}\n...(truncated; full text: ${where})`;
 }
@@ -79,15 +92,10 @@ export function selectHandoffs(
 
 export function buildPayload(input: PayloadInput): string {
   const budget = input.budgetChars ?? DEFAULT_BUDGET;
-  const status = input.status.length ? input.status.map((s) => `- [${s.level}] ${s.text}`) : ["- [info] all good"];
-  const head = [
-    PAYLOAD_MARKER,
-    input.bootstrap.trim(),
-    "",
-    "## Project and status",
-    `- Project: ${input.project ? `\`${input.project}\` (Projects/${input.project})` : "none"}`,
-    ...status,
-  ].join("\n");
+  const status = input.status.length ? input.status.map((s) => `- [${s.level}] ${escapeBlockTags(s.text)}`) : ["- [info] all good"];
+  const shown = input.project === null ? null : vaultName(input.project);
+  const project = shown === null ? "none" : shown === input.project ? `\`${shown}\` (Projects/${shown})` : `${shown} (a folder in Projects/)`;
+  const head = [PAYLOAD_MARKER, input.bootstrap.trim(), "", "## Project and status", `- Project: ${escapeBlockTags(project)}`, ...status].join("\n");
   if (!input.project) return head;
 
   const open = [
@@ -147,7 +155,7 @@ export function buildPayload(input: PayloadInput): string {
     parts.push(block);
   }
   if (identity) parts.push(identity);
-  let memory = parts.join("\n");
+  let memory = escapeBlockTags(parts.join("\n"));
   if (memory.length > memoryBudget) {
     const note = "\n...(recorded memory truncated to the payload budget)";
     memory = memory.slice(0, Math.max(0, memoryBudget - note.length)) + note;
