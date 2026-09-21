@@ -6,9 +6,12 @@ import { git, gitOk } from "./git.ts";
 import { createAt, MemoryPathError, quoted, readMemoryFile, vaultName } from "./store.ts";
 import type { Vault } from "./vault.ts";
 
+// `bare` marks the one refusal no pull can change (spec 4.2 step 1). Every other
+// refusal (ambiguity, collision, an unreadable claim) may be fixed by what the
+// session-start pull brings, so the caller decides again after it.
 export type ProjectResolution =
   | { kind: "ok"; name: string; origin: string | null; dir: string }
-  | { kind: "disabled"; reason: string };
+  | { kind: "disabled"; reason: string; bare: boolean };
 
 export const ORIGIN_FILE = ".origin";
 
@@ -99,7 +102,7 @@ export async function resolveProject(vault: Vault, sessionDir: string): Promise<
     if (bare.code !== 0) {
       name = basename(sessionDir); // not a git repository
     } else if (bare.stdout.trim() === "true") {
-      return { kind: "disabled", reason: `${sessionDir} is a bare repository: memory and sync are disabled` };
+      return { kind: "disabled", reason: `${sessionDir} is a bare repository: memory and sync are disabled`, bare: true };
     } else {
       const remote = await git(["config", "--get", "remote.origin.url"], { cwd: sessionDir });
       origin = remote.code === 0 ? normalizeOrigin(remote.stdout) : null;
@@ -109,6 +112,7 @@ export async function resolveProject(vault: Vault, sessionDir: string): Promise<
           return {
             kind: "disabled",
             reason: `origin ${origin} is claimed by several folders (${claimed.map((c) => quoted(c)).join(", ")}): merge them (see README)`,
+            bare: false,
           };
         }
         const only = claimed[0];
@@ -125,11 +129,12 @@ export async function resolveProject(vault: Vault, sessionDir: string): Promise<
         reason:
           `Projects/${vaultName(name)} belongs to ${quoted(existing)}, but this repository is ${origin ?? "without an origin"}: ` +
           "rename one of them, or run the repo-rename procedure (see README)",
+        bare: false,
       };
     }
     return { kind: "ok", name, origin, dir };
   } catch (err) {
-    if (err instanceof UnreadableClaimError) return { kind: "disabled", reason: err.message };
+    if (err instanceof UnreadableClaimError) return { kind: "disabled", reason: err.message, bare: false };
     throw err;
   }
 }

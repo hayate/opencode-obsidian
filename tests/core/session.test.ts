@@ -2,12 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, readFile, stat, symlink } from "node:fs/promises";
 import { join } from "node:path";
-import { initializeSession, statusFromCycle, type SessionOptions } from "../../core/session.ts";
+import { initializeSession, statusFromCycle, vaultId, type SessionOptions } from "../../core/session.ts";
 import type { Harness, SessionRef } from "../../core/harness.ts";
 import { PAYLOAD_MARKER } from "../../core/inject.ts";
 import { gitOk } from "../../core/git.ts";
 import { systemTimezone } from "../../core/vault.ts";
 import { writeJournalEntry } from "../../core/journal.ts";
+import { acquireLock, type LockHandle } from "../../core/lock.ts";
+import { REQUIRED_IGNORES } from "../../core/sync/state.ts";
 import { commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
 
 class QuietHarness implements Harness {
@@ -415,3 +417,78 @@ for (const c of symlinkCases) {
     assert.match(lines, c.reported);
   });
 }
+
+// Holds the machine-wide preparation lock, so a session's sync work waits (before
+// the pull and the post-pull identity) until the test releases it.
+async function holdPrepareLock(w: { vaultRoot: string; stateRoot: string }): Promise<LockHandle> {
+  const lock = await acquireLock(join(w.stateRoot, vaultId(w.vaultRoot), "prepare.lock"));
+  assert.ok(lock, "the test must hold the prepare lock");
+  return lock;
+}
+
+// The remote holds two folders claiming one origin (first use on two machines
+// under different clone names); this machine's vault starts empty.
+async function twoClaimsWorld(config = JSON.stringify({ timezone: "Asia/Tokyo" })) {
+  const remote = join(await tempDir("sro-remote-"), "projects.git");
+  await gitOk(["init", "-q", "--bare", "-b", "main", remote], { cwd: await tempDir() });
+  const seed = join(await tempDir(), "seed");
+  await gitOk(["clone", "-q", remote, seed], { cwd: await tempDir() });
+  await writeRel(seed, ".gitignore", `${REQUIRED_IGNORES.join("\n")}\n`);
+  await writeRel(seed, ".sro-config.json", config);
+  for (const f of ["kabin-api", "kabin-api-2"]) await writeRel(seed, `${f}/remember/.origin`, "github.com/acme/kabin-api\n");
+  await gitOk(["add", "-A"], { cwd: seed });
+  await gitOk(["commit", "-q", "-m", "two claims"], { cwd: seed });
+  await gitOk(["push", "-q", "origin", "HEAD"], { cwd: seed });
+  const vaultRoot = await tempDir("sro-vault-");
+  await mkdir(join(vaultRoot, ".obsidian"));
+  const code = join(await tempDir(), "kabin-api");
+  await initRepo(code);
+  await commitFile(code, "README.md", "x", "init");
+  await gitOk(["remote", "add", "origin", "git@github.com:acme/kabin-api.git"], { cwd: code });
+  return { vaultRoot, remote, code, stateRoot: await tempDir("sro-state-"), seed };
+}
+
+// Machine A merges the duplicate folders (the documented procedure) and pushes.
+async function mergeClaims(seed: string): Promise<void> {
+  await gitOk(["pull", "-q", "--rebase"], { cwd: seed });
+  await gitOk(["rm", "-rq", "kabin-api-2"], { cwd: seed });
+  await gitOk(["commit", "-q", "-m", "merge duplicate"], { cwd: seed });
+  await gitOk(["push", "-q", "origin", "HEAD"], { cwd: seed });
+}
+
+test("an identity refusal before the pull does not stop the pull that resolves it", async () => {
+  const w = await twoClaimsWorld();
+  const first = await initializeSession(opts(w, { sessionId: "s1" }));
+  assert.equal(first.context, null);
+  assert.match(first.payload, /claimed by several folders \("kabin-api", "kabin-api-2"\)/);
+  await mergeClaims(w.seed);
+  const next = await initializeSession(opts(w, { sessionId: "s2" }));
+  assert.equal(next.context?.project, "kabin-api", next.status.map((s) => s.text).join("\n"));
+});
+
+test("a refusal after the pull keeps the sync status lines in the payload", async () => {
+  const w = await twoClaimsWorld("{ not json");
+  const r = await initializeSession(opts(w));
+  assert.equal(r.context, null);
+  assert.match(r.payload, /\[error\] memory and sync disabled: .*claimed by several folders/);
+  assert.match(r.payload, /\[warn\] \.sro-config\.json is not valid JSON/, "the post-pull warning is kept");
+  assert.ok(r.status.some((s) => /is not valid JSON/.test(s.text)));
+});
+
+test("a session refused before a slow pull learns in the background that the pull resolved it", async () => {
+  const w = await twoClaimsWorld();
+  await initializeSession(opts(w, { sessionId: "s1" })); // this machine now has both folders
+  await mergeClaims(w.seed);
+  const lock = await holdPrepareLock(w);
+  let r;
+  try {
+    r = await initializeSession(opts(w, { sessionId: "s2", waitMs: 1_500 }));
+  } finally {
+    await lock.release();
+  }
+  assert.equal(r.context, null);
+  assert.match(r.payload, /claimed by several folders/);
+  assert.match(r.payload, /sync still running/);
+  const later = (await r.background).map((s) => s.text).join("\n");
+  assert.match(later, /maps to Projects\/kabin-api; restart the session/);
+});

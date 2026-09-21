@@ -109,13 +109,35 @@ export function statusFromCycle(r: CycleResult): StatusItem[] {
   return out;
 }
 
-function disabled(bootstrap: string, reason: string): InitResult {
+// No project: the bootstrap and the status lines only. The sync lines gathered
+// before the refusal stay, and so does the background work, if any.
+function disabled(
+  bootstrap: string,
+  reason: string,
+  status: StatusItem[] = [],
+  background: Promise<StatusItem[]> = Promise.resolve([]),
+): InitResult {
+  const all: StatusItem[] = [{ level: "error", text: `memory and sync disabled: ${reason}` }, ...status];
   return {
-    payload: `${PAYLOAD_MARKER}\n${bootstrap.trim()}\n\n## Project and status\n- [error] memory and sync disabled: ${reason}`,
-    status: [{ level: "error", text: `memory and sync disabled: ${reason}` }],
+    payload: `${PAYLOAD_MARKER}\n${bootstrap.trim()}\n\n## Project and status\n${all.map((s) => `- [${s.level}] ${s.text}`).join("\n")}`,
+    status: all,
     context: null,
-    background: Promise.resolve([]),
+    background,
   };
+}
+
+// The sync work's own lines, once it ends after the payload was built, plus what
+// the session must be told when the identity it was shown is no longer right.
+function afterSync(shown: ProjectResolution, later: { items: StatusItem[]; project: ProjectResolution }): StatusItem[] {
+  const { items, project } = later;
+  if (project.kind === "ok" && (shown.kind === "disabled" || project.name !== shown.name)) {
+    const not = shown.kind === "ok" ? `, not ${vaultName(shown.name)}` : "";
+    return [...items, { level: "warn", text: `after sync this repository maps to Projects/${vaultName(project.name)}${not}; restart the session` }];
+  }
+  if (project.kind === "disabled" && shown.kind === "ok") {
+    return [...items, { level: "error", text: `after sync memory and sync are disabled: ${project.reason}; restart the session` }];
+  }
+  return items;
 }
 
 export async function initializeSession(opts: SessionOptions): Promise<InitResult> {
@@ -134,10 +156,12 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
     } catch (err) {
       status.push({ level: "warn", text: `${(err as Error).message}; using ${timezone}` });
     }
-    // Early answer only (a bare repository is refused before any work); the real
-    // identity is resolved again after the pull, below.
+    // Early answer only. A bare repository is refused before any work: no pull can
+    // change that. Any other refusal may be fixed by what the pull brings (another
+    // machine merged two claiming folders), so the sync runs and the identity
+    // resolved after the pull, below, decides.
     const early = await resolveProject(vault, opts.sessionDir);
-    if (early.kind === "disabled") return disabled(opts.bootstrap, early.reason);
+    if (early.kind === "disabled" && early.bare) return disabled(opts.bootstrap, early.reason, status);
 
     const cfg = syncConfig(opts.env);
     const stateDir = join(opts.stateRoot ?? DEFAULT_STATE_ROOT, vaultId(vault.root));
@@ -193,10 +217,7 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       // already claimed, or it would claim a duplicate one under its own clone name.
       const project = await resolveProject(vault, opts.sessionDir);
       resolved = project;
-      if (project.kind === "disabled") {
-        out.push({ level: "error", text: project.reason });
-        return { items: out, project };
-      }
+      if (project.kind === "disabled") return { items: out, project };
       if (project.origin && state.kind !== "stopped") await recordOrigin(project.dir, project.origin);
       try {
         const projectStateDir = join(stateDir, project.name);
@@ -243,7 +264,14 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
     if (first.kind === "done") status.push(...first.value.items);
     if (first.kind === "failed") status.push({ level: "error", text: `sync failed: ${(first.err as Error).message}` });
     if (first.kind === "timeout") status.push({ level: "warn", text: "sync still running - memory may be stale" });
-    if (project.kind === "disabled") return disabled(opts.bootstrap, project.reason);
+    const background =
+      first.kind === "timeout"
+        ? work.then(
+            (later) => afterSync(project, later),
+            (err: unknown) => [{ level: "error" as const, text: `sync failed: ${(err as Error).message}` }],
+          )
+        : Promise.resolve([]);
+    if (project.kind === "disabled") return disabled(opts.bootstrap, project.reason, status, background);
 
     const ctx: SessionContext = {
       vault,
@@ -301,17 +329,6 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       identity,
       now: now(),
     });
-    const shownAs = project.name;
-    const background =
-      first.kind === "timeout"
-        ? work.then(
-            ({ items, project: later }) =>
-              later.kind === "ok" && later.name !== shownAs
-                ? [...items, { level: "warn" as const, text: `after sync this repository maps to Projects/${later.name}, not ${shownAs}; restart the session` }]
-                : items,
-            (err: unknown) => [{ level: "error" as const, text: `sync failed: ${(err as Error).message}` }],
-          )
-        : Promise.resolve([]);
     return { payload, status, context: ctx, background };
   } catch (err) {
     return disabled(opts.bootstrap, `unexpected error: ${(err as Error).message}`);
