@@ -1,8 +1,9 @@
 // Spec 5.1-5.2: is sync on, and is Projects/ in a state the cycle may touch?
 // Every branch here either returns "ready" or stops with a reason a human can
 // act on. Nothing is created under Projects/ before this has run.
-import { lstat, readFile, readdir, rm, rmdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { lstat, readFile, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { git, gitOk, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { scanStaged } from "../secrets.ts";
 import { createAt, writeAtomic } from "../store.ts";
@@ -123,6 +124,59 @@ async function removeCreatedGit(projectsDir: string): Promise<void> {
   await rm(join(projectsDir, ".git"), { recursive: true, force: true });
 }
 
+// The steps after this call created Projects/.git, up to its first push. Any
+// failure there, returned or thrown (git add on an unreadable note, a filter, a
+// failed write), removes that .git: a repository with no commit left behind would
+// otherwise end every later session "unsynced" (spec 5.2). A thrown error is
+// rethrown after the cleanup; session.ts reports it.
+async function firstPush(projectsDir: string, remote: string, steps: () => Promise<string | null>): Promise<SyncState> {
+  let failed: string | null;
+  try {
+    failed = await steps();
+  } catch (err) {
+    await removeCreatedGit(projectsDir).catch((cleanup: unknown) => {
+      throw new Error(`${(err as Error).message}; removing the Projects/.git it created also failed: ${(cleanup as Error).message}`);
+    });
+    throw err;
+  }
+  if (failed) {
+    await removeCreatedGit(projectsDir);
+    return { kind: "stopped", reason: failed };
+  }
+  const ready = await checkRepo(projectsDir, remote);
+  return ready.kind === "ready" ? { ...ready, bootstrapped: true } : ready;
+}
+
+// An effectively empty Projects/ is cloned into a hidden temporary sibling in the
+// vault root and moved into place only once the clone is known good: a failed
+// clone, or one killed at its timeout (a killed git cleans nothing up), never
+// leaves a half-made Projects/.git. Returns whether the remote had a commit to
+// check out, or why it stopped.
+async function cloneIntoPlace(root: string, projectsDir: string, remote: string): Promise<{ populated: boolean } | string> {
+  const tmp = join(root, `.${basename(projectsDir)}.${randomBytes(4).toString("hex")}.sro-tmp`);
+  try {
+    const clone = await git(["clone", "-q", remote, tmp], { cwd: root, timeoutMs: NETWORK_TIMEOUT_MS });
+    if (clone.code !== 0 || clone.timedOut) {
+      return `clone of ${remote} failed: ${clone.stderr.trim() || (clone.timedOut ? "timed out" : `git exited ${clone.code}`)}`;
+    }
+    const populated = (await git(["rev-parse", "--verify", "-q", "HEAD"], { cwd: tmp })).code === 0;
+    if (!populated) {
+      const branches = await remoteHasBranches(tmp, remote);
+      if (typeof branches === "string") return branches;
+      if (branches) {
+        return "the remote has branches but its HEAD names a missing one (e.g. a master-default bare repo); set the remote's default branch";
+      }
+    }
+    // Projects/ is absent or an empty directory now (its litter was cleared). A
+    // directory renames only onto a missing or empty one, so a note written there
+    // in the meantime makes this fail instead of being replaced.
+    await rename(tmp, projectsDir);
+    return { populated };
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
 async function vaultTracksProjects(vaultRoot: string): Promise<boolean> {
   if (!(await exists(join(vaultRoot, ".git")))) return false;
   const r = await git(["ls-files", "--", "Projects"], { cwd: vaultRoot });
@@ -130,6 +184,15 @@ async function vaultTracksProjects(vaultRoot: string): Promise<boolean> {
 }
 
 async function checkRepo(projectsDir: string, remote: string): Promise<SyncState> {
+  // Only an older version's failed bootstrap, import or killed clone leaves a
+  // repository with no commit. It holds nothing to keep, whatever its origin.
+  if ((await git(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: projectsDir })).code !== 0) {
+    return {
+      kind: "stopped",
+      reason:
+        "Projects/ is a git repository with no commit (left by an interrupted clone, bootstrap or import): delete Projects/.git (the notes stay) and start a new session",
+    };
+  }
   const origin = await git(["config", "--get", "remote.origin.url"], { cwd: projectsDir });
   if (origin.code !== 0 || origin.stdout.trim() !== remote) {
     return {
@@ -179,25 +242,11 @@ export async function prepareProjects(vault: Vault, cfg: SyncConfig, timezone: s
 
   if (await isEffectivelyEmpty(dir)) {
     await clearLitter(dir);
-    const clone = await git(["clone", "-q", cfg.remote, dir], { cwd: vault.root, timeoutMs: NETWORK_TIMEOUT_MS });
-    if (clone.code !== 0) return { kind: "stopped", reason: `clone of ${cfg.remote} failed: ${clone.stderr.trim() || "timed out"}` };
-    const head = await git(["rev-parse", "--verify", "-q", "HEAD"], { cwd: dir });
-    if (head.code === 0) return checkRepo(dir, cfg.remote);
-    const branches = await remoteHasBranches(dir, cfg.remote);
-    if (typeof branches === "string") return { kind: "stopped", reason: branches };
-    if (branches) {
-      return {
-        kind: "stopped",
-        reason: "the remote has branches but its HEAD names a missing one (e.g. a master-default bare repo); set the remote's default branch",
-      };
-    }
-    const failed = await commitAndPushNew(dir, timezone, "bootstrap Projects/");
-    if (failed) {
-      await removeCreatedGit(dir);
-      return { kind: "stopped", reason: failed };
-    }
-    const ready = await checkRepo(dir, cfg.remote);
-    return ready.kind === "ready" ? { ...ready, bootstrapped: true } : ready;
+    const cloned = await cloneIntoPlace(vault.root, dir, cfg.remote);
+    if (typeof cloned === "string") return { kind: "stopped", reason: cloned };
+    // A clone with a commit is a complete repository on its own: nothing to undo.
+    if (cloned.populated) return checkRepo(dir, cfg.remote);
+    return firstPush(dir, cfg.remote, () => commitAndPushNew(dir, timezone, "bootstrap Projects/"));
   }
 
   // Nonempty and not a repository: import only into an empty remote.
@@ -209,13 +258,10 @@ export async function prepareProjects(vault: Vault, cfg: SyncConfig, timezone: s
       reason: "Projects/ has notes but is not a git repository, and the remote is not empty: move the notes aside, let the plugin clone, then copy them back",
     };
   }
-  await gitOk(["init", "-q"], { cwd: dir });
-  await gitOk(["remote", "add", "origin", cfg.remote], { cwd: dir });
-  const failed = await commitAndPushNew(dir, timezone, "import Projects/");
-  if (failed) {
-    await removeCreatedGit(dir);
-    return { kind: "stopped", reason: failed };
-  }
-  const ready = await checkRepo(dir, cfg.remote);
-  return ready.kind === "ready" ? { ...ready, bootstrapped: true } : ready;
+  const remote = cfg.remote;
+  return firstPush(dir, remote, async () => {
+    await gitOk(["init", "-q"], { cwd: dir });
+    await gitOk(["remote", "add", "origin", remote], { cwd: dir });
+    return commitAndPushNew(dir, timezone, "import Projects/");
+  });
 }

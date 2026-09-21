@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ensureGitignore, prepareProjects, REQUIRED_IGNORES, syncConfig, type SyncState } from "../../core/sync/state.ts";
 import { git, gitOk } from "../../core/git.ts";
@@ -207,6 +207,101 @@ test("the import scan sees notes a .gitattributes marks -diff", async () => {
   assertKind(stopped, "stopped");
   assert.match(stopped.kind === "stopped" ? stopped.reason : "", /x\/creds\.md/);
   assert.equal(await gitOk(["ls-remote", "--heads", remote], { cwd: v.root }), "");
+});
+
+const AS_ROOT = process.getuid?.() === 0 ? "root reads a mode-000 file" : false;
+
+test("an import that throws after git init removes the Projects/.git it created; the next run imports", { skip: AS_ROOT }, async () => {
+  const v = await vault();
+  await writeRel(v.projectsDir, "p/a.md", "note\n");
+  await writeRel(v.projectsDir, "p/locked.md", "x\n");
+  const locked = join(v.projectsDir, "p", "locked.md");
+  const remote = await bareRemote();
+  await chmod(locked, 0o000);
+  try {
+    // git add -A cannot read the note: the import throws (session.ts reports it).
+    await assert.rejects(prepareProjects(v, { remote }, TZ), /Permission denied/);
+    await assert.rejects(stat(join(v.projectsDir, ".git")), "the created .git must go");
+  } finally {
+    await chmod(locked, 0o644);
+  }
+  assert.deepEqual(await prepareProjects(v, { remote }, TZ), { kind: "ready", branch: "main", bootstrapped: true });
+  assert.match(await gitOk(["ls-tree", "-r", "--name-only", "main"], { cwd: remote }), /p\/locked\.md/);
+});
+
+test("a bootstrap that throws after the clone removes the Projects/.git it created", async () => {
+  const v = await vault();
+  const remote = await bareRemote();
+  // A required clean filter that fails makes the bootstrap's git add -A throw.
+  const attributes = join(await tempDir(), "attributes");
+  await writeFile(attributes, "* filter=fail\n");
+  const failing = join(await tempDir(), "gitconfig");
+  await writeFile(
+    failing,
+    "[user]\n\tname = Test\n\temail = test@example.com\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n" +
+      `[core]\n\tattributesFile = ${attributes}\n[filter "fail"]\n\tclean = false\n\trequired = true\n`,
+  );
+  process.env.GIT_CONFIG_GLOBAL = failing;
+  try {
+    await assert.rejects(prepareProjects(v, { remote }, TZ), /git add -A/);
+  } finally {
+    process.env.GIT_CONFIG_GLOBAL = GIT_CONFIG;
+  }
+  await assert.rejects(stat(join(v.projectsDir, ".git")), "the created .git must go");
+  assert.equal(await gitOk(["ls-remote", "--heads", remote], { cwd: v.root }), "");
+  assertKind(await prepareProjects(v, { remote }, TZ), "ready");
+});
+
+async function tempClones(root: string): Promise<string[]> {
+  return (await readdir(root)).filter((n) => n.endsWith(".sro-tmp"));
+}
+
+test("a clone that fails leaves no Projects/.git and no temporary clone", async () => {
+  const v = await vault();
+  const state = await prepareProjects(v, { remote: join(await tempDir(), "missing.git") }, TZ);
+  assertKind(state, "stopped");
+  assert.match(state.kind === "stopped" ? state.reason : "", /clone of .* failed/);
+  await assert.rejects(stat(join(v.projectsDir, ".git")));
+  assert.deepEqual(await tempClones(v.root), []);
+});
+
+test("a clone killed mid-way, as the network timeout kills it, leaves Projects/ untouched and no temporary clone", async () => {
+  const v = await vault();
+  // A remote helper that SIGKILLs git's whole process group: exactly what the
+  // 45 s timeout does, and a killed git cleans nothing up.
+  const bin = await tempDir("sro-bin-");
+  const helper = join(bin, "git-remote-srokill");
+  await writeFile(helper, "#!/bin/sh\nkill -9 0\n");
+  await chmod(helper, 0o755);
+  const path = process.env.PATH ?? "";
+  process.env.PATH = `${bin}:${path}`;
+  try {
+    assertKind(await prepareProjects(v, { remote: "srokill::nowhere" }, TZ), "stopped");
+  } finally {
+    process.env.PATH = path;
+  }
+  await assert.rejects(stat(join(v.projectsDir, ".git")), "a killed clone must not leave Projects/.git");
+  assert.deepEqual(await tempClones(v.root), []);
+});
+
+test("a Projects/ repository with no commit (an older failure's leftover) stops and says what to do", async () => {
+  const remote = await seededRemote();
+  const leftovers: Array<[string, (dir: string) => Promise<void>]> = [
+    ["an unborn branch", async () => undefined],
+    // What a killed clone leaves: HEAD still names git's placeholder branch.
+    ["a killed clone's HEAD", (dir) => writeFile(join(dir, ".git", "HEAD"), "ref: refs/heads/.invalid\n")],
+  ];
+  for (const [label, damage] of leftovers) {
+    const v = await vault();
+    await initRepo(v.projectsDir);
+    await gitOk(["remote", "add", "origin", remote], { cwd: v.projectsDir });
+    await damage(v.projectsDir);
+    const state = await prepareProjects(v, { remote }, TZ);
+    assertKind(state, "stopped");
+    const reason = state.kind === "stopped" ? state.reason : "";
+    assert.match(reason, /no commit/, label);
+    assert.match(reason, /delete Projects\/\.git/, label);
+  }
 });
 
 test("a detached HEAD and an in-progress rebase each stop", async () => {
