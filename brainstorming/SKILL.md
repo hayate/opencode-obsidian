@@ -15,47 +15,47 @@ design, and get your human partner's approval.
 Do NOT invoke any implementation skill, write any code, scaffold any
 project, or take any implementation action until you have told your
 human partner what you intend and they have approved it. This applies
-to EVERY task on EVERY path below — the ceremony scales with the task;
+to EVERY task on EVERY path below - the ceremony scales with the task;
 the approval gate never does.
 </HARD-GATE>
 
 ## Three Paths
 
 Before your first question, classify the request and say the
-classification out loud — "this looks bounded, so I'll present a short
-design here rather than write a spec" — so your human partner can
+classification out loud - "this looks bounded, so I'll present a short
+design here rather than write a spec" - so your human partner can
 override it:
 
-- **Spike** — a feasibility question ("can we...", "is it possible...",
+- **Spike** - a feasibility question ("can we...", "is it possible...",
   "quick and dirty is fine") whose output is an answer, not code you
   keep. Present the question and what you'll try in 2-3 sentences, get
   a nod, then find out as cheaply as correctness allows. No design
   doc, no spec file. Report findings as a recommendation; anything you
   built stays labeled throwaway.
-- **Bounded** — a well-scoped change to code that already exists in
+- **Bounded** - a well-scoped change to code that already exists in
   this repo: a new flag, a small endpoint, a one-file fix.
-  Understanding the kind of app is not enough — bounded means the flow
+  Understanding the kind of app is not enough - bounded means the flow
   you are changing is already here to read. If there is no existing
   flow to change, the task is not bounded. Ask the clarifying
   questions that matter, present a short design IN CHAT (a few
   sentences to a few short paragraphs), and STOP. Implementation
-  starts only after your human partner says yes to that design — a
+  starts only after your human partner says yes to that design - a
   bounded task's approval is as hard a gate as an architectural
   one. No spec file, no implementation plan document.
-- **Architectural** — new projects, new subsystems, changes that
+- **Architectural** - new projects, new subsystems, changes that
   restructure how components fit together or alter interfaces others
   depend on. Follow the full process: questions, approaches, sectioned
   design, written spec, then the writing-plans skill.
 
 When in doubt between two paths, take the heavier one. The ratchet is
-one-way: hidden complexity discovered mid-task upgrades the path —
+one-way: hidden complexity discovered mid-task upgrades the path -
 stop, say so, and step up. Nothing downgrades mid-task.
 
 ## Anti-Pattern: "Too Simple To Need Approval"
 
 Every path ends with your human partner approving your intent before
 implementation. A todo list, a single-function utility, a config
-change — the design may be two sentences in chat, but you MUST present
+change - the design may be two sentences in chat, but you MUST present
 it and get approval. "Simple" tasks are where unexamined assumptions
 cause the most wasted work. What scales with simplicity is the
 artifact, never the approval.
@@ -65,11 +65,11 @@ artifact, never the approval.
 | Thought | Reality |
 |---------|---------|
 | "This is too simple to need a design" | Simple means a short design, not no design. Two sentences in chat, then approval. |
-| "I'll call it bounded and skip the spec" | Reaching for a label to skip work IS the doubt — take the heavier path. |
-| "It's bounded and the design is obvious — I'll start while they read it" | The gate is the approval, not the design's length. Present, then stop until you hear yes. |
-| "I understand this kind of app, so it's bounded" | Bounded measures the repo, not your familiarity. A new project has no existing flow — it is architectural. |
-| "The spike works, so I'll keep the code" | A spike's output is an answer. Keeping the code is a new request — classify it. |
-| "It grew, but I'm almost done — no need to re-classify" | Hidden complexity upgrades the path mid-task. Stop and say so. |
+| "I'll call it bounded and skip the spec" | Reaching for a label to skip work IS the doubt - take the heavier path. |
+| "It's bounded and the design is obvious - I'll start while they read it" | The gate is the approval, not the design's length. Present, then stop until you hear yes. |
+| "I understand this kind of app, so it's bounded" | Bounded measures the repo, not your familiarity. A new project has no existing flow - it is architectural. |
+| "The spike works, so I'll keep the code" | A spike's output is an answer. Keeping the code is a new request - classify it. |
+| "It grew, but I'm almost done - no need to re-classify" | Hidden complexity upgrades the path mid-task. Stop and say so. |
 | "They approved the spike, so the follow-up change is approved too" | Each task gets its own classification and its own approval. |
 
 ## Checklist
@@ -78,25 +78,25 @@ Classify first, announce the path, then create a task for each item on
 your path and complete them in order.
 
 **Spike:**
-1. **Explore project context** — enough to frame the probe
-2. **Present question + probe plan** — 2-3 sentences
-3. **Get approval** — a nod is enough
-4. **Investigate** — as cheaply as correctness allows
-5. **Report findings** — a recommendation; label anything built as throwaway
+1. **Explore project context** - enough to frame the probe
+2. **Present question + probe plan** - 2-3 sentences
+3. **Get approval** - a nod is enough
+4. **Investigate** - as cheaply as correctness allows
+5. **Report findings** - a recommendation; label anything built as throwaway
 
 **Bounded:**
-1. **Explore project context** — check files, docs, recent commits
-2. **Ask clarifying questions** — one at a time, the ones that matter
-3. **Present short design in chat** — approach, files touched, testing
-4. **Get approval** — STOP and wait for an explicit yes; presenting the design and starting in the same breath is skipping the gate
-5. **Implement** — proceed with the normal development workflow (TDD applies); no plan document
+1. **Explore project context** - check files, docs, recent commits
+2. **Ask clarifying questions** - one at a time, the ones that matter
+3. **Present short design in chat** - approach, files touched, testing
+4. **Get approval** - STOP and wait for an explicit yes; presenting the design and starting in the same breath is skipping the gate
+5. **Implement** - proceed with the normal development workflow (TDD applies); no plan document
 
 **Architectural:**
 1. **Explore project context** - check files, docs, recent commits
 2. **Ask clarifying questions** - one at a time, understand purpose/constraints/success criteria
 3. **Propose 2-3 approaches** - with trade-offs and your recommendation
 4. **Present design** - in sections scaled to their complexity, get user approval after each section
-5. **Write design doc** - save to the Obsidian vault at `Projects/<repo>/specs/YYYY-MM-DD-<topic>-design.md` (use the opencode-superpower-obsidian skill to resolve the vault path and write the file)
+5. **Write design doc** - save to the Obsidian vault at `Projects/<project>/specs/YYYY-MM-DD-<topic>-design.md` (use the opencode-superpower-obsidian skill to resolve the vault path and write the file)
 6. **Spec self-review** - quick inline check for placeholders, contradictions, ambiguity, scope (see below)
 7. **User reviews written spec** - ask user to review the spec file before proceeding
 8. **Transition to implementation** - invoke writing-plans skill to create implementation plan
@@ -146,7 +146,7 @@ digraph brainstorming {
 ```
 
 **Terminal states are path-bound.** Architectural: the ONLY skill you
-invoke after brainstorming is writing-plans — never frontend-design,
+invoke after brainstorming is writing-plans - never frontend-design,
 mcp-builder, or any other implementation skill. Bounded: after
 approval, implementation proceeds directly through the normal
 development workflow; no plan document. Spike: the terminal state is a
@@ -156,7 +156,7 @@ reported recommendation.
 
 The subsections below serve the bounded and architectural paths (a
 spike stops at "present the probe, get a nod"). Sections from
-**Exploring approaches** onward are architectural-path depth — for
+**Exploring approaches** onward are architectural-path depth - for
 bounded work, context plus a few questions plus a short in-chat design
 is the whole process.
 
@@ -202,7 +202,7 @@ is the whole process.
 
 **Documentation:**
 
-- Write the validated design (spec) to `Projects/<repo>/specs/YYYY-MM-DD-<topic>-design.md`
+- Write the validated design (spec) to `Projects/<project>/specs/YYYY-MM-DD-<topic>-design.md`
   - (User preferences for spec location override this default)
 - Use elements-of-style:writing-clearly-and-concisely skill if available
 
@@ -214,7 +214,7 @@ After writing the spec document, look at it with fresh eyes:
 3. **Scope check:** Is this focused enough for a single implementation plan, or does it need decomposition?
 4. **Ambiguity check:** Could any requirement be interpreted two different ways? If so, pick one and make it explicit.
 
-Fix any issues inline. No need to re-review — just fix and move on.
+Fix any issues inline. No need to re-review - just fix and move on.
 
 **User Review Gate:**
 After the spec review loop passes, ask the user to review the written spec before proceeding:
