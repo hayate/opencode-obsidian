@@ -149,6 +149,16 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       // Two sessions starting at once on a fresh vault must not race the clone:
       // one machine-wide lock around preparation (the sync lock lives in Projects/.git,
       // which may not exist yet).
+      // Spec 5.7: checked before anything touches Projects/, so a public remote is
+      // refused before prepareProjects can clone it (or bootstrap/import push to it).
+      if (cfg.remote) {
+        const vis = await remoteVisibility(cfg.remote);
+        if (vis.visibility === "public") {
+          out.push({ level: "error", text: `sync refused: ${vis.detail}; make the repository private` });
+          return { items: out, project: early };
+        }
+        if (vis.visibility === "unknown") out.push({ level: "warn", text: `could not verify the remote is private: ${vis.detail}` });
+      }
       const prep = await acquireLock(join(stateDir, "prepare.lock"), { waitMs: 60_000 });
       if (!prep) {
         out.push({ level: "warn", text: "another session is still preparing Projects/; run remember_sync shortly" });
@@ -162,12 +172,6 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       }
       out.push(...statusFromSync(state));
       if (state.kind === "ready" && cfg.remote) {
-        const vis = await remoteVisibility(cfg.remote);
-        if (vis.visibility === "public") {
-          out.push({ level: "error", text: `sync refused: ${vis.detail}; make the repository private` });
-          return { items: out, project: early };
-        }
-        if (vis.visibility === "unknown") out.push({ level: "warn", text: `could not verify the remote is private: ${vis.detail}` });
         out.push(...statusFromCycle(await runCycle({ projectsDir: vault.projectsDir, remote: cfg.remote, branch: state.branch, stateDir, machine })));
       }
       // Spec 4.2 after the pull: a first session must see the folders other machines

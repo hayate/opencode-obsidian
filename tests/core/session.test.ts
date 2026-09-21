@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { initializeSession, statusFromCycle, type SessionOptions } from "../../core/session.ts";
 import type { Harness, SessionRef } from "../../core/harness.ts";
@@ -207,3 +207,27 @@ test("two sessions initializing one fresh vault at once never race the clone", a
   assert.deepEqual([...a.status, ...b.status].filter((s) => s.level === "error"), []);
   await Promise.all([a.background, b.background]);
 });
+
+// Network probe: a public GitHub remote must be refused before Projects/ is ever
+// cloned or anything pushed to it. Opt in: SRO_NETWORK_TESTS=1 npm test
+test(
+  "a public GitHub remote is refused before Projects/ is cloned or anything is pushed (network)",
+  { skip: process.env.SRO_NETWORK_TESTS !== "1" },
+  async () => {
+    const vaultRoot = await tempDir("sro-vault-");
+    await mkdir(join(vaultRoot, ".obsidian"));
+    const sessionDir = await tempDir("sro-session-");
+    const r = await initializeSession({
+      env: { OBSIDIAN_VAULT_PATH: vaultRoot, OBSIDIAN_PROJECTS_REMOTE: "https://github.com/octocat/Hello-World.git" },
+      sessionDir,
+      sessionId: "ses_current",
+      harness: new QuietHarness(),
+      bootstrap: "BOOTSTRAP",
+      journalModel: "fake/model",
+      stateRoot: await tempDir("sro-state-"),
+      now: () => new Date("2026-09-21T07:00:00Z"),
+    });
+    assert.match(r.status.map((s) => s.text).join("\n"), /sync refused/);
+    await assert.rejects(stat(join(vaultRoot, "Projects", ".git")));
+  },
+);
