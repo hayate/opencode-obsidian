@@ -249,11 +249,23 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
   return { ok: true, pushAllowed: (await changedSince(dir, before)).length === 0 };
 }
 
+// Nobody else uses the clone and the sync lock is held, so any lock file in it is
+// a leftover: a git command killed on its timeout (spec 5.6).
+async function leftoverLock(gitDir: string): Promise<boolean> {
+  const names = [...(await readdir(gitDir)), ...(await readdir(join(gitDir, "refs"), { recursive: true }))];
+  return names.some((name) => name.endsWith(".lock"));
+}
+
 async function ensureStateClone(input: CycleInput): Promise<string> {
   const clone = join(input.stateDir, "sync");
-  // The clone is disposable: a crash mid-rebase (either backend) means rebuild it.
-  for (const marker of ["rebase-merge", "rebase-apply"]) {
-    if (await exists(join(clone, ".git", marker))) await rm(clone, { recursive: true, force: true });
+  const gitDir = join(clone, ".git");
+  // The clone is disposable: a crash mid-rebase (either backend) or a leftover
+  // lock means rebuild it.
+  if (
+    (await exists(gitDir)) &&
+    ((await exists(join(gitDir, "rebase-merge"))) || (await exists(join(gitDir, "rebase-apply"))) || (await leftoverLock(gitDir)))
+  ) {
+    await rm(clone, { recursive: true, force: true });
   }
   if (!(await exists(join(clone, ".git")))) {
     await rm(clone, { recursive: true, force: true });

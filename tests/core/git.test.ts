@@ -1,10 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmod, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { chmod, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { git, gitOk, GitError, literal } from "../../core/git.ts";
-import { initRepo, sleep, tempDir, writeRel } from "./helpers.ts";
+import { commitFile, initRepo, sleep, tempDir, writeRel } from "./helpers.ts";
+
+const execFileAsync = promisify(execFile);
 
 test("gitOk returns trimmed stdout", async () => {
   const out = await gitOk(["--version"], { cwd: process.cwd() });
@@ -123,13 +127,59 @@ test("the index.lock message is not retried when no index.lock exists", async ()
   assert.equal(await countRuns(dir), 1);
 });
 
-test("a command killed on timeout is never retried, though it leaves its index.lock behind", async () => {
+const exists = (path: string): Promise<boolean> => stat(path).then(() => true, () => false);
+
+test("a command killed on timeout is never retried, and the index.lock it left is removed", async () => {
   const dir = await tempDir();
   await initRepo(dir);
   await fakeFilter(dir, "exec sleep 10");
   await writeRel(dir, "a.md", "a\n");
   const r = await git(["add", "a.md"], { cwd: dir, timeoutMs: 500 });
   assert.equal(r.timedOut, true, "a retry would have returned a later, non-timed-out attempt");
+  assert.equal(await exists(join(dir, ".git", "index.lock")), false);
+  assert.match(r.stderr, /removed .*index\.lock/);
+});
+
+test("an index.lock that was already there when a killed command started is never removed", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  await writeRel(dir, "a.md", "a\n");
+  const lock = join(dir, ".git", "index.lock");
+  await writeFile(lock, "");
+  // Reading its config blocks on the pipe, so git is killed before it ever
+  // reaches the lock: the lock belongs to someone else.
+  const fifo = join(dir, ".git", "hang.fifo");
+  await execFileAsync("mkfifo", [fifo]);
+  const r = await git(["-c", `include.path=${fifo}`, "add", "a.md"], { cwd: dir, timeoutMs: 500 });
+  assert.equal(r.timedOut, true);
+  assert.equal(await exists(lock), true);
+});
+
+test("a killed command that does not take the index lock never removes one", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  const lock = join(dir, ".git", "index.lock");
+  // Another process takes the lock while this command runs.
+  const r = await git(["-c", `alias.nap=!touch '${lock}'; sleep 10`, "nap"], { cwd: dir, timeoutMs: 500 });
+  assert.equal(r.timedOut, true);
+  assert.equal(await exists(lock), true);
+});
+
+test("a lock file nobody removes is named in one plain sentence", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  await commitFile(dir, "a.md", "a\n", "a");
+  const lock = join(dir, ".git", "refs", "heads", "side.lock");
+  await writeFile(lock, "");
+  await assert.rejects(gitOk(["update-ref", "refs/heads/side", "HEAD"], { cwd: dir }), (err: unknown) => {
+    assert.ok(err instanceof GitError);
+    assert.equal(
+      err.message,
+      `git left a lock file behind: '${lock}' (a git program stopped before it finished). If no git program is running on this machine, delete that file.`,
+    );
+    return true;
+  });
+  assert.equal(await exists(lock), true);
 });
 
 test("literal() pathspecs: unstaging a note named a*.md leaves ab.md staged", async () => {

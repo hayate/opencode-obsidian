@@ -762,6 +762,33 @@ test("a state clone left mid-rebase by a crash (either backend) is rebuilt", asy
   }
 });
 
+test("a lock file a killed command left in the state clone is rebuilt away", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  await writeRel(a.projects, "x/first.md", "1\n");
+  await cycle(remote, a);
+  for (const leftover of ["index.lock", "HEAD.lock", "config.lock", "refs/remotes/origin/main.lock"]) {
+    await writeRel(join(a.state, "sync", ".git"), leftover, "");
+    const note = `x/${leftover.replaceAll("/", "-")}.md`;
+    await writeRel(a.projects, note, "n\n");
+    const r = await cycle(remote, a);
+    assert.equal(r.outcome, "synced", `${leftover}: ${r.reason ?? ""}`);
+    assert.equal(await remoteFile(remote, note), "n");
+  }
+});
+
+test("a lock nobody removes stops the cycle with one plain sentence, and is never deleted", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  await writeRel(a.projects, "x/new.md", "new\n");
+  const lock = join(a.projects, ".git", "index.lock");
+  await writeFile(lock, "");
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "aborted");
+  assert.match(r.reason ?? "", /^git left a lock file behind: '.*\/\.git\/index\.lock' .*delete that file\.$/);
+  assert.ok(await stat(lock));
+});
+
 test("another process's index.lock during a cycle is waited out", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];
