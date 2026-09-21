@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, stat, symlink } from "node:fs/promises";
-import { join } from "node:path";
-import { initializeSession, statusFromCycle, vaultId, type SessionOptions } from "../../core/session.ts";
+import { access, constants, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { delimiter, join } from "node:path";
+import { initializeSession, statusFromCycle, statusFromPrivacy, vaultId, type SessionOptions } from "../../core/session.ts";
 import type { Harness, SessionRef } from "../../core/harness.ts";
 import { PAYLOAD_MARKER } from "../../core/inject.ts";
 import { gitOk } from "../../core/git.ts";
@@ -10,6 +10,7 @@ import { systemTimezone } from "../../core/vault.ts";
 import { writeJournalEntry } from "../../core/journal.ts";
 import { acquireLock, type LockHandle } from "../../core/lock.ts";
 import { REQUIRED_IGNORES } from "../../core/sync/state.ts";
+import { remoteVisibility } from "../../core/sync/privacy.ts";
 import { commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
 
 class QuietHarness implements Harness {
@@ -491,4 +492,73 @@ test("a session refused before a slow pull learns in the background that the pul
   assert.match(r.payload, /sync still running/);
   const later = (await r.background).map((s) => s.text).join("\n");
   assert.match(later, /maps to Projects\/kabin-api; restart the session/);
+});
+
+async function realGit(): Promise<string> {
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    const candidate = join(dir, "git");
+    if (await access(candidate, constants.X_OK).then(() => true, () => false)) return candidate;
+  }
+  throw new Error("git is not on PATH");
+}
+
+// Runs `body` with a `git` first on PATH that runs `shell` (sh, with $real set to
+// the real git and $here to the physical working directory) before the real git.
+// PATH is restored in any case; tests in one file run one at a time.
+async function withGitWrapper<T>(shell: string, body: () => Promise<T>): Promise<T> {
+  const bin = await tempDir("sro-bin-");
+  await writeFile(join(bin, "git"), `#!/bin/sh\nreal=${JSON.stringify(await realGit())}\nhere=$(pwd -P)\n${shell}\nexec "$real" "$@"\n`, { mode: 0o755 });
+  const saved = process.env.PATH;
+  process.env.PATH = `${bin}${delimiter}${saved ?? ""}`;
+  try {
+    return await body();
+  } finally {
+    process.env.PATH = saved;
+  }
+}
+
+const failCommonDirIn = (dir: string): string =>
+  `if [ "$here" = ${JSON.stringify(dir)} ]; then for a in "$@"; do if [ "$a" = "--git-common-dir" ]; then echo "fatal: injected failure" >&2; exit 128; fi; done; fi`;
+
+test("a post-pull identity that cannot be resolved (git fails) is a refusal, never 'sync failed' with the old identity", async () => {
+  const w = await identityWorld();
+  assert.equal((await initializeSession(opts(w, { sessionId: "s1" }))).context?.project, "canonical");
+  // The claim that let identity skip the checkout lookup goes away with the next pull.
+  const seed = join(await tempDir(), "seed");
+  await gitOk(["clone", "-q", w.remote, seed], { cwd: await tempDir() });
+  await gitOk(["rm", "-q", "canonical/remember/.origin"], { cwd: seed });
+  await gitOk(["commit", "-q", "-m", "drop the claim"], { cwd: seed });
+  await gitOk(["push", "-q", "origin", "HEAD"], { cwd: seed });
+  const r = await withGitWrapper(failCommonDirIn(w.code), () => initializeSession(opts(w, { sessionId: "s2" })));
+  const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+  assert.equal(r.context, null, lines);
+  assert.match(lines, /\[error\] memory and sync disabled: .*--git-common-dir .*injected failure/);
+  assert.doesNotMatch(lines, /sync failed/);
+});
+
+test("an early identity that cannot be resolved (git fails) does not stop the sync, and the post-pull identity decides", async () => {
+  const w = await identityWorld();
+  const r = await withGitWrapper(failCommonDirIn(w.code), () => initializeSession(opts(w)));
+  const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+  assert.doesNotMatch(lines, /unexpected error/);
+  assert.equal(r.context?.project, "canonical", lines);
+});
+
+test("a broken .sro-config.json is reported once, not once per read", async () => {
+  const w = await localWorld();
+  await writeRel(w.vaultRoot, "Projects/.sro-config.json", "{ not json");
+  const r = await initializeSession(localOpts(w));
+  assert.equal(r.status.filter((s) => /is not valid JSON/.test(s.text)).length, 1, r.status.map((s) => s.text).join("\n"));
+});
+
+test("a remote the privacy check cannot look at gets one line saying so", async () => {
+  const r = await initializeSession(opts(await world()));
+  const lines = r.status.filter((s) => /privacy check did not run/.test(s.text));
+  assert.equal(lines.length, 1, r.status.map((s) => s.text).join("\n"));
+  assert.equal(lines[0]?.level, "info");
+  assert.match(lines[0]?.text ?? "", /a local path/);
+  const alias = "git@github-work:acme/projects.git"; // an SSH host alias of github.com
+  const items = statusFromPrivacy(alias, await remoteVisibility(alias));
+  assert.deepEqual(items.map((i) => i.level), ["info"]);
+  assert.match(items[0]?.text ?? "", /privacy check did not run for host github-work/);
 });

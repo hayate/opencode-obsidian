@@ -10,11 +10,11 @@ import type { Harness } from "./harness.ts";
 import { buildPayload, PAYLOAD_MARKER, type StatusItem } from "./inject.ts";
 import { buildRollups, catchUp, listEntries, type JournalContext, type JournalEntry } from "./journal.ts";
 import { legacyReappeared, schemaVersion, SCHEMA_VERSION } from "./migrate.ts";
-import { recordOrigin, resolveProject, type ProjectResolution } from "./project.ts";
+import { normalizeOrigin, recordOrigin, resolveProject, type ProjectResolution } from "./project.ts";
 import { acquireLock } from "./lock.ts";
 import { branchKey, computeHeads, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
 import { runCycle, type CycleResult } from "./sync/cycle.ts";
-import { remoteVisibility } from "./sync/privacy.ts";
+import { remoteVisibility, type Visibility } from "./sync/privacy.ts";
 import { prepareProjects, syncConfig, type SyncState } from "./sync/state.ts";
 import { dayStamp } from "./time.ts";
 import { readVaultConfig, resolveVault, systemTimezone, type Vault } from "./vault.ts";
@@ -77,6 +77,35 @@ export function statusFromSync(state: SyncState): StatusItem[] {
       return [{ level: "error", text: `sync stopped: ${state.reason}` }];
     case "ready":
       return state.bootstrapped ? [{ level: "info", text: "Projects/ was bootstrapped into the remote" }] : [];
+  }
+}
+
+// Spec 5.7, and 5.1's trust assumption made visible: a remote the check cannot
+// look at (anything but github.com, an SSH host alias of it included) is said to
+// be unchecked, once per session. Only the host is named, never the URL.
+export function statusFromPrivacy(remote: string, v: { visibility: Visibility; detail: string }): StatusItem[] {
+  switch (v.visibility) {
+    case "public":
+      return [{ level: "error", text: `sync refused: ${v.detail}; make the repository private` }];
+    case "unknown":
+      return [{ level: "warn", text: `could not verify the remote is private: ${v.detail}` }];
+    case "not-github": {
+      const normalized = normalizeOrigin(remote);
+      const where = normalized?.startsWith("file:") ? "a local path" : normalized ? `host ${normalized.split("/")[0]}` : "this remote";
+      return [{ level: "info", text: `the privacy check did not run for ${where}: only github.com remotes are checked, so keeping this one private is up to you` }];
+    }
+    case "not-public":
+      return [];
+  }
+}
+
+// resolveProject throws when git itself fails in the session directory: that is
+// a refusal like any other (and not a bare repository), never "sync failed".
+async function resolveSafely(vault: Vault, sessionDir: string): Promise<ProjectResolution> {
+  try {
+    return await resolveProject(vault, sessionDir);
+  } catch (err) {
+    return { kind: "disabled", reason: (err as Error).message, bare: false };
   }
 }
 
@@ -151,16 +180,18 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
   try {
     const status: StatusItem[] = [];
     let timezone = systemTimezone();
+    let configProblem: string | null = null;
     try {
       timezone = (await readVaultConfig(vault.projectsDir)).timezone;
     } catch (err) {
-      status.push({ level: "warn", text: `${(err as Error).message}; using ${timezone}` });
+      configProblem = (err as Error).message;
+      status.push({ level: "warn", text: `${configProblem}; using ${timezone}` });
     }
     // Early answer only. A bare repository is refused before any work: no pull can
     // change that. Any other refusal may be fixed by what the pull brings (another
     // machine merged two claiming folders), so the sync runs and the identity
     // resolved after the pull, below, decides.
-    const early = await resolveProject(vault, opts.sessionDir);
+    const early = await resolveSafely(vault, opts.sessionDir);
     if (early.kind === "disabled" && early.bare) return disabled(opts.bootstrap, early.reason, status);
 
     const cfg = syncConfig(opts.env);
@@ -174,19 +205,16 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
     let resolved = early as ProjectResolution;
     const work = (async (): Promise<{ items: StatusItem[]; project: ProjectResolution }> => {
       const out: StatusItem[] = [];
-      // Two sessions starting at once on a fresh vault must not race the clone:
-      // one machine-wide lock around preparation (the sync lock lives in Projects/.git,
-      // which may not exist yet).
       // Spec 5.7: checked before anything touches Projects/, so a public remote is
       // refused before prepareProjects can clone it (or bootstrap/import push to it).
       if (cfg.remote) {
         const vis = await remoteVisibility(cfg.remote);
-        if (vis.visibility === "public") {
-          out.push({ level: "error", text: `sync refused: ${vis.detail}; make the repository private` });
-          return { items: out, project: early };
-        }
-        if (vis.visibility === "unknown") out.push({ level: "warn", text: `could not verify the remote is private: ${vis.detail}` });
+        out.push(...statusFromPrivacy(cfg.remote, vis));
+        if (vis.visibility === "public") return { items: out, project: early };
       }
+      // Two sessions starting at once on a fresh vault must not race the clone:
+      // one machine-wide lock around preparation (the sync lock lives in Projects/.git,
+      // which may not exist yet).
       const prep = await acquireLock(join(stateDir, "prepare.lock"), { waitMs: 60_000 });
       if (!prep) {
         out.push({ level: "warn", text: "another session is still preparing Projects/; run remember_sync shortly" });
@@ -211,11 +239,12 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       try {
         timezone = (await readVaultConfig(vault.projectsDir)).timezone;
       } catch (err) {
-        out.push({ level: "warn", text: `${(err as Error).message}; using ${timezone}` });
+        // The same problem the first read reported is not reported twice.
+        if ((err as Error).message !== configProblem) out.push({ level: "warn", text: `${(err as Error).message}; using ${timezone}` });
       }
       // Spec 4.2 after the pull: a first session must see the folders other machines
       // already claimed, or it would claim a duplicate one under its own clone name.
-      const project = await resolveProject(vault, opts.sessionDir);
+      const project = await resolveSafely(vault, opts.sessionDir);
       resolved = project;
       if (project.kind === "disabled") return { items: out, project };
       if (project.origin && state.kind !== "stopped") await recordOrigin(project.dir, project.origin);

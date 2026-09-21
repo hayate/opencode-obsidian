@@ -40,7 +40,16 @@ async function inProject<T>(name: string, step: () => Promise<T>): Promise<T> {
 
 export async function migrateLegacyHandoffs(projectsDir: string): Promise<MigrationReport> {
   const report: MigrationReport = { migrated: [], alreadyDone: [] };
-  const entries = await readdir(projectsDir, { withFileTypes: true }).catch(() => []);
+  let entries;
+  try {
+    entries = await readdir(projectsDir, { withFileTypes: true });
+  } catch (err) {
+    // No Projects/ is nothing to migrate: writing the marker would create the
+    // folder and turn "absent" into "nonempty, not a repo" (spec 4.1), blocking
+    // the first clone. Any other failure is not "empty".
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return report;
+    throw err;
+  }
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
     const rel = `${entry.name}/HANDOFF.md`;

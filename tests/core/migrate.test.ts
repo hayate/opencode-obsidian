@@ -97,3 +97,15 @@ test("the migration never reads a symlinked HANDOFF.md, nor writes through a sym
   await assert.rejects(migrateLegacyHandoffs(b), /remember\/handoffs cannot be written \(a symbolic link\)/);
   assert.deepEqual(await readdir(outside), ["secret.txt"], "nothing was written through the link");
 });
+
+test("without a Projects/ folder the migration is a no-op: it never creates one", async () => {
+  const projects = join(await tempDir(), "Projects");
+  assert.deepEqual(await migrateLegacyHandoffs(projects), { migrated: [], alreadyDone: [] });
+  await assert.rejects(readdir(projects), /ENOENT/);
+});
+
+test("a Projects/ that cannot be listed stops the migration, before the marker", async () => {
+  const root = await tempDir();
+  await writeRel(root, "Projects", "a file where the folder should be");
+  await assert.rejects(migrateLegacyHandoffs(join(root, "Projects")), /ENOTDIR/);
+});
