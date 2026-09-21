@@ -7,7 +7,8 @@ import type { Harness, SessionRef } from "../../core/harness.ts";
 import { PAYLOAD_MARKER } from "../../core/inject.ts";
 import { gitOk } from "../../core/git.ts";
 import { systemTimezone } from "../../core/vault.ts";
-import { commitFile, initRepo, tempDir } from "./helpers.ts";
+import { writeJournalEntry } from "../../core/journal.ts";
+import { commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
 
 class QuietHarness implements Harness {
   modelCalls = 0;
@@ -292,3 +293,48 @@ test(
     await assert.rejects(stat(join(vaultRoot, "Projects", ".git")));
   },
 );
+
+// Sync off: Projects/ is a plain folder, so a test can shape the project on disk.
+async function localWorld(): Promise<{ vaultRoot: string; remote: string; code: string; stateRoot: string; projectDir: string }> {
+  const vaultRoot = await tempDir("sro-vault-");
+  await mkdir(join(vaultRoot, ".obsidian"));
+  await writeRel(vaultRoot, "Projects/.sro-config.json", JSON.stringify({ timezone: "Asia/Tokyo" }));
+  const code = join(await tempDir(), "kabin-api");
+  await initRepo(code);
+  await commitFile(code, "README.md", "x", "init");
+  await gitOk(["remote", "add", "origin", "git@github.com:acme/kabin-api.git"], { cwd: code });
+  return { vaultRoot, remote: "", code, stateRoot: await tempDir("sro-state-"), projectDir: join(vaultRoot, "Projects", "kabin-api") };
+}
+
+const localOpts = (w: { vaultRoot: string; remote: string; code: string; stateRoot: string }, over: Partial<SessionOptions> = {}): SessionOptions =>
+  opts(w, { env: { OBSIDIAN_VAULT_PATH: w.vaultRoot }, ...over });
+
+async function todayEntry(projectDir: string, summary: string): Promise<void> {
+  const at = new Date("2026-09-21T06:00:00Z"); // 15:00 in Tokyo, the session's "today"
+  await writeJournalEntry(projectDir, { machine: "a", session: "s", branch: "main", from: at, to: at, model: "m", summary, timezone: "Asia/Tokyo" });
+}
+
+test("an entry, a handoffs folder or identity.md that cannot be read is reported, and the payload is still built", async () => {
+  const w = await localWorld();
+  await todayEntry(w.projectDir, "READABLE ENTRY");
+  await mkdir(join(w.projectDir, "remember", "journal", "2026-09-21", "000000-bad.md"), { recursive: true });
+  await writeRel(w.projectDir, "remember/handoffs", "a file where the directory should be");
+  await mkdir(join(w.projectDir, "remember", "identity.md"));
+  const r = await initializeSession(localOpts(w));
+  const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+  assert.equal(r.context?.project, "kabin-api", lines);
+  assert.match(r.payload, /READABLE ENTRY/);
+  assert.match(lines, /\[warn\] .*"2026-09-21\/000000-bad\.md" cannot be read \(EISDIR\)/);
+  assert.match(lines, /\[error\] .*remember\/handoffs cannot be listed \(ENOTDIR\)/);
+  assert.match(lines, /\[warn\] .*remember\/identity\.md cannot be read \(EISDIR\)/);
+  assert.doesNotMatch(r.payload, /No handoff recorded yet/, "an unlistable folder is not an empty one");
+});
+
+test("a journal folder that cannot be listed is reported, and the payload is still built", async () => {
+  const w = await localWorld();
+  await writeRel(w.projectDir, "remember/journal", "a file where the directory should be");
+  const r = await initializeSession(localOpts(w));
+  const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+  assert.equal(r.context?.project, "kabin-api", lines);
+  assert.match(lines, /remember\/journal cannot be listed \(ENOTDIR\)/);
+});

@@ -3,17 +3,16 @@
 // bounded by waitMs; past it the payload is built from the live repo as it is,
 // and the work finishes in the background (its outcome is `background`).
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { git } from "./git.ts";
 import type { Harness } from "./harness.ts";
 import { buildPayload, PAYLOAD_MARKER, type StatusItem } from "./inject.ts";
-import { buildRollups, catchUp, listEntries, type JournalContext } from "./journal.ts";
+import { buildRollups, catchUp, listEntries, type JournalContext, type JournalEntry } from "./journal.ts";
 import { legacyReappeared, schemaVersion, SCHEMA_VERSION } from "./migrate.ts";
 import { recordOrigin, resolveProject, type ProjectResolution } from "./project.ts";
 import { acquireLock } from "./lock.ts";
-import { branchKey, computeHeads, listHandoffs, quoted, sanitizeKey, vaultName } from "./store.ts";
+import { branchKey, computeHeads, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
 import { runCycle, type CycleResult } from "./sync/cycle.ts";
 import { remoteVisibility } from "./sync/privacy.ts";
 import { prepareProjects, syncConfig, type SyncState } from "./sync/state.ts";
@@ -261,11 +260,35 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
     if (await legacyReappeared(vault.projectsDir, project.name)) {
       status.push({ level: "warn", text: `Projects/${vaultName(project.name)}/HANDOFF.md reappeared after migration (an old client?); it is not read` });
     }
+    // One unreadable file or folder costs its own part of the payload, reported,
+    // never the whole session.
     const includeLegacyRoot = (await schemaVersion(vault.projectsDir)) < SCHEMA_VERSION;
-    const heads = computeHeads(await listHandoffs(project.dir, { includeLegacyRoot }));
-    for (const p of heads.problems) status.push({ level: "warn", text: p });
+    let heads: Heads | null = null;
+    try {
+      heads = computeHeads(await listHandoffs(project.dir, { includeLegacyRoot }));
+      for (const p of heads.problems) status.push({ level: "warn", text: p });
+    } catch (err) {
+      status.push({ level: "error", text: `${(err as Error).message}; no handoff is shown` });
+    }
     const today = dayStamp(now(), timezone);
-    const read = (rel: string): Promise<string | null> => readFile(join(project.dir, rel), "utf8").catch(() => null);
+    let todayEntries: JournalEntry[] = [];
+    const skipped: string[] = [];
+    try {
+      todayEntries = (await listEntries(project.dir, skipped)).filter((e) => e.day === today);
+    } catch (err) {
+      status.push({ level: "warn", text: `${(err as Error).message}; today's journal is not shown` });
+    }
+    for (const p of skipped) status.push({ level: "warn", text: p });
+    const read = async (rel: string): Promise<string | null> => {
+      try {
+        return await readMemoryFile(project.dir, rel);
+      } catch (err) {
+        status.push({ level: "warn", text: `${(err as Error).message}; not shown` });
+        return null;
+      }
+    };
+    const recent = await read("remember/recent.md");
+    const identity = await read("remember/identity.md");
 
     const payload = buildPayload({
       bootstrap: opts.bootstrap,
@@ -273,9 +296,9 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       status,
       branch: code.branch,
       heads,
-      todayEntries: (await listEntries(project.dir)).filter((e) => e.day === today),
-      recent: await read("remember/recent.md"),
-      identity: await read("remember/identity.md"),
+      todayEntries,
+      recent,
+      identity,
       now: now(),
     });
     const shownAs = project.name;

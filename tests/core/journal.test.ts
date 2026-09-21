@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   buildRollups,
@@ -170,4 +170,32 @@ test("rollups: a late entry from another machine regenerates only its own day", 
   assert.equal(r.changed, true);
   assert.deepEqual(calls, ["day:2026-09-18"]);
   assert.match(await readFile(join(projectDir, "remember", "recent.md"), "utf8"), /day 2026-09-18: 2 item\(s\)/);
+});
+
+test("listEntries: a journal or day directory that cannot be listed is an error, never an empty list", async () => {
+  const a = join(await tempDir(), "p");
+  await mkdir(join(a, "remember"), { recursive: true });
+  await writeFile(join(a, "remember", "journal"), "a file where the directory should be");
+  await assert.rejects(listEntries(a), /ENOTDIR/);
+  const b = join(await tempDir(), "p");
+  await mkdir(join(b, "remember", "journal"), { recursive: true });
+  await writeFile(join(b, "remember", "journal", "2026-09-21"), "a file named like a day");
+  await assert.rejects(listEntries(b), /ENOTDIR/);
+});
+
+test("listEntries: a missing journal directory has no entries", async () => {
+  assert.deepEqual(await listEntries(join(await tempDir(), "p")), []);
+});
+
+test("listEntries: one entry that cannot be read is skipped and reported; the rest still load", async () => {
+  const projectDir = join(await tempDir(), "p");
+  const at = new Date("2026-09-21T03:00:00Z");
+  await writeJournalEntry(projectDir, { machine: "a", session: "s", branch: "main", from: at, to: at, model: "m", summary: "readable", timezone: TZ });
+  await mkdir(join(projectDir, "remember", "journal", "2026-09-21", "000000-bad.md"));
+  const problems: string[] = [];
+  const entries = await listEntries(projectDir, problems);
+  assert.deepEqual(entries.map((e) => e.body), ["readable"]);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0] ?? "", /"2026-09-21\/000000-bad\.md" cannot be read \(EISDIR\)/);
+  await assert.doesNotReject(listEntries(projectDir), "a caller that does not ask for problems still gets the entries");
 });

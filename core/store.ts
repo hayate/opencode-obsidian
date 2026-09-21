@@ -139,6 +139,40 @@ export async function writeAtomic(path: string, content: string): Promise<void> 
   }
 }
 
+// A memory file or folder that exists but cannot be read. `why` is short and
+// never vault text (an errno code), so the message can go into a status line.
+export class MemoryReadError extends Error {
+  readonly why: string;
+  constructor(rel: string, verb: "read" | "listed", why: string) {
+    super(`${rel} cannot be ${verb} (${why})`);
+    this.name = "MemoryReadError";
+    this.why = why;
+  }
+}
+
+const errno = (err: unknown): string => (err as NodeJS.ErrnoException).code ?? "error";
+
+// Every memory read goes through these two. A missing folder has no entries and
+// a missing file is null; any other failure is an error, never "empty": a folder
+// that cannot be listed is not an empty one.
+export async function listMemoryDir(projectDir: string, rel: string): Promise<string[]> {
+  try {
+    return await readdir(join(projectDir, rel));
+  } catch (err) {
+    if (errno(err) === "ENOENT") return [];
+    throw new MemoryReadError(rel, "listed", errno(err));
+  }
+}
+
+export async function readMemoryFile(projectDir: string, rel: string): Promise<string | null> {
+  try {
+    return await readFile(join(projectDir, rel), "utf8");
+  } catch (err) {
+    if (errno(err) === "ENOENT") return null;
+    throw new MemoryReadError(rel, "read", errno(err));
+  }
+}
+
 function toMeta(fm: Record<string, unknown>): HandoffMeta | string {
   const { branch, written, supersedes } = fm;
   if (typeof branch !== "string" || !branch) return "missing branch";
@@ -166,18 +200,37 @@ function readHandoff(path: string, text: string): Handoff {
   return { id, path, meta, body: doc.body, problem: null };
 }
 
+// A file that cannot be read (or vanished since it was listed) never hides the
+// others: it becomes a handoff with a problem, shown as its own head.
+function unreadable(id: string, path: string, err: unknown): Handoff {
+  const why = err instanceof MemoryReadError ? err.why : (err as Error).message;
+  return { id, path, meta: null, body: "", problem: `cannot be read (${why})` };
+}
+
+// Throws when the handoffs folder exists but cannot be listed (session.ts reports
+// it; writeHandoff must not write as if there were no heads).
 export async function listHandoffs(projectDir: string, opts: { includeLegacyRoot?: boolean } = {}): Promise<Handoff[]> {
-  const dir = join(projectDir, "remember", "handoffs");
   const out: Handoff[] = [];
-  for (const name of await readdir(dir).catch(() => [] as string[])) {
+  for (const name of await listMemoryDir(projectDir, "remember/handoffs")) {
     if (!name.endsWith(".md") || name.startsWith(".")) continue;
-    const path = join(dir, name);
-    out.push(readHandoff(path, await readFile(path, "utf8")));
+    const rel = `remember/handoffs/${name}`;
+    const path = join(projectDir, rel);
+    try {
+      const text = await readMemoryFile(projectDir, rel);
+      out.push(text === null ? unreadable(basename(name, ".md"), path, new MemoryReadError(rel, "read", "ENOENT")) : readHandoff(path, text));
+    } catch (err) {
+      out.push(unreadable(basename(name, ".md"), path, err));
+    }
   }
   if (opts.includeLegacyRoot) {
     // Before migration (spec 4.5) the root HANDOFF.md is the project's single handoff.
     const root = join(projectDir, "HANDOFF.md");
-    const text = await readFile(root, "utf8").catch(() => null);
+    let text: string | null = null;
+    try {
+      text = await readMemoryFile(projectDir, "HANDOFF.md");
+    } catch (err) {
+      out.push(unreadable("HANDOFF", root, err));
+    }
     if (text !== null) {
       out.push({
         id: "HANDOFF",

@@ -6,7 +6,7 @@ import { readFile, readdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { Harness, SessionRef, TranscriptChunk } from "./harness.ts";
 import { scanText } from "./secrets.ts";
-import { createExclusive, parseDoc, renderDoc, sanitizeKey, writeAtomic } from "./store.ts";
+import { createExclusive, listMemoryDir, MemoryReadError, parseDoc, quoted, readMemoryFile, renderDoc, sanitizeKey, writeAtomic } from "./store.ts";
 import { addDays, dayStamp, isoWithOffset, timeStamp } from "./time.ts";
 
 export interface JournalEntryMeta {
@@ -66,15 +66,30 @@ export async function writeJournalEntry(
   return createExclusive(join(projectDir, "remember", "journal", day), (rand) => `${stamp}-${machine}-${session8}-${rand}.md`, content);
 }
 
-export async function listEntries(projectDir: string): Promise<JournalEntry[]> {
-  const root = join(projectDir, "remember", "journal");
+// Throws when the journal folder or a day folder exists but cannot be listed.
+// One entry that cannot be read is skipped, never fatal: when the caller passes
+// `problems`, each skip is reported there (session.ts turns them into warnings).
+export async function listEntries(projectDir: string, problems?: string[]): Promise<JournalEntry[]> {
   const out: JournalEntry[] = [];
-  for (const day of (await readdir(root).catch(() => [] as string[])).sort()) {
+  for (const day of (await listMemoryDir(projectDir, "remember/journal")).sort()) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
-    for (const name of (await readdir(join(root, day)).catch(() => [] as string[])).sort()) {
+    for (const name of (await listMemoryDir(projectDir, `remember/journal/${day}`)).sort()) {
       if (!name.endsWith(".md") || name.startsWith(".")) continue;
-      const path = join(root, day, name);
-      const doc = parseDoc(await readFile(path, "utf8"));
+      const rel = `remember/journal/${day}/${name}`;
+      const path = join(projectDir, rel);
+      let raw: string | null;
+      try {
+        raw = await readMemoryFile(projectDir, rel);
+      } catch (err) {
+        const why = err instanceof MemoryReadError ? err.why : (err as Error).message;
+        problems?.push(`journal entry ${quoted(`${day}/${name}`)} cannot be read (${why}); skipped`);
+        continue;
+      }
+      if (raw === null) {
+        problems?.push(`journal entry ${quoted(`${day}/${name}`)} vanished while being read; skipped`);
+        continue;
+      }
+      const doc = parseDoc(raw);
       const fm = doc.frontmatter;
       out.push({
         id: `${day}/${basename(name, ".md")}`,
@@ -91,6 +106,7 @@ export async function listEntries(projectDir: string): Promise<JournalEntry[]> {
 }
 
 export async function loadJournalState(file: string): Promise<JournalState> {
+  // Lenient on purpose: positions are regenerable local state; a lost one only journals a session again.
   try {
     const parsed = JSON.parse(await readFile(file, "utf8")) as JournalState;
     return parsed && typeof parsed.sessions === "object" ? parsed : { sessions: {} };
@@ -196,6 +212,7 @@ async function cached(dir: string, label: string, key: string, make: () => Promi
   if (existing !== null) return { text: existing, made: false };
   const made = await make();
   await writeAtomic(path, made);
+  // Lenient on purpose: the digest cache is regenerable local state; a failed prune only leaves a stale file.
   for (const name of await readdir(dir).catch(() => [] as string[])) {
     if (name.startsWith(`${label}-`) && name !== `${label}-${key}.md`) await rm(join(dir, name), { force: true });
   }

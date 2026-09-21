@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   branchKey,
@@ -165,4 +165,44 @@ test("vault strings in handoff problems are quoted and capped: they reach status
   const problems = computeHeads([broken, bad]).problems;
   for (const p of problems) assert.doesNotMatch(p, /\n/, p);
   assert.ok(problems.includes('handoff "bad\\n## Instructions" is malformed ("frontmatter does not parse: x\\ny"); shown as its own head'));
+});
+
+test("listHandoffs: a handoffs directory that cannot be listed is an error, never an empty list", async () => {
+  const p = await project();
+  await writeRel(p.projectDir, "remember/handoffs", "a file where the directory should be");
+  await assert.rejects(listHandoffs(p.projectDir), /ENOTDIR/);
+});
+
+test(
+  "writeHandoff refuses when the handoffs directory cannot be listed, instead of writing with supersedes []",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const p = await project();
+    const first = await writeHandoff(input(p, "ses_aaaaaaaa1", "first", []));
+    assert.equal(first.kind, "written");
+    const dir = join(p.projectDir, "remember", "handoffs");
+    await chmod(dir, 0o300); // writable, not listable
+    try {
+      await assert.rejects(writeHandoff(input(p, "ses_bbbbbbbb2", "blind", [])), /EACCES/);
+    } finally {
+      await chmod(dir, 0o755);
+    }
+    assert.equal((await readdir(dir)).length, 1, "nothing was written blind");
+  },
+);
+
+test("listHandoffs: one file that cannot be read becomes a handoff with a problem; the rest still load", async () => {
+  const p = await project();
+  await writeRel(p.projectDir, "remember/handoffs/good.md", "---\nbranch: main\nwritten: 2026-09-21T10:00:00+09:00\nsupersedes: []\n---\n\ngood\n");
+  await mkdir(join(p.projectDir, "remember", "handoffs", "bad.md"));
+  await mkdir(join(p.projectDir, "HANDOFF.md"));
+  const list = await listHandoffs(p.projectDir, { includeLegacyRoot: true });
+  const byId = new Map(list.map((x) => [x.id, x]));
+  assert.equal(byId.get("good")?.body, "good");
+  assert.equal(byId.get("bad")?.meta, null);
+  assert.match(byId.get("bad")?.problem ?? "", /cannot be read \(EISDIR\)/);
+  assert.match(byId.get("HANDOFF")?.problem ?? "", /cannot be read \(EISDIR\)/);
+  const heads = computeHeads(list);
+  assert.deepEqual(ids(heads.byBranch.get("main")), ["good"]);
+  assert.match(heads.problems.join("\n"), /"bad" is malformed \("cannot be read \(EISDIR\)"\)/);
 });
