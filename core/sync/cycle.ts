@@ -6,7 +6,7 @@ import { mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock, type LockHandle } from "../lock.ts";
-import { scanStaged } from "../secrets.ts";
+import { redactUrlCredentials, scanStaged } from "../secrets.ts";
 import { writeAtomic } from "../store.ts";
 import { identityProblem } from "./state.ts";
 
@@ -433,5 +433,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
         result.reason = result.reason ? `${result.reason}; ${failed}` : failed;
       }
     }
+    // git's stderr and a GitError's arguments can hold the remote URL.
+    if (result.reason) result.reason = redactUrlCredentials(result.reason);
   }
 }

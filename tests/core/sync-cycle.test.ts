@@ -243,6 +243,31 @@ test("the quiet period defers a file written just now", async () => {
   assert.ok(second.committed && second.pushed);
 });
 
+test("a path changing during the snapshot suppresses the push; the next cycle pushes both versions", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  // A post-commit hook (git runs it even with --no-verify) appends to the file just
+  // committed: exactly the window between the commit and the re-stat.
+  const once = join(a.projects, ".git", "restat-once");
+  await writeFile(once, "");
+  const hook = join(a.projects, ".git", "hooks", "post-commit");
+  await writeFile(hook, `#!/bin/sh\nif [ -f '${once}' ]; then rm -f '${once}'; echo more >> x/notes/n.md; fi\n`);
+  await chmod(hook, 0o755);
+  await writeRel(a.projects, "x/notes/n.md", "n\n");
+  const first = await cycle(remote, a);
+  assert.equal(first.outcome, "unsynced", first.reason ?? "");
+  assert.ok(first.committed);
+  assert.equal(first.pushed, false);
+  assert.equal(await gitOk(["rev-parse", "HEAD"], { cwd: a.projects }), first.committed, "the commit stands locally");
+  assert.notEqual((await git(["cat-file", "-e", "main:x/notes/n.md"], { cwd: remote })).code, 0, "nothing was pushed");
+
+  const second = await cycle(remote, a);
+  assert.ok(second.committed && second.pushed, second.reason ?? "");
+  assert.equal(await remoteFile(remote, "x/notes/n.md"), "n\nmore");
+  const log = await gitOk(["log", "--format=%H", "main"], { cwd: remote });
+  assert.ok(log.split("\n").includes(first.committed), "the intermediate commit was pushed too");
+});
+
 test("changedSince reports size, mtime, creation and deletion changes", async () => {
   const dir = await tempDir();
   await writeRel(dir, "a.md", "one");

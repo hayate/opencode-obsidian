@@ -149,13 +149,22 @@ export function scanDiff(diff: string): Map<string, SecretHit[]> {
   return byFile;
 }
 
+// A remote URL may carry credentials (https://user:token@host/...), and status
+// reasons reach the model's context and the user's screen: the userinfo goes.
+// Everything up to the last "@" before the host goes, so an unencoded "@" in a
+// password cannot leave part of it behind. An scp-style "git@host:path" has no
+// scheme and no secret, and is kept.
+export function redactUrlCredentials(text: string): string {
+  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#"']*@/gi, "$1***@");
+}
+
 // git's empty tree: attributes are read from it, i.e. from nowhere in the tree.
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 // The staged diff exactly as the scan must see it, whatever the user's config or
 // the synced tree says. --attr-source=<empty tree>: a .gitattributes "*.md -diff"
-// (it syncs like any file) would print "Binary files differ" for every note, and a
-// real binary stays binary without it. --no-textconv: a textconv driver rewrites
+// (it syncs like any file) would print "Binary files differ" for every note; a real
+// binary (NUL bytes) is still detected as one. --no-textconv: a textconv driver rewrites
 // the + lines. --src-prefix/--dst-prefix: diff.mnemonicPrefix / noprefix /
 // dstPrefix change the +++ header, and scanDiff strips only git's own "b/"; a path
 // it cannot parse means the later unstage matches nothing and the secret stays staged.

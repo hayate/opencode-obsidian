@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { lstat, readFile, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { git, gitOk, NETWORK_TIMEOUT_MS } from "../git.ts";
-import { scanStaged } from "../secrets.ts";
+import { redactUrlCredentials, scanStaged } from "../secrets.ts";
 import { createAt, writeAtomic } from "../store.ts";
 import { CONFIG_FILE, type Vault } from "../vault.ts";
 
@@ -227,8 +227,8 @@ async function checkRepo(projectsDir: string, remote: string): Promise<SyncState
   const unmerged = await gitOk(["diff", "--name-only", "--diff-filter=U"], { cwd: projectsDir });
   if (unmerged) return { kind: "stopped", reason: `Projects/ has unmerged files: ${unmerged.split("\n").join(", ")}` };
   // Every repository that comes out ready gets the required ignores, not only
-  // one this call bootstrapped or imported: an existing Projects/ (Andrea's
-  // real vault: already a repo, never ran commitAndPushNew) and a fresh clone
+  // one this call bootstrapped or imported: a Projects/ that was a repository
+  // before the plugin (it never ran commitAndPushNew) and a fresh clone
   // of an already-populated remote (a plugin session may be the first to ever
   // clone that remote's history) both skip commitAndPushNew, so neither would
   // otherwise ever gain them. The write itself is committed by the next
@@ -237,7 +237,23 @@ async function checkRepo(projectsDir: string, remote: string): Promise<SyncState
   return { kind: "ready", branch: branch.stdout.trim(), bootstrapped: false };
 }
 
+// No status echoes the credentials a remote URL may carry: every reason and origin
+// this returns, and the message of anything it throws (session.ts reports it),
+// goes through redactUrlCredentials.
 export async function prepareProjects(vault: Vault, cfg: SyncConfig, timezone: string): Promise<SyncState> {
+  let state: SyncState;
+  try {
+    state = await prepare(vault, cfg, timezone);
+  } catch (err) {
+    if (err instanceof Error) err.message = redactUrlCredentials(err.message);
+    throw err;
+  }
+  if (state.kind === "stopped") return { ...state, reason: redactUrlCredentials(state.reason) };
+  if (state.kind === "off-but-configured") return { ...state, origin: redactUrlCredentials(state.origin) };
+  return state;
+}
+
+async function prepare(vault: Vault, cfg: SyncConfig, timezone: string): Promise<SyncState> {
   const dir = vault.projectsDir;
   const isRepo = await exists(join(dir, ".git"));
 

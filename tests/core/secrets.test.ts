@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { scanDiff, scanText, unquoteGitPath } from "../../core/secrets.ts";
+import { redactUrlCredentials, scanDiff, scanText, unquoteGitPath } from "../../core/secrets.ts";
 
 // Fixtures are assembled at runtime: a literal token-shaped string in this file
 // would trip GitHub push protection on the repository itself.
@@ -169,6 +169,20 @@ test("git's TAB after a name holding a space is dropped; the name's own spaces a
   assert.deepEqual(diff("+++ b/x/trailing \t"), ["x/trailing "]);
   assert.deepEqual(diff("+++ b/x/ leading.md\t"), ["x/ leading.md"]);
   assert.deepEqual(diff('+++ "b/x/a b\\n.md"\t'), ["x/a b\n.md"]);
+});
+
+test("redactUrlCredentials drops a URL's userinfo, a bare token included, and nothing else", () => {
+  const pw = j("s3cret", "pass");
+  assert.equal(
+    redactUrlCredentials(`clone of https://deploy:${pw}@host.example/x.git failed`),
+    "clone of https://***@host.example/x.git failed",
+  );
+  assert.equal(redactUrlCredentials(`"https://${noise(40)}@github.com/o/r.git"`), '"https://***@github.com/o/r.git"');
+  // An unencoded @ inside the password still goes whole.
+  assert.equal(redactUrlCredentials(`https://u:${pw}@x@host/r.git`), "https://***@host/r.git");
+  for (const kept of ["git@github.com:o/r.git", "https://host.example/a@b", "/srv/remotes/p.git", "ssh://host/r.git"]) {
+    assert.equal(redactUrlCredentials(kept), kept);
+  }
 });
 
 test("the scanner stays linear on a 1 MB line and ignores identifiers notes are full of", () => {

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmod, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { git, gitOk, GitError, literal } from "../../core/git.ts";
 import { initRepo, sleep, tempDir, writeRel } from "./helpers.ts";
 
@@ -59,7 +60,8 @@ test("a timeout kills git and the processes it started", async () => {
 });
 
 test("core never spawns synchronously (a sync child would block the event loop)", async () => {
-  const coreDir = new URL("../../core/", import.meta.url).pathname;
+  // fileURLToPath, never .pathname: a checkout path with a space is %20 in a URL.
+  const coreDir = fileURLToPath(new URL("../../core/", import.meta.url));
   const files = (await readdir(coreDir, { recursive: true })).filter((f) => f.endsWith(".ts"));
   assert.ok(files.length > 0);
   for (const file of files) {

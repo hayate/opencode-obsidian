@@ -304,6 +304,35 @@ test("a Projects/ repository with no commit (an older failure's leftover) stops 
   }
 });
 
+test("no status echoes the credentials in a remote URL", async () => {
+  // Port 1 refuses at once: no network needed.
+  const url = (repo: string): string => j("https://deploy", ":", "s3cret", "pass", `@127.0.0.1:1/${repo}.git`);
+  const password = j("s3cret", "pass");
+  const reasons: string[] = [];
+  const reasonOf = (state: SyncState): string => (state.kind === "stopped" ? state.reason : JSON.stringify(state));
+
+  const empty = await vault(); // clone of an unreachable remote
+  reasons.push(reasonOf(await prepareProjects(empty, { remote: url("x") }, TZ)));
+  const notes = await vault(); // import: the remote cannot be reached
+  await writeRel(notes.projectsDir, "x/n.md", "n\n");
+  reasons.push(reasonOf(await prepareProjects(notes, { remote: url("x") }, TZ)));
+  const repo = await vault(); // origin mismatch, both sides carrying credentials
+  await gitOk(["clone", "-q", await seededRemote(), repo.projectsDir], { cwd: repo.root });
+  await gitOk(["remote", "set-url", "origin", url("x")], { cwd: repo.projectsDir });
+  reasons.push(reasonOf(await prepareProjects(repo, { remote: url("y") }, TZ)));
+  const off = await prepareProjects(repo, { remote: null }, TZ); // sync off, a configured clone
+  assert.equal(off.kind, "off-but-configured");
+  reasons.push(off.kind === "off-but-configured" ? off.origin : "");
+
+  assert.match(reasons[0] ?? "", /^clone of /);
+  assert.match(reasons[1] ?? "", /^cannot reach /);
+  assert.match(reasons[2] ?? "", /must match exactly/);
+  for (const reason of reasons) {
+    assert.ok(!reason.includes(password), reason);
+    assert.match(reason, /127\.0\.0\.1:1\/[xy]\.git/, "the reason still names the remote");
+  }
+});
+
 test("a detached HEAD and an in-progress rebase each stop", async () => {
   const v = await vault();
   const remote = await seededRemote();
