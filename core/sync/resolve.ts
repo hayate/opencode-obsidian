@@ -48,6 +48,22 @@ interface Merge {
 const INFORMATIONAL = "Auto-merging";
 const COLLISION = "CONFLICT (rename involved in collision)";
 
+// The types a rule in mergeAndResolve resolves. A type outside this list stops the
+// cycle before any other record's rule can count its paths as resolved: nothing
+// says what such a record means.
+const RULED = [
+  "CONFLICT (contents)",
+  "CONFLICT (binary)",
+  COLLISION,
+  "CONFLICT (modify/delete)",
+  "CONFLICT (rename/delete)",
+  "CONFLICT (rename/rename)",
+  "CONFLICT (file/directory)",
+  "CONFLICT (distinct modes)",
+] as const;
+// Narrows a record's type, so a rule for a type missing from RULED does not compile.
+const hasRule = (type: string): type is (typeof RULED)[number] => (RULED as readonly string[]).includes(type);
+
 // Raw stdout, never gitOk's trimmed form: -z output ends in NULs that matter.
 async function run(clone: string, args: string[], env?: Record<string, string>, input?: string): Promise<string> {
   const r = await git(args, { cwd: clone, env, input });
@@ -216,7 +232,9 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
 
   // A rename collision resolves all of its paths, and a local file that displaces a
   // remote folder moves the whole folder aside: git's later records on those paths
-  // count as resolved.
+  // count as resolved. A record on the folder can also name a path neither commit
+  // holds (the old name of a note renamed into the folder there and deleted here);
+  // neither side has a note there to keep, so the folder move resolves that record too.
   const collided = new Set<string>();
   const displaced: string[] = [];
   for (const record of merge.records) {
@@ -227,13 +245,20 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
       if (moved && path && stage(moved, 3)) displaced.push(path);
     }
   }
-  const resolvedElsewhere = (path: string): boolean => collided.has(path) || displaced.some((f) => path.startsWith(`${f}/`));
+  const movedAside = (path: string): boolean => displaced.some((f) => path.startsWith(`${f}/`));
+  const inNeither = (path: string): boolean => !sides[2].tree.has(path) && !sides[3].tree.has(path);
+  const resolvedElsewhere = (paths: string[]): boolean =>
+    paths.every((p) => collided.has(p) || movedAside(p)) ||
+    (paths.some(movedAside) && paths.every((p) => movedAside(p) || inNeither(p)));
+  const contentRecordAt = (path: string): boolean =>
+    merge.records.some((r) => (r.type === "CONFLICT (contents)" || r.type === "CONFLICT (binary)") && r.paths.includes(path));
 
   for (const record of merge.records) {
     if (record.type === INFORMATIONAL) continue;
     if (!record.paths.length) return stop(`git reported ${record.type} without a path`, []);
+    if (!hasRule(record.type)) return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths);
     for (const path of record.paths) handled.add(path);
-    if (record.type !== COLLISION && record.paths.every(resolvedElsewhere)) continue;
+    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;
     switch (record.type) {
       case "CONFLICT (contents)":
       case "CONFLICT (binary)": {
@@ -241,6 +266,8 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
         const local = path && stage(path, 3);
         const remote = path && stage(path, 2);
         if (!path || !local || !remote) return stop(`git reported ${record.type} without both versions`, record.paths);
+        // git reports a binary clash twice, as binary and then as contents: one conflict.
+        if (conflicts.some((c) => c.kind === "both-changed" && c.path === path)) break;
         put(path, local);
         conflicts.push({ kind: "both-changed", path, copy: placeCopy(path, remote) });
         break;
@@ -275,6 +302,12 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
         } else if (remote && !local) {
           final.delete(path);
           conflicts.push({ kind: "deleted-here", path: known, copy: placeCopy(path, remote) });
+        } else if (local && remote && record.type === "CONFLICT (rename/delete)" && contentRecordAt(path)) {
+          // The note was renamed onto a name the other side also uses: the other
+          // entry there is that side's own note, and git's contents (or binary)
+          // record at the name resolves the pair (the local entry stays, the remote
+          // one becomes a copy). Without that record, nothing says what the pair
+          // is: stop.
         } else {
           return stop(`git reported ${record.type} with an unexpected pair of versions`, record.paths);
         }
@@ -329,8 +362,6 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
         conflicts.push({ kind: "type-differs", path, copy: placeCopy(path, remote) });
         break;
       }
-      default:
-        return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths);
     }
   }
   const tree = await (opts.writeTree ?? writeResolved)(clone, merge.tree, result, final);

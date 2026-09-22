@@ -101,6 +101,32 @@ test("two different new notes at one path: the local one keeps it, the remote on
   assert.equal(await blob(clone, tree.get(r.conflicts[0]?.copy ?? "")?.oid ?? ""), "R");
 });
 
+test("a binary file changed on both sides keeps the local version at the path and the remote one as a copy", async () => {
+  // A NUL byte makes git's merge say "binary" as well as "contents" for the path.
+  const clone = await scenario({ "n.bin": "a\0b\n" }, { write: { "n.bin": "remote\0b\n" } }, { write: { "n.bin": "local\0b\n" } });
+  const { r, tree } = await resolved(clone);
+  const local = (await treeOf(clone, "local")).get("n.bin");
+  const remote = (await treeOf(clone, "remote")).get("n.bin");
+  assert.deepEqual(r.conflicts.map((c) => [c.kind, c.path]), [["both-changed", "n.bin"]]);
+  const copy = r.conflicts[0]?.copy ?? "";
+  assert.ok(copy.startsWith("n.conflict-2026-09-22-0915-") && copy.endsWith(".bin"), copy);
+  assert.deepEqual(tree.get("n.bin"), local);
+  assert.deepEqual(tree.get(copy), remote);
+  assert.deepEqual([...tree.keys()].sort(), [copy, "n.bin"].sort());
+});
+
+test("a clash where the other machine also made the note executable keeps the local entry at the path and the executable one as the copy", async () => {
+  const clone = await scenario({ "n.md": "a\n" }, { write: { "n.md": "remote\n" }, exec: ["n.md"] }, { write: { "n.md": "local\n" } });
+  const { r, tree } = await resolved(clone);
+  const local = (await treeOf(clone, "local")).get("n.md");
+  const remote = (await treeOf(clone, "remote")).get("n.md");
+  assert.equal(remote?.mode, "100755", "the fixture's remote note is executable");
+  assert.deepEqual(r.conflicts.map((c) => [c.kind, c.path]), [["both-changed", "n.md"]]);
+  assert.deepEqual(tree.get("n.md"), { mode: "100644", oid: local?.oid });
+  assert.deepEqual(tree.get(r.conflicts[0]?.copy ?? ""), { mode: "100755", oid: remote?.oid });
+  assert.equal(tree.size, 2, [...tree.keys()].join(", "));
+});
+
 test("a note deleted here and edited there stays deleted; the edit becomes the copy", async () => {
   const clone = await scenario({ "n.md": "a\n" }, { write: { "n.md": "remote edit\n" } }, { remove: ["n.md"] });
   const { r, tree } = await resolved(clone);
@@ -172,6 +198,30 @@ test("deleted here and renamed there stays deleted; the renamed version becomes 
   assert.ok(r.conflicts[0]?.copy?.startsWith("r.conflict-2026-09-22-0915-"), r.conflicts[0]?.copy ?? "");
   assert.equal(tree.has("r.md"), false);
   assert.equal(tree.size, 1);
+});
+
+test("deleted here and renamed there onto a name this machine also uses: the local note keeps the name, the renamed one is the copy", async () => {
+  const clone = await scenario({ "n.md": TEXT }, { move: [["n.md", "r.md"]] }, { remove: ["n.md"], write: { "r.md": "a different local note\n" } });
+  const { r, tree } = await resolved(clone);
+  assert.deepEqual(r.conflicts.map((c) => [c.kind, c.path]), [["both-changed", "r.md"]]);
+  const copy = r.conflicts[0]?.copy ?? "";
+  assert.ok(copy.startsWith("r.conflict-2026-09-22-0915-"), copy);
+  assert.equal(await blob(clone, tree.get("r.md")?.oid ?? ""), "a different local note");
+  assert.equal(await blob(clone, tree.get(copy)?.oid ?? ""), TEXT.trimEnd());
+  assert.deepEqual([...tree.keys()].sort(), ["r.md", copy].sort());
+  for (const [, entry] of tree) assert.doesNotMatch(await blob(clone, entry.oid), /^<{7}/m);
+});
+
+test("renamed here onto a name the other machine also added, deleted there: the renamed note keeps the name, the other note is the copy", async () => {
+  const clone = await scenario({ "n.md": TEXT }, { remove: ["n.md"], write: { "r.md": "a different remote note\n" } }, { move: [["n.md", "r.md"]] });
+  const { r, tree } = await resolved(clone);
+  assert.deepEqual(r.conflicts.map((c) => [c.kind, c.path]), [["both-changed", "r.md"]]);
+  const copy = r.conflicts[0]?.copy ?? "";
+  assert.ok(copy.startsWith("r.conflict-2026-09-22-0915-"), copy);
+  assert.equal(await blob(clone, tree.get("r.md")?.oid ?? ""), TEXT.trimEnd());
+  assert.equal(await blob(clone, tree.get(copy)?.oid ?? ""), "a different remote note");
+  assert.deepEqual([...tree.keys()].sort(), ["r.md", copy].sort());
+  for (const [, entry] of tree) assert.doesNotMatch(await blob(clone, entry.oid), /^<{7}/m);
 });
 
 test("a local file against a remote folder: the file keeps the path, the folder moves to a copy", async () => {
@@ -358,6 +408,22 @@ test("a local file replacing a folder the other machine edited in: the whole rem
   assert.deepEqual([...tree.keys()].sort(), ["keep.md", "p", `${folder}/a.md`]);
 });
 
+test("a local file replacing the folder the other machine renamed a note into (deleted here): the note moves aside with the folder", async () => {
+  const clone = await scenario(
+    { "q.md": TEXT, "p/a.md": "a\n", "keep.md": "k\n" },
+    { move: [["q.md", "p/b.md"]] },
+    { remove: ["q.md", "p"], write: { p: "file\n" } },
+  );
+  const { r, tree } = await resolved(clone);
+  assert.deepEqual(r.conflicts.map((c) => c.kind), ["file-folder"]);
+  const folder = r.conflicts[0]?.copy ?? "";
+  assert.ok(folder.startsWith("p.conflict-2026-09-22-0915-"), folder);
+  assert.equal(await blob(clone, tree.get("p")?.oid ?? ""), "file");
+  assert.equal(await blob(clone, tree.get(`${folder}/b.md`)?.oid ?? ""), TEXT.trimEnd());
+  assert.deepEqual([...tree.keys()].sort(), ["keep.md", "p", `${folder}/b.md`]);
+  for (const [, entry] of tree) assert.doesNotMatch(await blob(clone, entry.oid), /^<{7}/m);
+});
+
 test("a remote file replacing a folder edited here: the local folder keeps its notes, the file becomes the copy", async () => {
   const clone = await scenario({ "p/a.md": "a\n", "keep.md": "k\n" }, { remove: ["p"], write: { p: "file\n" } }, { write: { "p/a.md": "a local edit\n" } });
   const { r, tree } = await resolved(clone);
@@ -375,11 +441,13 @@ test("a conflicting edit to a note inside a folder the other machine renamed kee
     { write: { "d/a.md": edited("LOCAL") } },
   );
   const { r, tree } = await resolved(clone);
-  assert.equal(r.conflicts.length, 1);
-  const kept = [...tree].filter(([, e]) => e.oid).map(([p]) => p);
-  const texts = await Promise.all(kept.map(async (p) => [p, await blob(clone, tree.get(p)?.oid ?? "")] as const));
-  assert.ok(texts.some(([, t]) => t === edited("LOCAL").trimEnd()), kept.join(", "));
-  assert.ok(texts.some(([, t]) => t === edited("REMOTE").trimEnd()), kept.join(", "));
+  // git follows the note's own rename, d/a.md to e/a.md, and merges it there.
+  assert.deepEqual(r.conflicts.map((c) => [c.kind, c.path]), [["both-changed", "e/a.md"]]);
+  const copy = r.conflicts[0]?.copy ?? "";
+  assert.ok(copy.startsWith("e/a.conflict-2026-09-22-0915-"), copy);
+  assert.equal(await blob(clone, tree.get("e/a.md")?.oid ?? ""), edited("LOCAL").trimEnd());
+  assert.equal(await blob(clone, tree.get(copy)?.oid ?? ""), edited("REMOTE").trimEnd());
+  assert.deepEqual([...tree.keys()].sort(), [copy, "e/a.md", "e/b.md"].sort());
 });
 
 test("a local file against a remote folder of several notes moves every note of the folder", async () => {
@@ -444,6 +512,43 @@ test("a record type no rule covers stops the cycle, including ones git spells wi
   }
 });
 
+test("a record type no rule covers stops the cycle even when a collision or a folder moved aside covers its paths", async () => {
+  const edited = (side: string): string => TEXT.replace("line two", `line two ${side}`);
+  const cases: Array<{ clone: () => Promise<string>; from: string; to: string }> = [
+    {
+      // The add/add record at dest.md, a path of the rename collision.
+      clone: () => scenario(
+        { "old.md": TEXT, "keep.md": "k\n" },
+        { move: [["old.md", "dest.md"]], write: { "dest.md": edited("REMOTE") } },
+        { write: { "old.md": edited("LOCAL"), "dest.md": "an unrelated new note\n" } },
+      ),
+      from: "CONFLICT (contents)",
+      to: "CONFLICT(directory rename collision)",
+    },
+    {
+      // The modify/delete record at p/a.md, inside the folder the local file p displaces.
+      clone: () => scenario({ "p/a.md": "a\n", "keep.md": "k\n" }, { write: { "p/a.md": "a remote edit\n" } }, { remove: ["p"], write: { p: "file\n" } }),
+      from: "CONFLICT (modify/delete)",
+      to: "CONFLICT(directory rename unclear split)",
+    },
+    {
+      // The rename/delete record at p/b.md (inside that folder) and q.md (in neither commit).
+      clone: () => scenario({ "q.md": TEXT, "p/a.md": "a\n", "keep.md": "k\n" }, { move: [["q.md", "p/b.md"]] }, { remove: ["q.md", "p"], write: { p: "file\n" } }),
+      from: "CONFLICT (rename/delete)",
+      to: "Path updated due to directory rename",
+    },
+  ];
+  for (const { clone: make, from, to } of cases) {
+    const clone = await make();
+    let r: Resolution | undefined;
+    await withRewrittenMergeTree(`\0${from}\0`, `\0${to}\0`, async () => {
+      r = await mergeAndResolve(clone, "remote", "local", { when: WHEN });
+    });
+    assert.equal(r?.kind, "stop", `${to}: ${JSON.stringify(r)}`);
+    assert.match((r as { reason: string }).reason, new RegExp(`git reported ${to.replace(/[()]/g, "\\$&")}, which the plugin cannot resolve`));
+  }
+});
+
 test("a conflict that names no path stops the cycle", async () => {
   const clone = await scenario({ "x/n.md": "a\n" }, { write: { "x/n.md": "remote\n" } }, { write: { "x/n.md": "local\n" } });
   let r: Resolution | undefined;
@@ -452,6 +557,18 @@ test("a conflict that names no path stops the cycle", async () => {
   });
   assert.equal(r?.kind, "stop", JSON.stringify(r));
   assert.match((r as { reason: string }).reason, /without a path/);
+});
+
+test("a rename/delete onto a name both sides hold stops when no content record names that name", async () => {
+  const clone = await scenario({ "n.md": TEXT }, { move: [["n.md", "r.md"]] }, { remove: ["n.md"], write: { "r.md": "a different local note\n" } });
+  let r: Resolution | undefined;
+  // git's add/add record at r.md now names the old path instead.
+  await withRewrittenMergeTree("\x001\0r.md\0CONFLICT (contents)\0", "\x001\0n.md\0CONFLICT (contents)\0", async () => {
+    r = await mergeAndResolve(clone, "remote", "local", { when: WHEN });
+  });
+  assert.equal(r?.kind, "stop", JSON.stringify(r));
+  assert.match((r as { reason: string }).reason, /rename\/delete\) with an unexpected pair of versions/);
+  assert.deepEqual((r as { paths: string[] }).paths, ["r.md", "n.md"]);
 });
 
 test("the check stops a merge whose written tree lost a version", async () => {
