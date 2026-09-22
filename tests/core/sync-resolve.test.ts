@@ -723,13 +723,14 @@ test("each stop says the one thing to do: a submodule's is to remove the nested 
     assert.equal(r?.kind, "stop", JSON.stringify(r));
     assert.match((r as { todo: string }).todo, todo);
     assert.deepEqual((r as { paths: string[] }).paths, ["x/n.md"]);
+    assert.deepEqual((r as { findings: string[] }).findings, [], "only a failed check has findings");
   }
 });
 
 // Real git (2.50.1): the other machine renames q.md into p/ and edits it; this machine
 // edits q.md on the same line and replaces folder p/ with a file. A known shape the
 // check stops (spec 5.4 step 3).
-test("a merge the check stops names the notes this machine holds among the conflict's paths, and never reads as a loss", async () => {
+test("a merge the check stops names the notes this machine holds among the conflict's paths, promises no merge, and carries the check's own findings", async () => {
   const clone = await scenario(
     { "q.md": TEXT, "p/a.md": "a\n", "keep.md": "k\n" },
     { move: [["q.md", "p/b.md"]], write: { "p/b.md": TEXT.replace("line two", "line two REMOTE") } },
@@ -737,10 +738,18 @@ test("a merge the check stops names the notes this machine holds among the confl
   );
   const r = await mergeAndResolve(clone, "remote", "local", { when: WHEN });
   assert.equal(r.kind, "stop", JSON.stringify(r));
-  const stop = r as { reason: string; paths: string[]; todo: string };
+  const stop = r as { reason: string; paths: string[]; todo: string; findings: string[] };
   assert.equal(stop.reason, "the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check)");
   assert.deepEqual(stop.paths, ["p"], "not git's relocation p~<commit>, nor the other machine's name p/b.md");
-  assert.equal(stop.todo, "To go on, move or rename this machine's version of these notes; the next sync then merges.");
+  // A check that fails for any other reason (a rule's bug) gets the same todo: it
+  // promises no merge, and the findings let the failure be diagnosed.
+  assert.equal(stop.todo, "To go on, move or rename this machine's version of these notes, then sync again.");
+  assert.deepEqual(stop.findings, [
+    "p/b.md: a version (bfedba226568) was lost",
+    "p/b.md: a version (09a8dfb5af58) was lost",
+    "p.conflict-2026-09-22-0915-ee297d/b.md: git's merged result remains",
+    "p/b.md was not moved with its folder",
+  ]);
 });
 
 test("a conflict that names no path stops the cycle", async () => {

@@ -291,17 +291,20 @@ function listed(shown: string[], total: number): string {
   return (total > shown.length ? [...shown, `and ${total - shown.length} more`] : shown).join(", ");
 }
 
-// File names quoted and capped like any other.
+// File names (and the check's findings, which hold them) quoted and capped like any other.
 function joinNames(names: string[]): string {
   return listed(names.slice(0, MAX_LISTED).map((n) => quoted(n)), names.length);
 }
 
 // resolve.ts's stop as the user reads it: what stopped the merge, the notes it names
 // (quoted and capped like any other names), that nothing was pushed or lost, and the
-// one thing to do (spec 5.4 step 3).
-function stopReason(stop: { reason: string; paths: string[]; todo: string }): string {
+// one thing to do (spec 5.4 step 3). A failed check's own findings come last, quoted
+// and capped the same way: they are about the merge it refused, never the vault, and
+// they let a failure that no known shape explains be diagnosed.
+function stopReason(stop: { reason: string; paths: string[]; todo: string; findings: string[] }): string {
   const named = stop.paths.length ? `: ${joinNames(stop.paths)}` : "";
-  return `${stop.reason}${named}. Nothing was pushed and nothing was lost. ${stop.todo}`;
+  const found = stop.findings.length ? ` The check's findings, in the merge it refused: ${joinNames(stop.findings)}.` : "";
+  return `${stop.reason}${named}. Nothing was pushed and nothing was lost. ${stop.todo}${found}`;
 }
 
 // A status line, not a transcript: git's first few lines that say something.

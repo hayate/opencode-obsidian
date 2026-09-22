@@ -25,20 +25,21 @@ export interface Conflict {
   other?: string;
 }
 
-// A stop: what stopped the merge, the notes it names, and the one thing the user
-// does to go on (spec 5.4 step 3). Nothing was pushed and nothing was lost either way:
-// the merge ran in the state clone, and each machine still holds its own version.
+// A stop: what stopped the merge, the notes it names, the one thing the user does to
+// go on (spec 5.4 step 3), and, for a failed check, the check's own findings.
+// Nothing was pushed and nothing was lost either way: the merge ran in the state
+// clone, and each machine still holds its own version.
 export type Resolution =
   | { kind: "clean"; tree: string; conflicts: Conflict[] }
-  | { kind: "stop"; reason: string; paths: string[]; todo: string };
+  | { kind: "stop"; reason: string; paths: string[]; todo: string; findings: string[] };
 
 // The one thing to do after each kind of stop. For the two known shapes the check
 // stops (spec 5.4 step 3: a rename meeting the other machine's note of its new name,
 // and a note renamed into a folder this machine replaced with a file), giving this
 // machine's version of the named notes a name of its own lets the next sync merge
-// with nothing lost (verified with real git, sync-cycle.test.ts). A type no rule
-// covers gets the same advice without that promise.
-const MOVE_ASIDE = "To go on, move or rename this machine's version of these notes; the next sync then merges.";
+// with nothing lost (verified with real git, sync-cycle.test.ts). A check that fails
+// for any other reason (a bug in a rule) and a type no rule covers get the same
+// advice, so it promises no merge: only that sync runs again.
 const MOVE_ASIDE_RETRY = "To go on, move or rename this machine's version of these notes, then sync again.";
 // A submodule is a git repository inside Projects/, which step 2 already reports.
 const REMOVE_REPOSITORY = "To go on, remove the nested repository there (move it out of Projects/, or remove its .git), then sync again.";
@@ -230,7 +231,7 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
   // (rename/rename, a rename collision) read the side commits; the check below stops
   // any merged output a rule would leave in place.
   const stage = (path: string, n: 2 | 3): Entry | undefined => merge.stages.get(path)?.[n];
-  const stop = (reason: string, paths: string[], todo = MOVE_ASIDE_RETRY): Resolution => ({ kind: "stop", reason, paths, todo });
+  const stop = (reason: string, paths: string[], todo = MOVE_ASIDE_RETRY, findings: string[] = []): Resolution => ({ kind: "stop", reason, paths, todo, findings });
 
   const put = (path: string, entry: Entry): void => {
     final.set(path, entry);
@@ -396,16 +397,20 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
     for (const c of conflicts) if (c.other?.startsWith(`${path}/`)) c.other = moved(c.other);
   }
   const tree = await (opts.writeTree ?? writeResolved)(clone, merge.tree, result, final);
-  // The check's own findings name paths and git's objects, and read as loss where
-  // nothing was lost: the user reads that the check failed, and the notes this
-  // machine holds among the conflict's paths (git's relocations and the other
-  // machine's names are nothing they can move), or every path when it holds none.
-  if (checkResolved(await listTree(clone, tree), final, facts).length) {
+  // The user reads that the check failed, and the notes this machine holds among the
+  // conflict's paths (git's relocations and the other machine's names are nothing they
+  // can move), or every path when it holds none. The check's own findings name paths
+  // and git's objects in the merge it refused, and read as loss where nothing was
+  // lost: they come last (cycle.ts), so that a failure a rule's bug caused can be
+  // diagnosed.
+  const findings = checkResolved(await listTree(clone, tree), final, facts);
+  if (findings.length) {
     const mine = [...handled].filter((p) => sides[3].tree.has(p));
     return stop(
       "the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check)",
       mine.length ? mine : [...handled],
-      MOVE_ASIDE,
+      MOVE_ASIDE_RETRY,
+      findings,
     );
   }
   return { kind: "clean", tree, conflicts };

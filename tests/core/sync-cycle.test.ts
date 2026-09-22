@@ -1423,8 +1423,11 @@ test("a merge stop that names no path gives a reason with no dangling colon, and
 
 // Spec 5.4 step 3's two known shapes the check stops, each followed by the user's way
 // out as the status gives it. Verified with real git: the next sync merges, nothing lost.
+// The status promises no merge (a check can fail for another reason, a rule's bug), and
+// ends with the check's own findings, quoted and capped, so such a failure can be diagnosed.
 const FIVE = "line1\nline2\nline3\nline4\nline5\n";
-const MOVE_ASIDE = "Nothing was pushed and nothing was lost. To go on, move or rename this machine's version of these notes; the next sync then merges.";
+const MOVE_ASIDE = "Nothing was pushed and nothing was lost. To go on, move or rename this machine's version of these notes, then sync again.";
+const FOUND = " The check's findings, in the merge it refused: ";
 
 // This machine renames x/<b> to x/<z> without editing it; the other machine edits x/<b>
 // and starts its own x/<z>. Returns the cycle that stopped, and the remote head before it.
@@ -1449,7 +1452,7 @@ test("a rename that meets the other machine's note of the new name stops, saying
   assert.equal(stopped.outcome, "stopped", stopped.reason ?? "");
   assert.equal(
     stopped.reason,
-    `the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check): "x/z.md". ${MOVE_ASIDE}`,
+    `the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check): "x/z.md". ${MOVE_ASIDE}${FOUND}"x/z.md: a version (b3c5a95f929a) was lost", "x/z.md: git's merged result remains".`,
   );
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
   // The way out: this machine's x/z.md gets a name of its own.
@@ -1482,9 +1485,12 @@ test("a note renamed into a folder this machine replaced with a file, edited on 
   const before = await gitOk(["rev-parse", "main"], { cwd: remote });
   const stopped = await cycle(remote, b);
   assert.equal(stopped.outcome, "stopped", stopped.reason ?? "");
-  assert.equal(
-    stopped.reason,
-    `the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check): "x/p". ${MOVE_ASIDE}`,
+  // The copy's name in the findings carries the time of the cycle.
+  const [said, found] = (stopped.reason ?? "").split(FOUND);
+  assert.equal(said, `the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check): "x/p". ${MOVE_ASIDE}`);
+  assert.match(
+    found ?? "",
+    /^"x\/p\/b\.md: a version \([0-9a-f]{12}\) was lost", "x\/p\/b\.md: a version \([0-9a-f]{12}\) was lost", "x\/p\.conflict-[0-9-]+-[0-9a-f]{6}\/b\.md: git's merged result remains", "x\/p\/b\.md was not moved with its folder"\.$/,
   );
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
   // The way out: this machine's file x/p gets a name of its own.
@@ -1508,11 +1514,19 @@ test("a stop names each note quoted, so a name cannot add a status line, and at 
   const { stopped } = await renameMeetsItsNewName([{ b: "b.md", z: forged }]);
   assert.equal(stopped.outcome, "stopped", stopped.reason ?? "");
   const [line] = statusFromCycle(stopped);
-  assert.equal(line?.text, `sync stopped: the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check): ${JSON.stringify(`x/${forged}`)}. ${MOVE_ASIDE}`);
+  const findings = [`x/${forged}: a version (b3c5a95f929a) was lost`, `x/${forged}: git's merged result remains`].map((f) => JSON.stringify(f)).join(", ");
+  assert.equal(
+    line?.text,
+    `sync stopped: the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check): ${JSON.stringify(`x/${forged}`)}. ${MOVE_ASIDE}${FOUND}${findings}.`,
+  );
   const many = await renameMeetsItsNewName(Array.from({ length: 11 }, (_, i) => ({ b: `b${i}.md`, z: `z${i}.md` })));
   assert.equal(many.stopped.outcome, "stopped", many.stopped.reason ?? "");
   assert.match(many.stopped.reason ?? "", /: "x\/z0\.md", .*, and 1 more\. Nothing was pushed/);
   assert.equal((many.stopped.reason?.match(/"x\/z\d+\.md"/g) ?? []).length, 10);
+  // Two findings for each of the eleven notes: ten shown, then a count.
+  const [, manyFound] = (many.stopped.reason ?? "").split(FOUND);
+  assert.equal((manyFound?.match(/"x\/z\d+\.md: /g) ?? []).length, 10);
+  assert.match(manyFound ?? "", /", and 12 more\.$/);
 });
 
 test("adopting a rewritten remote with nothing unsent pushes nothing, and the vault follows the remote", async () => {

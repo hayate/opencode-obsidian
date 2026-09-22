@@ -120,7 +120,7 @@ mutate("core/sync/resolve.ts", "    `--attr-source=${EMPTY_TREE}`,\n", "", R)
 mutate("core/sync/resolve.ts", '    "-c",\n    "merge.directoryRenames=false",\n', "", R)
 mutate("core/sync/resolve.ts", "    if (!hasRule(record.type)) {", "    if (false) {", R, pattern="no rule covers")
 mutate("core/sync/resolve.ts", "    for (const [path, e] of final) if (isCopyOf(original, path) && same(e, entry)) return path;", "", R)
-mutate("core/sync/resolve.ts", "  if (checkResolved(await listTree(clone, tree), final, facts).length) {", "  if (false) {", R)
+mutate("core/sync/resolve.ts", "  if (findings.length) {", "  if (false) {", R)
 # copies.ts: names and dedupe.
 mutate("core/sync/copies.ts", "    const kept = cutBytes(stem, NAME_MAX - byteLength(suffix) - byteLength(ext));", "    const kept = cutBytes(stem, NAME_MAX);", CP)
 mutate("core/sync/copies.ts", "    const name = kept ? `${kept}${suffix}${ext}` : `conflict-${oid.slice(0, 12)}${count}`;", "    const name = `${kept}${suffix}${ext}`;", CP)
@@ -316,6 +316,12 @@ mutate(F_R, 'record.type.includes("submodule") ? REMOVE_REPOSITORY : MOVE_ASIDE_
 mutate(F_R, "      mine.length ? mine : [...handled],", "      [...handled],", R, pattern="the check stops names the notes")
 mutate(CY, 'const named = stop.paths.length ? `: ${joinNames(stop.paths)}` : "";', 'const named = stop.paths.length ? `: ${stop.paths.join(", ")}` : "";', C, pattern="names each note quoted")
 mutate("core/session.ts", "  return out.map((item) => ({ ...item, text: oneLine(item.text) }));", "  return out;", SE, pattern="collapses the control characters")
+# A failed check promises no merge (a rule's bug fails it too), and its own findings come last,
+# quoted and capped, so such a failure can be diagnosed (2026-09-23).
+mutate(F_R, "      MOVE_ASIDE_RETRY,\n      findings,\n", "      MOVE_ASIDE_RETRY,\n      [],\n", R, pattern="the check stops names the notes")
+mutate(CY, "Nothing was pushed and nothing was lost. ${stop.todo}${found}`;", "Nothing was pushed and nothing was lost. ${stop.todo}`;", C,
+       pattern="a rename that meets the other machine's note|a note renamed into a folder this machine replaced|a stop names each note quoted")
+mutate(CY, "in the merge it refused: ${joinNames(stop.findings)}.", "in the merge it refused: ${stop.findings.join(\", \")}.", C, pattern="a stop names each note quoted")
 # git's refusals are read as its whole lines, a quoted path spanning a line break.
 mutate(CY, (r"/^error: (?:Entry '", r"would lose untracked files in it)$/gm"), (r"/(?:Entry '", r"would lose untracked files in it)/gm"), C, pattern="named with git's refusal wording")
 mutate(CY, r"(?:Entry '([\s\S]+?)' (?:not uptodate", r"(?:Entry '(.+?)' (?:not uptodate", C, pattern="whose name holds a line break is named")
