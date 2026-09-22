@@ -1,9 +1,11 @@
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
-import { git, gitOk } from "../../core/git.ts";
-import { finishInterrupted, recordIntent, recordInterrupted } from "../../core/sync/recovery.ts";
+import { git, GitError, gitOk } from "../../core/git.ts";
+import { fold } from "../../core/sync/copies.ts";
+import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted } from "../../core/sync/recovery.ts";
 import { commitFile, initRepo, sleep, tempDir, writeRel } from "./helpers.ts";
 
 interface Interruption {
@@ -40,6 +42,64 @@ async function interrupted(extra: Record<string, string> = {}, how: Interruption
 const head = (dir: string): Promise<string> => gitOk(["rev-parse", "HEAD"], { cwd: dir });
 const status = (dir: string): Promise<string> => gitOk(["status", "--porcelain"], { cwd: dir });
 const exists = (p: string): Promise<boolean> => stat(p).then(() => true, () => false);
+
+// A new vault's two commits: `before`, then `after` on top of it (null removes a path
+// first, so a note can become a folder and back). `config` is set before either.
+// The vault is left at the first.
+async function history(
+  before: Record<string, string>,
+  after: Record<string, string | null>,
+  config: Record<string, string> = {},
+): Promise<{ dir: string; from: string; to: string }> {
+  const dir = await tempDir();
+  await initRepo(dir);
+  for (const [key, value] of Object.entries(config)) await gitOk(["config", key, value], { cwd: dir });
+  for (const [rel, content] of Object.entries(before)) await writeRel(dir, rel, content);
+  await gitOk(["add", "-A"], { cwd: dir });
+  await gitOk(["commit", "-q", "-m", "old"], { cwd: dir });
+  const from = await head(dir);
+  for (const [rel, content] of Object.entries(after)) if (content === null) await gitOk(["rm", "-q", "-r", "--", rel], { cwd: dir });
+  for (const [rel, content] of Object.entries(after)) if (content !== null) await writeRel(dir, rel, content);
+  await gitOk(["add", "-A"], { cwd: dir });
+  await gitOk(["commit", "-q", "-m", "new"], { cwd: dir });
+  const to = await head(dir);
+  await gitOk(["reset", "-q", "--hard", from], { cwd: dir });
+  return { dir, from, to };
+}
+
+// The live update from -> to, killed while the smudge filter of the paths `slow`
+// matches hangs, and recorded as the cycle records it. Returns the state directory.
+async function killUpdate(dir: string, from: string, to: string, how: { slow?: string; prints?: boolean } = {}): Promise<string> {
+  await gitOk(["config", "filter.slow.smudge", "sleep 10; cat"], { cwd: dir });
+  await writeFile(join(dir, ".git", "info", "attributes"), `${how.slow ?? "*.md"} filter=slow\n`);
+  const state = await tempDir();
+  await recordIntent(state, from, to);
+  assert.equal((await git(["reset", "-q", "--keep", to], { cwd: dir, timeoutMs: 500 })).timedOut, true);
+  if (how.prints !== false) await recordInterrupted(state, dir, from, to);
+  await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: dir });
+  return state;
+}
+
+// Waits for a marker a filter writes, which says how far a repair got.
+async function until(ready: () => Promise<boolean>): Promise<void> {
+  const end = Date.now() + 10_000;
+  while (!(await ready())) {
+    if (Date.now() > end) throw new Error("the repair never got that far");
+    await sleep(20);
+  }
+}
+
+// A smudge filter that says when it started and holds the repair's checkout until
+// told to go on; then it passes the content through (or fails, if `fails`).
+async function gate(dir: string, fails = false): Promise<{ started: string; go: string }> {
+  const marks = await tempDir();
+  const started = join(marks, "started");
+  const go = join(marks, "go");
+  const finish = fails ? "exit 1" : "cat";
+  await gitOk(["config", "filter.gate.smudge", `touch '${started}'; while [ ! -e '${go}' ]; do sleep 0.05; done; ${finish}`], { cwd: dir });
+  await gitOk(["config", "filter.gate.required", "true"], { cwd: dir });
+  return { started, go };
+}
 
 test("a path nobody touched since the kill goes back to the old version, cleanly", async () => {
   const w = await interrupted();
@@ -122,11 +182,15 @@ test("a HEAD that cannot be read leaves the record for the next run, never read 
 });
 
 test("a note the user saves while a slow repair runs is kept: the old version is built aside and put in place only if the path is untouched", async () => {
-  const w = await interrupted({}, { stillSlow: true });
-  await gitOk(["config", "filter.slow.smudge", "sleep 2; cat"], { cwd: w.dir });
+  const w = await interrupted();
+  // The save lands while the old version is being built: after the first check, before the last.
+  const { started, go } = await gate(w.dir);
+  await writeFile(join(w.dir, ".git", "info", "attributes"), "*.md filter=gate\n");
   const finishing = finishInterrupted(w.state, w.dir);
-  await sleep(700);
+  finishing.catch(() => undefined);
+  await until(() => exists(started));
   await writeFile(join(w.dir, "x/a.md"), "saved during the repair\n");
+  await writeFile(go, "");
   const done = await finishing;
   assert.deepEqual(done, { restored: [], kept: ["x/a.md"], moved: false });
   assert.equal(await readFile(join(w.dir, "x/a.md"), "utf8"), "saved during the repair\n");
@@ -165,4 +229,247 @@ test("a repair runs none of the vault's hooks (it is not the user's checkout)", 
   await writeFile(join(w.dir, ".git", "hooks", "post-checkout"), `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
   assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/a.md"], kept: [], moved: false });
   assert.equal(await exists(marker), false);
+});
+
+test("a cleared record leaves nothing to finish, and clearing when there is none is no error", async () => {
+  const w = await interrupted();
+  await clearInterrupted(w.state);
+  assert.equal(await finishInterrupted(w.state, w.dir), null);
+  await clearInterrupted(w.state);
+});
+
+test("an update whose intent alone was recorded, with the vault untouched, leaves the vault as it was and clears the record", async () => {
+  const { dir, from, to } = await history({ "x/a.md": "old\n" }, { "x/0new.txt": "brand new\n", "x/a.md": "new\n" });
+  const state = await tempDir();
+  await recordIntent(state, from, to); // and the process died
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/0new.txt", "x/a.md"], kept: [], moved: false });
+  assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "old\n");
+  assert.equal(await exists(join(dir, "x/0new.txt")), false);
+  assert.equal(await status(dir), "");
+  assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
+});
+
+test("an update that never started, turning a note into a folder, leaves the note as it was", async () => {
+  const { dir, from, to } = await history(
+    { "x/p": "the note\n", "x/z.md": "old\n" },
+    { "x/p": null, "x/p/b.txt": "in the new folder\n", "x/z.md": "new\n" },
+  );
+  const state = await tempDir();
+  await recordIntent(state, from, to); // and the process died
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/b.txt", "x/p", "x/z.md"], kept: [], moved: false });
+  assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
+  assert.equal(await status(dir), "");
+  assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
+});
+
+test("an update that turned a folder into a note, killed after writing the note: the user's edit of it is kept and sync goes on", async () => {
+  const { dir, from, to } = await history(
+    { "x/p/b.txt": "in the folder\n", "x/z.md": "old\n" },
+    { "x/p/b.txt": null, "x/p": "the new note\n", "x/z.md": "new\n" },
+  );
+  const state = await killUpdate(dir, from, to);
+  assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the new note\n", "the kill came after the note was written");
+  await writeFile(join(dir, "x/p"), "the user's edit\n");
+  // x/p/b.txt cannot come back without removing the user's note, where its folder was.
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/z.md"], kept: ["x/p", "x/p/b.txt"], moved: false });
+  assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the user's edit\n");
+  assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
+});
+
+test("a note the user adds in the folder the update made is kept, and the folder with it", async () => {
+  const { dir, from, to } = await history(
+    { "x/p": "the note\n", "x/z.md": "old\n" },
+    { "x/p": null, "x/p/b.txt": "in the new folder\n", "x/z.md": "new\n" },
+  );
+  const state = await killUpdate(dir, from, to);
+  assert.equal(await readFile(join(dir, "x/p/b.txt"), "utf8"), "in the new folder\n", "the kill came after the folder was made");
+  await writeFile(join(dir, "x/p/mine.txt"), "the user's note\n");
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/b.txt", "x/z.md"], kept: ["x/p"], moved: false });
+  assert.equal(await readFile(join(dir, "x/p/mine.txt"), "utf8"), "the user's note\n");
+  assert.equal(await exists(join(dir, "x/p/b.txt")), false, "the update's own file goes");
+  assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
+});
+
+test("an update stopped before it wrote anything, turning a folder into a note, leaves the folder as it was", async () => {
+  const { dir, from, to } = await history(
+    { "x/p/b.txt": "in the folder\n", "x/z.md": "old\n" },
+    { "x/p/b.txt": null, "x/p": "the new note\n", "x/z.md": "new\n" },
+  );
+  const state = await tempDir();
+  await recordIntent(state, from, to);
+  await recordInterrupted(state, dir, from, to); // killed before it had written anything
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p", "x/p/b.txt", "x/z.md"], kept: [], moved: false });
+  assert.equal(await readFile(join(dir, "x/p/b.txt"), "utf8"), "in the folder\n");
+  assert.equal(await status(dir), "");
+  assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
+});
+
+test("a note the update turned into nested folders comes back: a removal takes the folders it empties, as git's own does", async () => {
+  const { dir, from, to } = await history(
+    { "x/p": "the note\n", "x/z.md": "old\n" },
+    { "x/p": null, "x/p/q/c.txt": "deep in the new folder\n", "x/z.md": "new\n" },
+  );
+  const state = await killUpdate(dir, from, to);
+  assert.equal(await exists(join(dir, "x/p/q/c.txt")), true, "the kill came after the folders were made");
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [], moved: false });
+  assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
+  assert.equal(await status(dir), "");
+});
+
+test("a repair stopped after the emptied folder went, before the note came back, gets the note back next time", async () => {
+  const { dir, from, to } = await history(
+    { "x/p": "the note\n", "x/z.md": "old\n" },
+    { "x/p": null, "x/p/b.txt": "in the new folder\n", "x/z.md": "new\n" },
+  );
+  const state = await killUpdate(dir, from, to);
+  // Real git cannot make the disk refuse one rename: swap node's rename, which every
+  // module's import of it follows (syncBuiltinESMExports), for this one path.
+  const fsp = createRequire(import.meta.url)("node:fs/promises") as typeof import("node:fs/promises");
+  const rename = fsp.rename;
+  fsp.rename = async (source, dest) => {
+    if (dest === join(dir, "x/p")) throw Object.assign(new Error("the disk refused the rename"), { code: "EIO" });
+    return rename(source, dest);
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(finishInterrupted(state, dir), /the disk refused the rename/);
+  } finally {
+    fsp.rename = rename;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/b.txt", "x/p", "x/z.md"], kept: [], moved: false });
+  assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
+  assert.equal(await status(dir), "");
+});
+
+test("a repair writes the old version through the filters the vault's committed .gitattributes name", async () => {
+  const { dir, from, to } = await history(
+    { ".gitattributes": "*.md filter=mark\n", "x/a.md": "old\n", "x/z.txt": "old\n" },
+    { "x/a.md": "new\n", "x/z.txt": "new\n" },
+    { "filter.mark.smudge": "sed 's/^/SMUDGED:/'", "filter.mark.clean": "sed 's/^SMUDGED://'" },
+  );
+  assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "SMUDGED:old\n", "the vault's own checkout runs the filter");
+  const state = await killUpdate(dir, from, to, { slow: "x/z.txt" });
+  assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "SMUDGED:new\n", "the kill came after x/a.md was written");
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/a.md", "x/z.txt"], kept: [], moved: false });
+  assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "SMUDGED:old\n");
+  assert.equal(await status(dir), "");
+});
+
+// A vault whose update renamed Note.md to note.md (and changed it), killed on z.md
+// after the rename: on a disk that ignores case, the two names are one file. Null
+// (and the test skipped) where the disk tells them apart.
+async function caseRenamed(t: TestContext, prints: boolean): Promise<{ dir: string; state: string } | null> {
+  const dir = await tempDir();
+  await initRepo(dir);
+  if ((await git(["config", "--bool", "core.ignorecase"], { cwd: dir })).stdout.trim() !== "true") {
+    t.skip("core.ignorecase is false here: the disk holds Note.md and note.md as two files");
+    return null;
+  }
+  await writeRel(dir, "Note.md", "old note\n");
+  await writeRel(dir, "z.md", "old\n");
+  await gitOk(["add", "-A"], { cwd: dir });
+  await gitOk(["commit", "-q", "-m", "old"], { cwd: dir });
+  const from = await head(dir);
+  // Committed as a case-sensitive machine does: git here cannot stage a case-only rename by name.
+  const blob = (text: string): Promise<string> => gitOk(["hash-object", "-w", "--stdin"], { cwd: dir, input: text });
+  const tree = await gitOk(["mktree"], { cwd: dir, input: `100644 blob ${await blob("new note\n")}\tnote.md\n100644 blob ${await blob("new\n")}\tz.md\n` });
+  const to = await gitOk(["commit-tree", tree, "-p", from, "-m", "new"], { cwd: dir });
+  const state = await killUpdate(dir, from, to, { slow: "z.md", prints });
+  assert.deepEqual(await spellings(dir), ["note.md"], "the kill came after the rename");
+  return { dir, state };
+}
+
+const spellings = async (dir: string): Promise<string[]> => (await readdir(dir)).filter((name) => fold(name) === "note.md");
+
+for (const prints of [true, false]) {
+  test(`a case-only rename the update had made is set back under the old spelling, never deleted (${prints ? "with" : "without"} fingerprints)`, async (t) => {
+    const v = await caseRenamed(t, prints);
+    if (!v) return;
+    assert.deepEqual(await finishInterrupted(v.state, v.dir), { restored: ["Note.md", "note.md", "z.md"], kept: [], moved: false });
+    assert.deepEqual(await spellings(v.dir), ["Note.md"]);
+    assert.equal(await readFile(join(v.dir, "Note.md"), "utf8"), "old note\n");
+    assert.equal(await status(v.dir), "");
+  });
+}
+
+test("a case-only rename whose one file the user changed since is kept as the user's", async (t) => {
+  const v = await caseRenamed(t, true);
+  if (!v) return;
+  await writeFile(join(v.dir, "note.md"), "the user's edit\n");
+  assert.deepEqual(await finishInterrupted(v.state, v.dir), { restored: ["z.md"], kept: ["Note.md", "note.md"], moved: false });
+  assert.deepEqual(await spellings(v.dir), ["note.md"]);
+  assert.equal(await readFile(join(v.dir, "note.md"), "utf8"), "the user's edit\n");
+});
+
+test("a path named like an object's own property (constructor) is judged as any other", async () => {
+  const w = await interrupted({ constructor: "from the update\n" }, { prints: false });
+  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["constructor", "x/a.md"], kept: [], moved: false });
+  assert.equal(await exists(join(w.dir, "constructor")), false);
+});
+
+test("a record that cannot be read stops sync with a message that names the file and what to do, and stays", async () => {
+  const w = await interrupted();
+  const [name = ""] = await readdir(w.state);
+  const record = join(w.state, name);
+  for (const text of ["{ not json", JSON.stringify({ prints: {} }), JSON.stringify({ from: "HEAD", to: "main" })]) {
+    await writeFile(record, text);
+    await assert.rejects(finishInterrupted(w.state, w.dir), (err: Error) => {
+      assert.ok(err.message.includes(record), err.message);
+      assert.match(err.message, /delete that file/i);
+      return true;
+    });
+    assert.equal(await readFile(record, "utf8"), text, "the record stays");
+  }
+});
+
+// An update of x/a.md and x/b.md killed on x/a.md, and a repair that sets x/a.md back
+// and then fails on x/b.md, whose checkout waits at the gate until told to fail.
+async function repairFailingOnB(): Promise<{ dir: string; state: string; started: string; go: string }> {
+  const { dir, from, to } = await history({ "x/a.md": "old a\n", "x/b.md": "old b\n" }, { "x/a.md": "new a\n", "x/b.md": "new b\n" });
+  const state = await killUpdate(dir, from, to);
+  const { started, go } = await gate(dir, true);
+  await writeFile(join(dir, ".git", "info", "attributes"), "x/b.md filter=gate\n");
+  return { dir, state, started, go };
+}
+
+test("a repair that stops reports its own error, and the next run takes what it had set back for its own", async () => {
+  const r = await repairFailingOnB();
+  const finishing = finishInterrupted(r.state, r.dir);
+  finishing.catch(() => undefined);
+  await until(() => exists(r.started));
+  // x/a.md is back by now; unreadable, it could no longer be fingerprinted.
+  const a = join(r.dir, "x/a.md");
+  const { mode } = await stat(a);
+  await chmod(a, 0);
+  await writeFile(r.go, "");
+  try {
+    await assert.rejects(finishing, GitError);
+  } finally {
+    await chmod(a, mode & 0o7777);
+  }
+  await writeFile(join(r.dir, ".git", "info", "attributes"), "");
+  assert.deepEqual(await finishInterrupted(r.state, r.dir), { restored: ["x/a.md", "x/b.md"], kept: [], moved: false });
+  assert.equal(await readFile(a, "utf8"), "old a\n");
+  assert.equal(await status(r.dir), "");
+});
+
+test("a repair that stops reports its own error even when the record cannot be updated", async () => {
+  const r = await repairFailingOnB();
+  const finishing = finishInterrupted(r.state, r.dir);
+  finishing.catch(() => undefined);
+  await until(() => exists(r.started));
+  const { mode } = await stat(r.state);
+  await chmod(r.state, 0o555);
+  await writeFile(r.go, "");
+  try {
+    await assert.rejects(finishing, GitError);
+  } finally {
+    await chmod(r.state, mode & 0o7777);
+  }
+  // The older record errs toward keeping: x/a.md, back to the old version, reads as an edit.
+  await writeFile(join(r.dir, ".git", "info", "attributes"), "");
+  assert.deepEqual(await finishInterrupted(r.state, r.dir), { restored: ["x/b.md"], kept: ["x/a.md"], moved: false });
+  assert.equal(await readFile(join(r.dir, "x/a.md"), "utf8"), "old a\n");
+  assert.equal(await readFile(join(r.dir, "x/b.md"), "utf8"), "old b\n");
 });
