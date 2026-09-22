@@ -1055,6 +1055,55 @@ test("an unfinished live update whose history then moved by hand stops sync with
   assert.deepEqual((await remoteNames(remote)).filter((n) => n.includes(".conflict-")), [], "and no conflict copy made");
 });
 
+test("a refused note whose name holds a line break is named, and escalates after three blocked cycles", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  const name = "x/two\nlines.md";
+  await writeRel(a.projects, name, "v1\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  assert.ok((await cycle(remote, b)).liveUpdated);
+  await writeRel(b.projects, name, `v1\ntoken ${TOKEN}\n`); // held back: stays a local edit
+  await writeRel(a.projects, name, "v2 from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  let r: CycleResult | undefined;
+  for (let run = 1; run <= 3; run++) {
+    r = await cycle(remote, b);
+    assert.equal(r.outcome, "synced", r.reason ?? "");
+    assert.deepEqual(r.blockedBy, [name], `cycle ${run}`);
+    assert.equal(r.blockedCycles, run);
+  }
+  const blocked = statusFromCycle(r as CycleResult).find((s) => s.text.startsWith("live update blocked"));
+  assert.equal(blocked?.level, "error", "the escalation");
+  assert.match(blocked?.text ?? "", /"x\/two\\nlines\.md" \(3 cycles in a row\)$/);
+  assert.equal(await readdir(b.state).then((names) => names.includes("interrupted-update.json")), false, "a refusal, never an interrupted update");
+});
+
+test("a note named with git's refusal wording, whose smudge filter fails, is a failed update, never a refusal: the record stays, and the next cycle finishes it", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  const name = "x/Untracked working tree file 'q.md' would be removed by merge.md";
+  await writeRel(a.projects, name, "v1\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  assert.ok((await cycle(remote, b)).liveUpdated);
+  await writeRel(a.projects, name, "v2 from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  // git unlinks the note, then its smudge fails, naming the note in its own error line.
+  for (const [key, value] of [["filter.bad.clean", "cat"], ["filter.bad.smudge", "false"], ["filter.bad.required", "true"]]) {
+    await gitOk(["config", key ?? "", value ?? ""], { cwd: b.projects });
+  }
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "*.md filter=bad\n");
+  const first = await cycle(remote, b);
+  assert.equal(first.outcome, "unsynced", first.reason ?? "");
+  assert.match(first.reason ?? "", /updating the vault failed/);
+  assert.deepEqual(first.blockedBy, []);
+  assert.ok((await readdir(b.state)).includes("interrupted-update.json"), "the record stays");
+  await gitOk(["config", "filter.bad.smudge", "cat"], { cwd: b.projects });
+  const second = await cycle(remote, b);
+  assert.equal(second.outcome, "synced", second.reason ?? "");
+  assert.equal(await read(b, name), "v2 from a\n");
+  assert.equal(await remoteFile(remote, name), "v2 from a", "the note's deletion was never sent");
+});
+
 test("a held-back new note the remote also adds blocks the update by name, and nothing is recorded as interrupted", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];

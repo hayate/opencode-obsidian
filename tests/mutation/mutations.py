@@ -261,7 +261,7 @@ mutate(F_RC, "    if (!(await isFolder(wanted))) return;\n", "    if (await miss
 # reported once its copy is pushed, and the status wording.
 mutate(CY, "(?:not uptodate|would be overwritten by merge)", "(?:not uptodate)", C, pattern="an edit staged by hand")
 mutate(CY, "would be (?:overwritten|removed) by merge", "would be (?:overwritten) by merge", C, pattern="a deletion staged by hand")
-mutate(CY, "|Updating '(.+)' would lose untracked files in it/g", "/g", C, pattern="a held-back note in a folder the remote replaces")
+mutate(CY, r"|Updating '([\s\S]+?)' would lose untracked files in it)$/gm", r")$/gm", C, pattern="a held-back note in a folder the remote replaces")
 mutate(CY, "for (const line of commits.filter(Boolean)) {", "for (const line of commits.filter(Boolean).slice(0, 0)) {", C, pattern="a secret one hand commit added")
 mutate(CY, "if (!(await exempt(commit, file))) inCommits.push({ file, commit });", "inCommits.push({ file, commit });", C, pattern="adds only what the remote's tree already holds")
 mutate(CY, "    if (built && commit === to) continue;\n", "", C, pattern="scans what it carries over")
@@ -316,3 +316,6 @@ mutate(F_R, 'record.type.includes("submodule") ? REMOVE_REPOSITORY : MOVE_ASIDE_
 mutate(F_R, "      mine.length ? mine : [...handled],", "      [...handled],", R, pattern="the check stops names the notes")
 mutate(CY, 'const named = stop.paths.length ? `: ${joinNames(stop.paths)}` : "";', 'const named = stop.paths.length ? `: ${stop.paths.join(", ")}` : "";', C, pattern="names each note quoted")
 mutate("core/session.ts", "  return out.map((item) => ({ ...item, text: oneLine(item.text) }));", "  return out;", SE, pattern="collapses the control characters")
+# git's refusals are read as its whole lines, a quoted path spanning a line break.
+mutate(CY, (r"/^error: (?:Entry '", r"would lose untracked files in it)$/gm"), (r"/(?:Entry '", r"would lose untracked files in it)/gm"), C, pattern="named with git's refusal wording")
+mutate(CY, r"(?:Entry '([\s\S]+?)' (?:not uptodate", r"(?:Entry '(.+?)' (?:not uptodate", C, pattern="whose name holds a line break is named")

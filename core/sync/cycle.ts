@@ -481,9 +481,12 @@ async function push(clone: string, input: CycleInput, sha: string): Promise<Push
 // that a deletion would remove, a folder of untracked files where a note goes. Each
 // verified (git 2.50.1) to leave HEAD, the index and the worktree exactly as they
 // were. Only these: a refusal clears the intent record, so a message counted here
-// that git prints after writing would skip the repair of a half-updated vault.
+// that git prints after writing would skip the repair of a half-updated vault. Each
+// is matched as git's whole line, so a note named with a refusal's words, in another
+// error's line (a smudge filter that fails names its note), is never read as one;
+// the quoted path may hold a line break, which git prints raw.
 const REFUSED =
-  /Entry '(.+)' (?:not uptodate|would be overwritten by merge)|Untracked working tree file '(.+)' would be (?:overwritten|removed) by merge|Updating '(.+)' would lose untracked files in it/g;
+  /^error: (?:Entry '([\s\S]+?)' (?:not uptodate|would be overwritten by merge)\. Cannot merge\.|Untracked working tree file '([\s\S]+?)' would be (?:overwritten|removed) by merge\.|Updating '([\s\S]+?)' would lose untracked files in it)$/gm;
 
 // Spec 5.4 step 5: the remote head now known, into the live repo's objects before
 // anything refers to it; then remote-seen; then the all-or-nothing reset.
