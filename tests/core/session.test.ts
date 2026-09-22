@@ -248,6 +248,14 @@ test("statusFromCycle gives each conflict one quoted line saying where both vers
   assert.match(items[1]?.text ?? "", /which you deleted, was changed on another machine: it stays deleted/);
   assert.match(items[2]?.text ?? "", /"x\/kept\.md" was deleted on another machine; your version is kept/);
   assert.match(items[3]?.text ?? "", /both "x\/l\.md" and "x\/r\.md"/);
+  assert.equal(
+    items[4]?.text,
+    '"x/p" is a file on one machine and a folder on another: yours stays; the other is saved as "x/p.conflict-2026-09-22-0915-bbbbbb"',
+  );
+  assert.equal(
+    items[5]?.text,
+    '"x/s.md" is a different kind of file on another machine (a symlink, or an executable): yours stays; the other is saved as "x/s.conflict-2026-09-22-0915-cccccc.md"',
+  );
   assert.equal(items[6]?.level, "info");
 
   const many = statusFromCycle({
@@ -256,7 +264,8 @@ test("statusFromCycle gives each conflict one quoted line saying where both vers
     notices: [],
   });
   assert.equal(many.length, 11);
-  assert.match(many[10]?.text ?? "", /^and 2 more notes changed on two machines/);
+  // These have no copy (deleted there): the line claims none for each of them.
+  assert.equal(many[10]?.text, "and 2 more notes changed on two machines; no version was lost, and any copy made sits beside its note");
   for (const i of many) assert.doesNotMatch(i.text, /\n/, i.text);
 });
 

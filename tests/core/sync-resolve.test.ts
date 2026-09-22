@@ -4,7 +4,7 @@ import { chmod, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { gitOk } from "../../core/git.ts";
 import { checkResolved, mergeAndResolve, writeResolved, type MergeFacts, type Resolution } from "../../core/sync/resolve.ts";
-import { initRepo, tempDir } from "./helpers.ts";
+import { initRepo, tempDir, withRewrittenMergeTree } from "./helpers.ts";
 
 const WHEN = "2026-09-22-0915";
 const TEXT = "long enough text for rename detection, line one\nline two\nline three\n";
@@ -655,35 +655,6 @@ test("two new entries of different kinds at one path (git moves the local one as
   assert.equal(tree.get(r.conflicts[0]?.copy ?? "")?.mode, "120000");
   assert.equal([...tree.keys()].some((p) => p.includes("~")), false);
 });
-
-// Runs fn with a git on PATH that rewrites merge-tree's raw output (NULs and all):
-// records git cannot be made to emit here (folder-rename detection is off, and no
-// conflict of a notes vault names no path). A rewrite that matches nothing fails.
-async function withRewrittenMergeTree(from: string, to: string, fn: () => Promise<void>): Promise<void> {
-  const dir = await tempDir();
-  const real = (await gitOk(["--exec-path"], { cwd: dir })) + "/git";
-  const script = [
-    `#!${process.execPath}`,
-    `const { spawnSync } = require("node:child_process");`,
-    `const args = process.argv.slice(2);`,
-    `const r = spawnSync(${JSON.stringify(real)}, args, { stdio: ["inherit", "pipe", "inherit"], maxBuffer: 1 << 30 });`,
-    `let out = r.stdout.toString("latin1");`,
-    `if (args.includes("merge-tree")) {`,
-    `  if (!out.includes(${JSON.stringify(from)})) { process.stderr.write("rewrite matched nothing"); process.exit(99); }`,
-    `  out = out.split(${JSON.stringify(from)}).join(${JSON.stringify(to)});`,
-    `}`,
-    `process.stdout.write(Buffer.from(out, "latin1"));`,
-    `process.exitCode = r.status ?? 1;`,
-  ].join("\n");
-  await writeFile(join(dir, "git"), script, { mode: 0o755 });
-  const path = process.env.PATH;
-  process.env.PATH = `${dir}:${path}`;
-  try {
-    await fn();
-  } finally {
-    process.env.PATH = path;
-  }
-}
 
 test("a record type no rule covers stops the cycle, including ones git spells without a space or as information", async () => {
   for (const [from, to] of [

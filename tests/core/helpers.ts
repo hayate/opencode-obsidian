@@ -50,3 +50,32 @@ export async function commitFile(repo: string, rel: string, content: string, mes
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// Runs fn with a git on PATH that rewrites merge-tree's raw output (NULs and all):
+// records git cannot be made to emit here (folder-rename detection is off, and no
+// conflict of a notes vault names no path). A rewrite that matches nothing fails.
+export async function withRewrittenMergeTree(from: string, to: string, fn: () => Promise<void>): Promise<void> {
+  const dir = await tempDir();
+  const real = (await gitOk(["--exec-path"], { cwd: dir })) + "/git";
+  const script = [
+    `#!${process.execPath}`,
+    `const { spawnSync } = require("node:child_process");`,
+    `const args = process.argv.slice(2);`,
+    `const r = spawnSync(${JSON.stringify(real)}, args, { stdio: ["inherit", "pipe", "inherit"], maxBuffer: 1 << 30 });`,
+    `let out = r.stdout.toString("latin1");`,
+    `if (args.includes("merge-tree")) {`,
+    `  if (!out.includes(${JSON.stringify(from)})) { process.stderr.write("rewrite matched nothing"); process.exit(99); }`,
+    `  out = out.split(${JSON.stringify(from)}).join(${JSON.stringify(to)});`,
+    `}`,
+    `process.stdout.write(Buffer.from(out, "latin1"));`,
+    `process.exitCode = r.status ?? 1;`,
+  ].join("\n");
+  await writeFile(join(dir, "git"), script, { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${dir}:${path}`;
+  try {
+    await fn();
+  } finally {
+    process.env.PATH = path;
+  }
+}

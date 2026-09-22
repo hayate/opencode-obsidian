@@ -146,7 +146,7 @@ export function statusFromCycle(r: CycleResult): StatusItem[] {
   // Spec 5.4 step 3: a conflict never pauses sync; each one gets a line saying where
   // both versions are (at most 10 lines, then a count).
   for (const c of r.conflicts.slice(0, 10)) out.push({ level: "warn", text: conflictLine(c) });
-  if (r.conflicts.length > 10) out.push({ level: "warn", text: `and ${r.conflicts.length - 10} more notes changed on two machines, each with its copy beside it` });
+  if (r.conflicts.length > 10) out.push({ level: "warn", text: `and ${r.conflicts.length - 10} more notes changed on two machines; no version was lost, and any copy made sits beside its note` });
   for (const n of r.notices) out.push({ level: "info", text: n });
   if (r.caseCollisions.length) {
     out.push({

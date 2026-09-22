@@ -7,7 +7,7 @@ import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock, type LockHandle } from "../lock.ts";
-import { redactUrlCredentials, scanRange, scanStaged } from "../secrets.ts";
+import { EMPTY_TREE, redactUrlCredentials, scanRange, scanStaged } from "../secrets.ts";
 import { quoted, writeAtomic } from "../store.ts";
 import { ensureStateClone } from "./clone.ts";
 import { conflictStamp } from "./copies.ts";
@@ -283,12 +283,22 @@ async function ancestry(cwd: string, a: string, b: string): Promise<Ancestry> {
   return r.code === 0 ? "yes" : r.code === 1 ? "no" : "unknown";
 }
 
-// A status line, not a transcript: at most the first 10 names, quoted and
-// capped like any other, then a count of what was left out.
-function joinNames(names: string[], max = 10): string {
-  const shown = names.slice(0, max).map((n) => quoted(n));
-  if (names.length > max) shown.push(`and ${names.length - max} more`);
-  return shown.join(", ");
+// A status line, not a transcript: at most the first 10 items, then a count of
+// what was left out.
+const MAX_LISTED = 10;
+
+function listed(shown: string[], total: number): string {
+  return (total > shown.length ? [...shown, `and ${total - shown.length} more`] : shown).join(", ");
+}
+
+// File names quoted and capped like any other.
+function joinNames(names: string[]): string {
+  return listed(names.slice(0, MAX_LISTED).map((n) => quoted(n)), names.length);
+}
+
+// resolve.ts's stop as one line: the paths it names, when it names any.
+function stopReason(stop: { reason: string; paths: string[] }): string {
+  return stop.paths.length ? `${stop.reason}: ${joinNames(stop.paths)}` : stop.reason;
 }
 
 // A status line, not a transcript: git's first few lines that say something.
@@ -317,29 +327,62 @@ async function mergeMessage(clone: string, machine: string, from: string, tree: 
   return `sync(${machine}): ${files.length} file${files.length === 1 ? "" : "s"} [${projects.join(", ")}]`;
 }
 
-// Spec 5.4 step 3: what a push would add to the remote goes through the step-2
-// scan, except objects the remote's tree already holds (a copy of a remote version
-// is inside the trusted remote already, and would otherwise block every cycle).
-async function outboundHits(clone: string, from: string, to: string): Promise<string[]> {
-  const hits = await scanRange(clone, from, to);
-  if (!hits.size) return [];
-  const remoteObjects = new Set(
-    (await zList(clone, ["ls-tree", "-r", from])).map((line) => line.slice(0, line.indexOf("\t")).split(" ")[2]),
-  );
-  const flagged: string[] = [];
-  for (const file of hits.keys()) {
-    const oid = (await git(["rev-parse", "-q", "--verify", `${to}:${file}`], { cwd: clone })).stdout.trim();
-    if (!remoteObjects.has(oid)) flagged.push(file);
-  }
-  return flagged.sort();
+interface OutboundHits {
+  // Flagged in a commit of the vault's own history that the push would send.
+  inCommits: Array<{ file: string; commit: string }>;
+  // Flagged in what the push leaves on the remote (from..to as two trees).
+  inTree: string[];
 }
 
-async function outbound(clone: string, from: string, to: string, conflicts: Conflict[]): Promise<Integration> {
-  const flagged = await outboundHits(clone, from, to);
-  if (flagged.length) {
+// Spec 5.4 step 3: nothing unscanned leaves the machine. The push sends every commit
+// in from..to, so each one's additions against its first parent go through the
+// step-2 scan (a commit made by hand never met it, and a later commit that removes
+// a secret does not unsend it), and so does the tree the push leaves. Exempt: objects
+// the remote's tree already holds (a copy of a remote version is inside the trusted
+// remote already, and would otherwise block every cycle). `built` is the commit this
+// cycle made in the state clone, if `to` is one: its first parent is `from`, so its
+// own additions are the tree's, and it is in no history the user can rewrite.
+async function outboundHits(clone: string, from: string, to: string, built: boolean): Promise<OutboundHits> {
+  let remoteObjects: Promise<Set<string | undefined>> | undefined;
+  const exempt = async (commit: string, file: string): Promise<boolean> => {
+    remoteObjects ??= zList(clone, ["ls-tree", "-r", from]).then(
+      (lines) => new Set(lines.map((line) => line.slice(0, line.indexOf("\t")).split(" ")[2])),
+    );
+    const oid = (await git(["rev-parse", "-q", "--verify", `${commit}:${file}`], { cwd: clone })).stdout.trim();
+    return (await remoteObjects).has(oid);
+  };
+  const inCommits: OutboundHits["inCommits"] = [];
+  // Oldest first, each with its parents; a root commit adds all it holds.
+  const commits = (await gitOk(["rev-list", "--reverse", "--topo-order", "--parents", `${from}..${to}`], { cwd: clone })).split("\n");
+  for (const line of commits.filter(Boolean)) {
+    const [commit = "", parent = EMPTY_TREE] = line.split(" ");
+    if (built && commit === to) continue;
+    for (const file of [...(await scanRange(clone, parent, commit)).keys()].sort()) {
+      if (!(await exempt(commit, file))) inCommits.push({ file, commit });
+    }
+  }
+  const inTree: string[] = [];
+  for (const file of (await scanRange(clone, from, to)).keys()) if (!(await exempt(to, file))) inTree.push(file);
+  return { inCommits, inTree: inTree.sort() };
+}
+
+async function outbound(clone: string, input: CycleInput, from: string, to: string, built: boolean, conflicts: Conflict[]): Promise<Integration> {
+  const { inCommits, inTree } = await outboundHits(clone, from, to, built);
+  if (inCommits.length) {
+    // The short hash as git abbreviates it in the vault, where the user rewrites.
+    const shown: string[] = [];
+    for (const { file, commit } of inCommits.slice(0, MAX_LISTED)) {
+      shown.push(`${quoted(file)} (commit ${await gitOk(["rev-parse", "--short", commit], { cwd: input.projectsDir })})`);
+    }
     return {
       kind: "stopped",
-      reason: `the secret scan flags what this sync would send in ${joinNames(flagged)}: nothing was pushed (remove the secret, then sync again)`,
+      reason: `the secret scan flags what this sync would send in ${listed(shown, inCommits.length)}: nothing was pushed. The secret is in commits of Projects/ that were never sent, so removing the file is not enough: rewrite those commits (for example, drop or amend the one that added it), then sync again`,
+    };
+  }
+  if (inTree.length) {
+    return {
+      kind: "stopped",
+      reason: `the secret scan flags what this sync would send in ${joinNames(inTree)}: nothing was pushed (remove the secret, then sync again)`,
     };
   }
   return { kind: "ok", next: to, needsPush: true, conflicts };
@@ -357,7 +400,7 @@ async function integrate(clone: string, input: CycleInput, live: string): Promis
   if (seen.kind === "unreadable") {
     return {
       kind: "stopped",
-      reason: `${REMOTE_SEEN} in Projects/ does not name a commit git can read: sync stopped, so a rewritten remote cannot go unnoticed. If the remote's history was not rewritten, delete it (git update-ref -d ${REMOTE_SEEN}) and sync again.`,
+      reason: `${REMOTE_SEEN} in Projects/ does not name a commit git can read, so a rewritten remote could go unnoticed. If the remote's history was not rewritten, delete it (git update-ref -d ${REMOTE_SEEN}) and sync again.`,
     };
   }
   const fetched = await git(["fetch", "-q", "origin", `+refs/heads/${b}:refs/remotes/origin/${b}`], {
@@ -380,17 +423,21 @@ async function integrate(clone: string, input: CycleInput, live: string): Promis
         return {
           kind: "stopped",
           reason:
-            "the remote's history was rewritten (a force-push): sync stopped, so nothing the rewrite dropped is deleted here or pushed back. If the rewrite was intended, run remember_sync to adopt the rewritten remote.",
+            "the remote's history was rewritten (a force-push): nothing the rewrite dropped is deleted here or pushed back. If the rewrite was intended, run remember_sync to adopt the rewritten remote.",
         };
       }
       // Adopt: carry over only this machine's unsent changes, with the single parent
       // upstream, so none of the dropped history is published again.
       const base = await gitOk(["merge-base", seen.commit, live], { cwd: clone });
       const merged = await mergeAndResolve(clone, upstream, live, { mergeBase: base, when });
-      if (merged.kind === "stop") return { kind: "stopped", reason: `${merged.reason}: ${joinNames(merged.paths)}` };
+      if (merged.kind === "stop") return { kind: "stopped", reason: stopReason(merged) };
+      // Nothing unsent: the vault moves to the remote as it is, and no empty commit is pushed.
+      if (merged.tree === (await gitOk(["rev-parse", `${upstream}^{tree}`], { cwd: clone }))) {
+        return { kind: "ok", next: upstream, needsPush: false, conflicts: merged.conflicts };
+      }
       const message = await mergeMessage(clone, input.machine, upstream, merged.tree);
       const next = await gitOk([...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-m", message], { cwd: clone });
-      return outbound(clone, upstream, next, merged.conflicts);
+      return outbound(clone, input, upstream, next, true, merged.conflicts);
     }
   }
 
@@ -399,14 +446,14 @@ async function integrate(clone: string, input: CycleInput, live: string): Promis
   if (sent === "yes") return { kind: "ok", next: upstream, needsPush: false, conflicts: [] };
   const ahead = await ancestry(clone, upstream, live);
   if (ahead === "unknown") return { kind: "unsynced", reason: "could not compare the remote with the live snapshot" };
-  if (ahead === "yes") return outbound(clone, upstream, live, []);
+  if (ahead === "yes") return outbound(clone, input, upstream, live, false, []);
 
   const merged = await mergeAndResolve(clone, upstream, live, { when });
-  if (merged.kind === "stop") return { kind: "stopped", reason: `${merged.reason}: ${joinNames(merged.paths)}` };
+  if (merged.kind === "stop") return { kind: "stopped", reason: stopReason(merged) };
   // Two parents, remote first: ancestry records that live is on the remote.
   const message = await mergeMessage(clone, input.machine, upstream, merged.tree);
   const next = await gitOk([...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-p", live, "-m", message], { cwd: clone });
-  return outbound(clone, upstream, next, merged.conflicts);
+  return outbound(clone, input, upstream, next, true, merged.conflicts);
 }
 
 type Push = { kind: "pushed" } | { kind: "raced"; detail: string } | { kind: "failed"; reason: string };
@@ -425,6 +472,15 @@ async function push(clone: string, input: CycleInput, sha: string): Promise<Push
   if (/^!\t.*\[rejected\]/m.test(r.stdout)) return { kind: "raced", detail };
   return { kind: "failed", reason: `push failed: ${detail}` };
 }
+
+// git's refusals of `reset --keep`, each printed before it writes anything: a local
+// edit, an edit or a deletion staged by hand, an untracked file where a note goes or
+// that a deletion would remove, a folder of untracked files where a note goes. Each
+// verified (git 2.50.1) to leave HEAD, the index and the worktree exactly as they
+// were. Only these: a refusal clears the intent record, so a message counted here
+// that git prints after writing would skip the repair of a half-updated vault.
+const REFUSED =
+  /Entry '(.+)' (?:not uptodate|would be overwritten by merge)|Untracked working tree file '(.+)' would be (?:overwritten|removed) by merge|Updating '(.+)' would lose untracked files in it/g;
 
 // Spec 5.4 step 5: the remote head now known, into the live repo's objects before
 // anything refers to it; then remote-seen; then the all-or-nothing reset.
@@ -453,11 +509,8 @@ async function updateLive(clone: string, input: CycleInput, live: string, next: 
     result.reason = "updating the vault timed out; the next sync finishes it";
     return;
   }
-  // git's check before it writes anything (verified, git 2.50.1): a local change, or
-  // an untracked file in the way, refuses the whole update and nothing changed.
-  const blocked = [...reset.stderr.matchAll(/Entry '(.+)' not uptodate|Untracked working tree file '(.+)' would be overwritten/g)].map(
-    (m) => m[1] ?? m[2] ?? "",
-  );
+  // git's check before it writes anything refuses the whole update and nothing changed.
+  const blocked = [...reset.stderr.matchAll(REFUSED)].map((m) => m[1] ?? m[2] ?? m[3] ?? "");
   if (!blocked.length) {
     // Any other error (a smudge filter that fails) can stop it partway: the intent
     // stays, and the next cycle finishes it before its snapshot.
@@ -521,6 +574,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     const live = (await rev(dir, "HEAD")) ?? "";
     const clone = await ensureStateClone(input.stateDir, dir, input.remote);
     let next = "";
+    let conflicts: Conflict[] = [];
     for (let attempt = 1; ; attempt++) {
       if (!(await stillHeld())) return result;
       const integration = await integrate(clone, input, live);
@@ -535,7 +589,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
         return result;
       }
       next = integration.next;
-      result.conflicts = integration.conflicts;
+      conflicts = integration.conflicts;
       if (!integration.needsPush) break;
       const pushed = await push(clone, input, next);
       if (pushed.kind === "pushed") {
@@ -553,6 +607,9 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
         return result;
       }
     }
+    // Only now: a conflict's copy exists once N is on the remote (or nothing needed
+    // pushing), and a cycle that ends before that reports none.
+    result.conflicts = conflicts;
 
     if (!(await stillHeld())) return result;
     await updateLive(clone, input, live, next, streak, result);
