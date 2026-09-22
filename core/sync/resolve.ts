@@ -407,7 +407,7 @@ function insideCopyOf(p: string, x: string): boolean {
 // - git's merged results (neither side's version) are gone from those paths and are
 //   in no new copy of them; an unrelated note with the same bytes is someone's note;
 // - git's relocations (conflict paths neither commit has) are gone;
-// - a remote folder a local file displaced moved aside whole;
+// - every other entry of a remote folder a local file displaced moved aside with it;
 // - every other path is exactly git's merge, and the tree is exactly the resolution.
 // A note's own text is never inspected, so notes that quote markers pass.
 export function checkResolved(written: Map<string, Entry>, resolution: Map<string, Entry>, facts: MergeFacts): string[] {
@@ -452,9 +452,11 @@ export function checkResolved(written: Map<string, Entry>, resolution: Map<strin
   }
 
   // A local file at a conflict path displaced the remote folder git merged there.
+  // A conflict path inside it is held to its record above instead: git's result
+  // there is its own merge, which must not move with the folder.
   const displacedEntry = (x: string): boolean => displacing.some((p) => x.startsWith(`${p}/`));
   for (const [x, entry] of result) {
-    if (!displacedEntry(x)) continue;
+    if (!displacedEntry(x) || conflictPaths.has(x)) continue;
     if (!entries.some(([at, e]) => same(e, entry) && movedWith(x, at))) problems.add(`${x} was not moved with its folder`);
   }
   const involved = (x: string): boolean =>

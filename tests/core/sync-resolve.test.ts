@@ -366,6 +366,33 @@ test("the check holds a file/folder conflict to git's relocation and the folder 
   assert.match(check([["p", e("2")], ["elsewhere/n.md", e("1")]]), /p\/n\.md was not moved with its folder/);
 });
 
+test("the check holds a conflict path inside a displaced folder to its own record, and rejects git's merged result at its moved place", () => {
+  // q.md renamed to p/b.md there (remote's own text 1) and to z.md here (local's own
+  // text 4), and a local file p (2) displaced the folder: git's result at both names
+  // is its merge (3).
+  const facts = {
+    records: [
+      { paths: ["p~local", "p"], type: "CONFLICT (file/directory)" },
+      { paths: ["q.md", "p/b.md", "z.md"], type: "CONFLICT (rename/rename)" },
+    ],
+    stages: new Map([["p~local", { 3: e("2") }], ["q.md", { 1: e("9") }], ["p/b.md", { 2: e("3") }], ["z.md", { 3: e("3") }]]),
+    result: new Map([["p~local", e("2")], ["p/b.md", e("3")], ["z.md", e("3")], ["keep.md", e("5")]]),
+    remote: new Map([["p/b.md", e("1")], ["keep.md", e("5")]]),
+    local: new Map([["p", e("2")], ["z.md", e("4")], ["keep.md", e("5")]]),
+  };
+  const folder = "p.conflict-2026-09-22-0915-666666";
+  const good: Array<[string, E]> = [["p", e("2")], [`${folder}/b.md`, e("1")], ["z.md", e("4")], ["keep.md", e("5")]];
+  const check = (written: Array<[string, E]>): string => checkResolved(new Map(written), new Map(written), facts).join("; ");
+  assert.equal(check(good), "", "git's merge at p/b.md need not move with the folder: the remote's own note did");
+  // git's merge moved with the folder in place of the remote's own note.
+  const merged = check([["p", e("2")], [`${folder}/b.md`, e("3")], ["z.md", e("4")], ["keep.md", e("5")]]);
+  assert.match(merged, /p\/b\.md: a version \(111111111111\) was lost/);
+  assert.match(merged, /p\.conflict-2026-09-22-0915-666666\/b\.md: git's merged result remains/);
+  // Every version kept, and git's merge at the note's place in a second copy of the folder.
+  const other = "p.conflict-2026-09-22-0915-777777";
+  assert.equal(check([...good, [`${other}/b.md`, e("3")]]), `${other}/b.md: git's merged result remains`);
+});
+
 test("a rename colliding with a new note, with content changed on both sides, keeps all three versions", async () => {
   const edited = (side: string): string => TEXT.replace("line two", `line two ${side}`);
   const clone = await scenario(
@@ -443,6 +470,35 @@ test("a note renamed into a folder there and elsewhere here, with the folder rep
   assert.deepEqual(tree.get("z.md"), (await treeOf(clone, "local")).get("z.md"));
   assert.deepEqual([...tree.keys()].sort(), [`${folder}/b.md`, "keep.md", "p", "z.md"].sort());
   for (const [, entry] of tree) assert.doesNotMatch(await blob(clone, entry.oid), /^<{7}/m);
+});
+
+test("the same renames with the note edited here, on both sides, or there: each side's own text under its name, nothing merged", async () => {
+  const edited = (side: string): string => TEXT.replace("line two", `line two ${side}`);
+  // git's result at both names is its rename/rename merge: the local edit, or markers
+  // when both sides edited.
+  for (const [label, remoteText, localText] of [
+    ["edited here", TEXT, edited("LOCAL")],
+    ["edited on both sides", edited("REMOTE"), edited("LOCAL")],
+    ["edited there", edited("REMOTE"), TEXT],
+  ] as const) {
+    const clone = await scenario(
+      { "q.md": TEXT, "p/a.md": "a\n", "keep.md": "k\n" },
+      { move: [["q.md", "p/b.md"]], write: { "p/b.md": remoteText } },
+      { move: [["q.md", "z.md"]], remove: ["p"], write: { p: "file\n", "z.md": localText } },
+    );
+    const r = await mergeAndResolve(clone, "remote", "local", { when: WHEN });
+    assert.equal(r.kind, "clean", `${label}: ${JSON.stringify(r)}`);
+    const tree = await treeOf(clone, (r as { tree: string }).tree);
+    const folder = (r as { conflicts: Array<{ kind: string; copy: string | null }> }).conflicts.find((c) => c.kind === "file-folder")?.copy ?? "";
+    assert.ok(folder.startsWith("p.conflict-2026-09-22-0915-"), `${label}: ${folder}`);
+    assert.equal(await blob(clone, tree.get("p")?.oid ?? ""), "file", label);
+    assert.deepEqual(tree.get(`${folder}/b.md`), (await treeOf(clone, "remote")).get("p/b.md"), label);
+    assert.deepEqual(tree.get("z.md"), (await treeOf(clone, "local")).get("z.md"), label);
+    assert.equal(await blob(clone, tree.get(`${folder}/b.md`)?.oid ?? ""), remoteText.trimEnd(), label);
+    assert.equal(await blob(clone, tree.get("z.md")?.oid ?? ""), localText.trimEnd(), label);
+    assert.deepEqual([...tree.keys()].sort(), [`${folder}/b.md`, "keep.md", "p", "z.md"].sort(), label);
+    for (const [, entry] of tree) assert.doesNotMatch(await blob(clone, entry.oid), /^<{7}/m, label);
+  }
 });
 
 test("a note renamed into a folder here and elsewhere there, with the folder replaced by a file there: the folder and both names stay", async () => {
