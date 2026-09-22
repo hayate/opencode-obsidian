@@ -7,6 +7,7 @@
 // to the old version (the update then runs again as usual), and never overwrites a
 // path that changed since: that is the user's edit.
 import { createHash } from "node:crypto";
+import { uptime } from "node:os";
 import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { git, GitError, gitOk, literal, type GitResult } from "../git.ts";
@@ -39,6 +40,12 @@ interface Record_ {
   // dies can see it running (spec 5.4 step 5). Absent once the process is known to be
   // gone, and absent in a record an older client wrote.
   group?: number;
+  // The boot that group belongs to, and when the update started. A record outlives a
+  // reboot, after which any process may hold that id, so the group counts only while the
+  // boot still matches; the start is how long it has been running, which the status says
+  // once that passes the longest limit a live update gets.
+  boot?: number;
+  startedAt?: number;
   // Each path's fingerprint as the kill left it. A path without one (the process
   // died first, or an error stopped the update) is judged by its content instead.
   prints?: Record<string, string | null>;
@@ -414,20 +421,39 @@ async function setBack(
 
 // Written before the live update starts, so a process death or a failed recording still
 // leaves a record of what the update was changing, and again with the update's process
-// group as soon as git is spawned (cycle.ts). The instant between the spawn and that
-// second write is not covered: a session that dies inside it leaves a record with no
-// group, which the next cycle repairs as it always has.
+// group as soon as git is spawned (cycle.ts), with the boot that group belongs to and the
+// moment it started. The instant between the spawn and that second write is not covered:
+// a session that dies inside it leaves a record with no group, which the next cycle
+// repairs as it always has.
 export async function recordIntent(stateDir: string, from: string, to: string, group?: number): Promise<void> {
-  const record: Record_ = group === undefined ? { from, to } : { from, to, group };
+  const record: Record_ = group === undefined ? { from, to } : { from, to, group, boot: bootInstant(), startedAt: Date.now() };
   await writeAtomic(join(stateDir, RECORD), JSON.stringify(record));
 }
+
+// When this machine booted, as a wall-clock instant to the second: os.uptime() is the
+// seconds since boot, so now minus it is the same number in every process of this boot.
+// Exported for the tests that write a record by hand.
+export function bootInstant(): number {
+  return Math.round((Date.now() - uptime() * 1000) / 1000) * 1000;
+}
+
+// How far a record's boot may sit from this one and still be this boot: uptime() counts
+// whole seconds and the clock can be adjusted under it, so two readings differ by a
+// second or two, while a reboot moves this by far more.
+const BOOT_TOLERANCE_MS = 5000;
 
 // Spec 5.6's model for the lock's pid, applied to a process group: ESRCH means it is
 // gone, EPERM means it is alive under another user, and anything else is treated as
 // alive, since nothing may repair over an update that might still be running. A group id
-// the system has since given to something else therefore reads as alive and sync waits
-// for a process that is not ours: the accepted limitation, as for the lock.
+// this boot has since given to something else therefore reads as alive and sync waits for
+// a process that is not ours: the accepted limitation, as for the lock, and bounded by
+// the boot check above, since a record from an earlier boot names no group at all.
 function groupAlive(group: number): boolean {
+  // The plugin's process groups are POSIX: git.ts spawns detached and kills -pgid on a
+  // timeout, and CI runs ubuntu and macOS. Where the platform has none the question
+  // cannot be answered at all, and answering "gone" lets the repair run, rather than
+  // leaving sync waiting for ever. There is no Windows path.
+  if (process.platform === "win32") return false;
   try {
     process.kill(-group, 0);
     return true;
@@ -436,14 +462,25 @@ function groupAlive(group: number): boolean {
   }
 }
 
-// The process group of a live update that may still be running, or null: no record, a
-// record with no group, or a group that has exited. Read before the repair (cycle.ts):
-// repairing or snapshotting over a running update would set its notes back under it and
-// push the old versions as this machine's change.
-export async function runningUpdate(stateDir: string): Promise<number | null> {
+export interface RunningUpdate {
+  // The update's process group, which the status names.
+  group: number;
+  // How long it has been running. A start in the future (the clock moved back under it)
+  // reads as just started, never as long-running.
+  runningMs: number;
+}
+
+// The live update that may still be running, or null: no record, a record with no group,
+// a group of an earlier boot (any process may hold that id now, so it counts for
+// nothing), or a group that has exited. Read before the repair (cycle.ts): repairing or
+// snapshotting over a running update would set its notes back under it and push the old
+// versions as this machine's change.
+export async function runningUpdate(stateDir: string): Promise<RunningUpdate | null> {
   const record = await readRecord(join(stateDir, RECORD));
   if (record?.group === undefined) return null;
-  return groupAlive(record.group) ? record.group : null;
+  if (record.boot === undefined || Math.abs(bootInstant() - record.boot) > BOOT_TOLERANCE_MS) return null;
+  if (!groupAlive(record.group)) return null;
+  return { group: record.group, runningMs: Math.max(0, Date.now() - (record.startedAt ?? Date.now())) };
 }
 
 // Called after git() returned for the killed reset, so its process group is gone.
@@ -478,11 +515,12 @@ const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 function isRecord(value: unknown): value is Record_ {
   if (typeof value !== "object" || value === null) return false;
-  const { from, to, group, prints } = value as Record<string, unknown>;
+  const { from, to, group, boot, startedAt, prints } = value as Record<string, unknown>;
   if (typeof from !== "string" || typeof to !== "string" || !OBJECT_ID.test(from) || !OBJECT_ID.test(to)) return false;
   // A group of 0 or 1 is no update's: process.kill(-1, ...) signals every process this
   // user may signal, so a record naming one is read as unreadable, like any other.
   if (group !== undefined && (typeof group !== "number" || !Number.isInteger(group) || group < 2)) return false;
+  for (const stamp of [boot, startedAt]) if (stamp !== undefined && (typeof stamp !== "number" || !Number.isFinite(stamp))) return false;
   if (prints === undefined) return true;
   return typeof prints === "object" && prints !== null && !Array.isArray(prints) && Object.values(prints).every((p) => p === null || typeof p === "string");
 }

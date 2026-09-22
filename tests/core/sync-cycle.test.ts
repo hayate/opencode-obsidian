@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { chmod, mkdir, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { changedSince, REMOTE_SEEN, runCycle, type CycleInput, type CycleResult } from "../../core/sync/cycle.ts";
+import { bootInstant } from "../../core/sync/recovery.ts";
 import { statusFromCycle } from "../../core/session.ts";
 import { prepareProjects, REQUIRED_IGNORES } from "../../core/sync/state.ts";
 import { acquireLock } from "../../core/lock.ts";
@@ -1834,8 +1835,12 @@ test("a session that died mid-update leaves it running: the next cycle waits for
 
   const waiting = await runCycle(input);
   assert.equal(waiting.outcome, "unsynced", waiting.reason ?? "");
-  assert.equal(waiting.reason, `an earlier vault update is still running (process group ${group}); sync waits for it. If it is hung, end that process.`);
-  assert.deepEqual(statusFromCycle(waiting), [{ level: "warn", text: `unsynced: ${waiting.reason}` }], "a warn, not a notify: nothing is wrong yet");
+  assert.equal(waiting.reason, "an earlier vault update is still running");
+  assert.equal(waiting.waiting?.group, group);
+  assert.equal(waiting.waiting?.hung, false, "it started moments ago");
+  const [line] = statusFromCycle(waiting);
+  assert.equal(line?.level, "warn", "a warn, not a notify: nothing is wrong yet");
+  assert.match(line?.text ?? "", new RegExp(`^unsynced: an earlier vault update is still running \\(process group ${group}, \\d+ s so far\\); sync waits for it\\. If it is hung, end that process$`));
   assert.equal(waiting.committed, null, "nothing is snapshotted");
   assert.equal(waiting.pushed, false);
   assert.deepEqual(waiting.notices, [], "nothing is repaired");
@@ -1861,11 +1866,12 @@ test("a cycle waits for a record's live process group, and the cycle after it fi
   alive.unref();
   const group = alive.pid ?? 0;
   assert.ok(group >= 2);
-  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group }));
+  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group, boot: bootInstant(), startedAt: Date.now() }));
   await writeRel(b.state, "blocked-cycles", "2");
   const waiting = await runCycle(slow);
   assert.equal(waiting.outcome, "unsynced", waiting.reason ?? "");
-  assert.match(waiting.reason ?? "", new RegExp(`^an earlier vault update is still running \\(process group ${group}\\); sync waits for it\\.`));
+  assert.equal(waiting.reason, "an earlier vault update is still running");
+  assert.deepEqual({ group: waiting.waiting?.group, hung: waiting.waiting?.hung }, { group, hung: false });
   assert.equal(waiting.committed, null);
   assert.deepEqual(waiting.notices, []);
   assert.equal(waiting.timedOut, null, "waiting is not a timeout: the limit stays where it was");
@@ -1893,10 +1899,10 @@ test("a running update is waited for even when the vault's history moved by hand
   const alive = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
   alive.unref();
   const group = alive.pid ?? 0;
-  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group }));
+  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group, boot: bootInstant(), startedAt: Date.now() }));
   const waiting = await runCycle(slow);
   assert.equal(waiting.outcome, "unsynced", waiting.reason ?? "");
-  assert.match(waiting.reason ?? "", new RegExp(`^an earlier vault update is still running \\(process group ${group}\\)`));
+  assert.equal(waiting.waiting?.group, group);
   assert.equal(waiting.committed, null);
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushed, "nothing pushed");
   process.kill(-group, "SIGKILL");
@@ -1923,4 +1929,54 @@ test("a record naming a process group that is gone is repaired like any other, a
   assert.deepEqual(after.notices, ["finished an interrupted vault update; 1 file set back to update again"]);
   assert.equal(await read(b, "x/t.md"), "from a\n");
   assert.equal(await remoteFile(remote, "x/t.md"), "from a");
+});
+
+test("a group recorded before a reboot is ignored: any process may hold that id now, so the repair runs instead of waiting for ever", async () => {
+  const { remote, b, slow } = await behindSlowFilter("sleep 10; cat", 500);
+  assert.equal((await runCycle(slow)).outcome, "unsynced");
+  const alive = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  alive.unref();
+  const group = alive.pid ?? 0;
+  // The same id, alive, but recorded under the boot before this one.
+  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group, boot: bootInstant() - 86_400_000, startedAt: Date.now() }));
+  await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });
+  const after = await runCycle({ ...slow, liveUpdateTimeoutMs: undefined });
+  assert.equal(after.outcome, "synced", after.reason ?? "");
+  assert.equal(after.waiting, null);
+  assert.deepEqual(after.notices, ["finished an interrupted vault update; 1 file set back to update again"]);
+  assert.equal(await read(b, "x/t.md"), "from a\n");
+  assert.equal(await remoteFile(remote, "x/t.md"), "from a");
+  process.kill(-group, "SIGKILL");
+  await new Promise((done) => alive.on("exit", done));
+});
+
+test("an update still running after the longest limit a live update gets is hung: the wait escalates to a notify naming it and its age, and a start in the future reads as just started", async () => {
+  // The base is 500 ms here, so the longest limit is 32 s.
+  const { b, slow } = await behindSlowFilter("sleep 10; cat", 500);
+  assert.equal((await runCycle(slow)).outcome, "unsynced");
+  const alive = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  alive.unref();
+  const group = alive.pid ?? 0;
+  const record = await recordOf(b);
+  await writeRel(b.state, RECORD, JSON.stringify({ ...record, group, boot: bootInstant(), startedAt: Date.now() - 3_600_000 }));
+  const hung = await runCycle(slow);
+  assert.equal(hung.outcome, "unsynced", hung.reason ?? "");
+  assert.equal(hung.waiting?.group, group);
+  assert.equal(hung.waiting?.hung, true);
+  assert.ok((hung.waiting?.runningMs ?? 0) >= 3_600_000);
+  assert.equal(hung.committed, null, "and it still repairs nothing and snapshots nothing");
+  assert.deepEqual(statusFromCycle(hung), [
+    {
+      level: "error",
+      text: `unsynced: an earlier vault update has been running for 60 min (process group ${group}), longer than the longest limit a live update gets: it is hung. End that process, and the next sync finishes the update`,
+    },
+  ]);
+  // A clock moved back under a running update: it reads as just started, never as hung.
+  await writeRel(b.state, RECORD, JSON.stringify({ ...record, group, boot: bootInstant(), startedAt: Date.now() + 60_000 }));
+  const fresh = await runCycle(slow);
+  assert.equal(fresh.waiting?.hung, false);
+  assert.equal(fresh.waiting?.runningMs, 0);
+  assert.equal(statusFromCycle(fresh)[0]?.level, "warn");
+  process.kill(-group, "SIGKILL");
+  await new Promise((done) => alive.on("exit", done));
 });

@@ -54,6 +54,11 @@ export interface CycleResult {
   // where one is known (the repair's checkout knows it; `reset --keep` names none).
   // Null otherwise.
   timedOut: { nextLimitMs: number; ceiling: boolean; note: string | null } | null;
+  // Spec 5.4 step 5: an update another session started is still running, so this cycle
+  // did nothing (the outcome is unsynced). Its process group, how long it has been
+  // running, and whether that is longer than the longest limit a live update gets, which
+  // makes it hung rather than slow and escalates the status to a notify. Null otherwise.
+  waiting: { group: number; runningMs: number; hung: boolean } | null;
 }
 
 // The remote head this machine last integrated with (spec 5.3).
@@ -208,9 +213,11 @@ async function writeLevel(stateDir: string, level: number): Promise<void> {
   await writeAtomic(join(stateDir, LEVEL), String(level));
 }
 
-// The cycle's own words for it; session.ts says what follows from the limit, and
-// runCycle can append a problem of its own (a failed lock release) to the reason.
+// The cycle's own words for these two; session.ts says what follows from the limit, the
+// process group and the age, and runCycle can append a problem of its own (a failed lock
+// release) to the reason.
 export const TIMED_OUT = "updating the vault timed out";
+export const STILL_RUNNING = "an earlier vault update is still running";
 
 // A live update or its repair killed on its limit: the next attempt gets the next rung.
 async function timedOut(stateDir: string, ladder: Ladder, result: CycleResult, note: string | null = null): Promise<void> {
@@ -262,6 +269,7 @@ function emptyResult(): CycleResult {
     caseCollisions: [],
     notices: [],
     timedOut: null,
+    waiting: null,
   };
 }
 
@@ -627,6 +635,9 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       result.reason = "lost the sync lock";
       return false;
     };
+    // One limit for the whole cycle: the repair rewrites the same files through the
+    // same filters as the live update.
+    const ladder = await readLadder(input.stateDir, input.liveUpdateTimeoutMs ?? LOCAL_TIMEOUT_MS);
     // Spec 5.4 step 5: an update whose session died keeps running, in the process group
     // git.ts recorded with the intent (the kill timer died with that session). Repairing
     // or snapshotting now would set its notes back under it and push the old versions as
@@ -636,16 +647,16 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     const running = await runningUpdate(input.stateDir);
     if (running !== null) {
       result.outcome = "unsynced";
-      result.reason = `an earlier vault update is still running (process group ${running}); sync waits for it. If it is hung, end that process.`;
+      result.reason = STILL_RUNNING;
+      // Past the longest limit a live update gets, it is not slow but hung, and the status
+      // escalates to the notify the ladder uses at its own ceiling.
+      result.waiting = { ...running, hung: running.runningMs > limitOf({ ...ladder, level: MAX_LEVEL }) };
       return result;
     }
     // Every cycle that runs breaks the streak, whatever its outcome, unless it ends
     // blocked again; a busy cycle never ran and leaves it alone.
     const streak = await readBlocked(input.stateDir);
     await writeBlocked(input.stateDir, 0);
-    // One limit for the whole cycle: the repair rewrites the same files through the
-    // same filters as the live update.
-    const ladder = await readLadder(input.stateDir, input.liveUpdateTimeoutMs ?? LOCAL_TIMEOUT_MS);
     // An interrupted update is finished before anything is snapshotted.
     let finished: Finished | null;
     try {

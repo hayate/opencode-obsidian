@@ -418,3 +418,18 @@ mutate("core/git.ts", """      resolve(
         }),
       );""", "      resolve(result);", G, pattern="git waits for what onSpawn writes")
 mutate("core/git.ts", "      reported = Promise.reject(err);", "      throw err;", G, pattern="an onSpawn that throws where it stands")
+# Fix round 2: a record's group belongs to the boot that wrote it, an update that outlives the
+# longest limit is hung rather than slow, and where the platform has no process groups the
+# check answers gone.
+REBOOT = "group recorded before a reboot"; HUNG = "longest limit a live update gets is hung"
+mutate(F_RC, "  if (record.boot === undefined || Math.abs(bootInstant() - record.boot) > BOOT_TOLERANCE_MS) return null;\n", "", C, pattern=REBOOT)
+mutate(F_RC, '  const record: Record_ = group === undefined ? { from, to } : { from, to, group, boot: bootInstant(), startedAt: Date.now() };',
+       "  const record: Record_ = group === undefined ? { from, to } : { from, to, group };", C, pattern=WAITS)
+mutate(F_RC, '  if (process.platform === "win32") return false;\n', "", RC, pattern="no process groups the check answers gone")
+mutate(F_RC, "  return { group: record.group, runningMs: Math.max(0, Date.now() - (record.startedAt ?? Date.now())) };",
+       "  return { group: record.group, runningMs: Date.now() - (record.startedAt ?? Date.now()) };", C, pattern=HUNG)
+mutate(CY, "result.waiting = { ...running, hung: running.runningMs > limitOf({ ...ladder, level: MAX_LEVEL }) };",
+       "result.waiting = { ...running, hung: false };", C, pattern=HUNG)
+mutate("core/session.ts", "    if (!hung) {", "    if (true) {", SE, pattern="statusFromCycle waits at warn for an update")
+mutate("core/session.ts", "  return seconds < 60 ? `${seconds} s` : `${Math.round(seconds / 60)} min`;", "  return `${seconds} s`;", SE,
+       pattern="statusFromCycle waits at warn for an update")

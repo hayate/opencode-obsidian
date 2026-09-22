@@ -13,7 +13,7 @@ import { legacyReappeared, schemaVersion, SCHEMA_VERSION } from "./migrate.ts";
 import { normalizeOrigin, recordOrigin, resolveProject, type ProjectResolution } from "./project.ts";
 import { acquireLock } from "./lock.ts";
 import { branchKey, computeHeads, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
-import { runCycle, TIMED_OUT, type CycleResult } from "./sync/cycle.ts";
+import { runCycle, STILL_RUNNING, TIMED_OUT, type CycleResult } from "./sync/cycle.ts";
 import type { Conflict } from "./sync/resolve.ts";
 import { remoteVisibility, type Visibility } from "./sync/privacy.ts";
 import { prepareProjects, syncConfig, type SyncConfig, type SyncState } from "./sync/state.ts";
@@ -144,17 +144,38 @@ function duration(ms: number): string {
   return `${ms} ms`;
 }
 
+// How long something has been running, as the user reads it: whole seconds up to a
+// minute, then whole minutes. Rounded, unlike a limit, which is exact by construction.
+function age(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  return seconds < 60 ? `${seconds} s` : `${Math.round(seconds / 60)} min`;
+}
+
 // Spec 5.4 step 5: a live update, or the repair of one, killed on its limit gets twice
 // the time next, up to the longest limit; one killed even with that escalates to a
 // notify (the adapter notifies on errors), and sync keeps retrying with it. It says the
 // next sync tries again, never that it finishes: at the ceiling six timeouts in a row
-// are the normal case. No line says when the retry comes: a cycle runs when an OpenCode
-// session starts. Anything runCycle appended to the reason (a failed lock release) goes
-// last, after the limit, so both read cleanly.
+// are the normal case. An update another session left running is waited for, at warn
+// level, until it has run longer than that longest limit, when it is hung and says so.
+// No line says when the retry comes: a cycle runs when an OpenCode session starts.
+// Anything runCycle appended to the reason (a failed lock release) goes last, after this
+// line's own words, so both read cleanly.
 function unsynced(r: CycleResult): StatusItem {
   const said = r.reason ?? "push did not happen";
+  const rest = (lead: string): string => (said.startsWith(lead) ? said.slice(lead.length) : `; ${said}`);
+  if (r.waiting !== null) {
+    const { group, runningMs, hung } = r.waiting;
+    const also = rest(STILL_RUNNING);
+    if (!hung) {
+      return { level: "warn", text: `unsynced: ${STILL_RUNNING} (process group ${group}, ${age(runningMs)} so far); sync waits for it. If it is hung, end that process${also}` };
+    }
+    return {
+      level: "error",
+      text: `unsynced: an earlier vault update has been running for ${age(runningMs)} (process group ${group}), longer than the longest limit a live update gets: it is hung. End that process, and the next sync finishes the update${also}`,
+    };
+  }
   if (r.timedOut === null) return { level: "warn", text: `unsynced: ${said}` };
-  const also = said.startsWith(TIMED_OUT) ? said.slice(TIMED_OUT.length) : `; ${said}`;
+  const also = rest(TIMED_OUT);
   const limit = duration(r.timedOut.nextLimitMs);
   if (!r.timedOut.ceiling) {
     return { level: "warn", text: `unsynced: ${TIMED_OUT}; the next sync tries again, with its limit doubled to ${limit}${also}` };

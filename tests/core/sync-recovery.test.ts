@@ -1,11 +1,12 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { chmod, lstat, mkdir, readdir, readFile, readlink, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { basename, join } from "node:path";
 import { git, GitError, gitOk } from "../../core/git.ts";
 import { fold } from "../../core/sync/copies.ts";
-import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, RepairTimedOut } from "../../core/sync/recovery.ts";
+import { bootInstant, clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, RepairTimedOut, runningUpdate } from "../../core/sync/recovery.ts";
 import { commitFile, initRepo, sleep, tempDir, writeRel } from "./helpers.ts";
 
 interface Interruption {
@@ -997,4 +998,27 @@ test("a stopped repair records a file it had removed as nothing there, so a fold
   assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/0new.txt", "x/a.md", "x/b.md"], kept: [] });
   assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "old a\n");
   assert.equal(await readFile(join(dir, "x/b.md"), "utf8"), "old b\n");
+});
+
+// Spec 5.4 step 5 (fix round 2): process groups here are POSIX, so where the platform has
+// none the question cannot be answered and the repair must go ahead rather than wait for
+// ever. CI runs ubuntu and macOS; this pins the answer without a Windows path.
+test("where the platform has no process groups the check answers gone, so nothing waits on it", async () => {
+  const w = await interrupted();
+  const alive = spawn("sleep", ["10"], { detached: true, stdio: "ignore" });
+  alive.unref();
+  const group = alive.pid ?? 0;
+  await recordIntent(w.state, w.from, w.to, group);
+  const running = await runningUpdate(w.state);
+  assert.equal(running?.group, group, "alive on this platform");
+  assert.ok((running?.runningMs ?? -1) >= 0 && (running?.runningMs ?? Infinity) < 5000, `just started: ${running?.runningMs} ms`);
+  const platform = process.platform;
+  Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+  try {
+    assert.equal(await runningUpdate(w.state), null);
+  } finally {
+    Object.defineProperty(process, "platform", { value: platform, configurable: true });
+  }
+  process.kill(-group, "SIGKILL");
+  await new Promise((done) => alive.on("exit", done));
 });

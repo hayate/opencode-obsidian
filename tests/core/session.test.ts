@@ -171,6 +171,7 @@ test("statusFromCycle turns every non-clean outcome into a visible line", () => 
     caseCollisions: ["x/Note.md", "x/note.md"],
     notices: [],
     timedOut: null,
+    waiting: null,
   });
   assert.deepEqual(items.map((i) => i.level), ["error", "warn", "warn", "warn", "error"]);
   assert.match(items[0]?.text ?? "", /^sync stopped: the remote's history was rewritten/);
@@ -194,6 +195,7 @@ test("statusFromCycle quotes the vault file names it reports", () => {
     caseCollisions: [],
     notices: [],
     timedOut: null,
+    waiting: null,
   });
   assert.equal(items.length, 3);
   for (const i of items) assert.doesNotMatch(i.text, /\n/, i.text);
@@ -203,7 +205,7 @@ test("statusFromCycle quotes the vault file names it reports", () => {
 test("statusFromCycle collapses the control characters a reason carries (git's words, an error's message), so no reason can add a line", () => {
   const base = {
     committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
-    conflicts: [], embedded: [], caseCollisions: [], timedOut: null,
+    conflicts: [], embedded: [], caseCollisions: [], timedOut: null, waiting: null,
   };
   for (const outcome of ["stopped", "unsynced", "aborted", "synced"] as const) {
     const items = statusFromCycle({
@@ -234,6 +236,7 @@ test("statusFromCycle shows a reason recorded on a synced outcome (a failed lock
     caseCollisions: [],
     notices: [],
     timedOut: null,
+    waiting: null,
   });
   assert.deepEqual(items, [{ level: "warn", text: "releasing the sync lock failed: EACCES" }]);
 });
@@ -252,6 +255,7 @@ test("statusFromCycle gives each conflict one quoted line saying where both vers
     embedded: [],
     caseCollisions: [],
     timedOut: null,
+    waiting: null,
   };
   const items = statusFromCycle({
     ...base,
@@ -303,30 +307,63 @@ test("statusFromCycle gives a live update that timed out the next attempt's limi
     conflicts: [], embedded: [], caseCollisions: [], notices: [],
   };
   const causes = "The likely cause is a hung disk, or a smudge filter that never finishes (such as LFS or git-crypt); sync keeps retrying with that limit";
-  assert.deepEqual(statusFromCycle({ ...base, timedOut: { nextLimitMs: 60_000, ceiling: false, note: null } }), [
+  assert.deepEqual(statusFromCycle({ ...base, waiting: null, timedOut: { nextLimitMs: 60_000, ceiling: false, note: null } }), [
     { level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 1 min" },
   ]);
   assert.deepEqual(
-    statusFromCycle({ ...base, timedOut: { nextLimitMs: 1_920_000, ceiling: false, note: "x/n.md" } }),
+    statusFromCycle({ ...base, waiting: null, timedOut: { nextLimitMs: 1_920_000, ceiling: false, note: "x/n.md" } }),
     [{ level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 32 min" }],
     "below the ceiling the note is not named: the next sync may well finish it",
   );
-  assert.deepEqual(statusFromCycle({ ...base, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: null } }), [
+  assert.deepEqual(statusFromCycle({ ...base, waiting: null, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: null } }), [
     { level: "error", text: `unsynced: updating the vault timed out, even with its longest limit (32 min). ${causes}` },
   ]);
   assert.deepEqual(
-    statusFromCycle({ ...base, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: "x/n\n- [info] all fine.md" } }),
+    statusFromCycle({ ...base, waiting: null, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: "x/n\n- [info] all fine.md" } }),
     [{ level: "error", text: `unsynced: updating the vault timed out while it was rewriting "x/n\\n- [info] all fine.md", even with its longest limit (32 min). ${causes}` }],
     "the note is quoted, so it cannot add a status line",
   );
   // A problem runCycle recorded with the reason (a failed lock release) comes last, so
   // both it and the limit read cleanly.
   const lock = { ...base, reason: "updating the vault timed out; releasing the sync lock failed: EACCES" };
-  assert.deepEqual(statusFromCycle({ ...lock, timedOut: { nextLimitMs: 60_000, ceiling: false, note: null } }), [
+  assert.deepEqual(statusFromCycle({ ...lock, waiting: null, timedOut: { nextLimitMs: 60_000, ceiling: false, note: null } }), [
     { level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 1 min; releasing the sync lock failed: EACCES" },
   ]);
-  assert.deepEqual(statusFromCycle({ ...lock, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: null } }), [
+  assert.deepEqual(statusFromCycle({ ...lock, waiting: null, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: null } }), [
     { level: "error", text: `unsynced: updating the vault timed out, even with its longest limit (32 min). ${causes}; releasing the sync lock failed: EACCES` },
+  ]);
+});
+
+// Spec 5.4 step 5 (fix round 2): a cycle that found another session's update still
+// running waits at warn level, naming the process and its age; once it has run longer
+// than the longest limit a live update gets it is hung, and the line escalates to the
+// notify level the ladder uses at its ceiling.
+test("statusFromCycle waits at warn for an update another session is still running, and calls one that outlived the longest limit hung", () => {
+  const base = {
+    outcome: "unsynced" as const,
+    reason: "an earlier vault update is still running",
+    committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
+    conflicts: [], embedded: [], caseCollisions: [], notices: [], timedOut: null,
+  };
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 12_400, hung: false } }), [
+    { level: "warn", text: "unsynced: an earlier vault update is still running (process group 4242, 12 s so far); sync waits for it. If it is hung, end that process" },
+  ]);
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 45_000, hung: false } }), [
+    { level: "warn", text: "unsynced: an earlier vault update is still running (process group 4242, 45 s so far); sync waits for it. If it is hung, end that process" },
+  ]);
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 1_920_000, hung: true } }), [
+    {
+      level: "error",
+      text: "unsynced: an earlier vault update has been running for 32 min (process group 4242), longer than the longest limit a live update gets: it is hung. End that process, and the next sync finishes the update",
+    },
+  ]);
+  // A problem runCycle recorded with the reason comes last here too.
+  const lock = { ...base, reason: "an earlier vault update is still running; releasing the sync lock failed: EACCES" };
+  assert.deepEqual(statusFromCycle({ ...lock, waiting: { group: 4242, runningMs: 0, hung: false } }), [
+    {
+      level: "warn",
+      text: "unsynced: an earlier vault update is still running (process group 4242, 0 s so far); sync waits for it. If it is hung, end that process; releasing the sync lock failed: EACCES",
+    },
   ]);
 });
 
