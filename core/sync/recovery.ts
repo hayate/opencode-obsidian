@@ -35,6 +35,10 @@ export class RepairTimedOut extends GitError {
 interface Record_ {
   from: string;
   to: string;
+  // The update's process group while it runs, so a session that starts after this one
+  // dies can see it running (spec 5.4 step 5). Absent once the process is known to be
+  // gone, and absent in a record an older client wrote.
+  group?: number;
   // Each path's fingerprint as the kill left it. A path without one (the process
   // died first, or an error stopped the update) is judged by its content instead.
   prints?: Record<string, string | null>;
@@ -408,10 +412,38 @@ async function setBack(
   }
 }
 
-// Written before the live update starts, so a process death or a failed recording
-// still leaves a record of what the update was changing.
-export async function recordIntent(stateDir: string, from: string, to: string): Promise<void> {
-  await writeAtomic(join(stateDir, RECORD), JSON.stringify({ from, to } satisfies Record_));
+// Written before the live update starts, so a process death or a failed recording still
+// leaves a record of what the update was changing, and again with the update's process
+// group as soon as git is spawned (cycle.ts). The instant between the spawn and that
+// second write is not covered: a session that dies inside it leaves a record with no
+// group, which the next cycle repairs as it always has.
+export async function recordIntent(stateDir: string, from: string, to: string, group?: number): Promise<void> {
+  const record: Record_ = group === undefined ? { from, to } : { from, to, group };
+  await writeAtomic(join(stateDir, RECORD), JSON.stringify(record));
+}
+
+// Spec 5.6's model for the lock's pid, applied to a process group: ESRCH means it is
+// gone, EPERM means it is alive under another user, and anything else is treated as
+// alive, since nothing may repair over an update that might still be running. A group id
+// the system has since given to something else therefore reads as alive and sync waits
+// for a process that is not ours: the accepted limitation, as for the lock.
+function groupAlive(group: number): boolean {
+  try {
+    process.kill(-group, 0);
+    return true;
+  } catch (err) {
+    return errno(err) !== "ESRCH";
+  }
+}
+
+// The process group of a live update that may still be running, or null: no record, a
+// record with no group, or a group that has exited. Read before the repair (cycle.ts):
+// repairing or snapshotting over a running update would set its notes back under it and
+// push the old versions as this machine's change.
+export async function runningUpdate(stateDir: string): Promise<number | null> {
+  const record = await readRecord(join(stateDir, RECORD));
+  if (record?.group === undefined) return null;
+  return groupAlive(record.group) ? record.group : null;
 }
 
 // Called after git() returned for the killed reset, so its process group is gone.
@@ -446,8 +478,11 @@ const OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 function isRecord(value: unknown): value is Record_ {
   if (typeof value !== "object" || value === null) return false;
-  const { from, to, prints } = value as Record<string, unknown>;
+  const { from, to, group, prints } = value as Record<string, unknown>;
   if (typeof from !== "string" || typeof to !== "string" || !OBJECT_ID.test(from) || !OBJECT_ID.test(to)) return false;
+  // A group of 0 or 1 is no update's: process.kill(-1, ...) signals every process this
+  // user may signal, so a record naming one is read as unreadable, like any other.
+  if (group !== undefined && (typeof group !== "number" || !Number.isInteger(group) || group < 2)) return false;
   if (prints === undefined) return true;
   return typeof prints === "object" && prints !== null && !Array.isArray(prints) && Object.values(prints).every((p) => p === null || typeof p === "string");
 }

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { chmod, mkdir, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { changedSince, REMOTE_SEEN, runCycle, type CycleInput, type CycleResult } from "../../core/sync/cycle.ts";
@@ -7,7 +8,7 @@ import { statusFromCycle } from "../../core/session.ts";
 import { prepareProjects, REQUIRED_IGNORES } from "../../core/sync/state.ts";
 import { acquireLock } from "../../core/lock.ts";
 import { git, gitOk } from "../../core/git.ts";
-import { GIT_CONFIG, commitFile, initRepo, tempDir, withRewrittenMergeTree, writeRel } from "./helpers.ts";
+import { GIT_CONFIG, commitFile, initRepo, sleep, tempDir, withRewrittenMergeTree, writeRel } from "./helpers.ts";
 
 const TZ = "Asia/Tokyo";
 const j = (...parts: string[]): string => parts.join("");
@@ -1749,6 +1750,144 @@ test("a repair gets the live update's current limit: one that needs longer than 
   assert.equal(second.outcome, "synced", second.reason ?? "");
   assert.deepEqual(second.notices, ["finished an interrupted vault update; 1 file set back to update again"], "the repair set the note back");
   assert.ok(second.liveUpdated);
+  assert.equal(await read(b, "x/t.md"), "from a\n");
+  assert.equal(await remoteFile(remote, "x/t.md"), "from a");
+});
+
+// Spec 5.4 step 5 (fix round 1, 2026-09-23): git runs in its own process group, and its
+// kill timer lives in this process, so an update outlives the session that started it.
+// A cycle that repaired and snapshotted while it ran would set its notes back under it
+// and push the old versions as this machine's change.
+const RECORD = "interrupted-update.json";
+
+const groupAlive = (group: number): boolean => {
+  try {
+    process.kill(-group, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+};
+
+// The process group the running update recorded, once it is there.
+async function recordedGroup(x: Machine): Promise<number> {
+  const started = Date.now();
+  for (;;) {
+    const group = await readFile(join(x.state, RECORD), "utf8").then(
+      (text) => (JSON.parse(text) as { group?: number }).group,
+      () => undefined,
+    );
+    if (group !== undefined) return group;
+    assert.ok(Date.now() - started < 20_000, "the update never recorded its process group");
+    await sleep(20);
+  }
+}
+
+async function waitGone(group: number, why: string): Promise<void> {
+  const started = Date.now();
+  while (groupAlive(group)) {
+    assert.ok(Date.now() - started < 30_000, why);
+    await sleep(50);
+  }
+}
+
+const recordOf = async (x: Machine): Promise<{ group?: number }> => JSON.parse(await readFile(join(x.state, RECORD), "utf8"));
+
+test("a live update records its process group as it starts, and clears the record when it finishes", async () => {
+  // A limit far longer than the filter: this update completes.
+  const { b, slow } = await behindSlowFilter("sleep 1; cat", 30_000);
+  const cycling = runCycle(slow);
+  const group = await recordedGroup(b);
+  assert.ok(Number.isInteger(group) && group >= 2, `${group} is a process group`);
+  assert.ok(groupAlive(group), "the group is alive while the update runs");
+  const r = await cycling;
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  assert.ok(r.liveUpdated);
+  assert.equal(await read(b, "x/t.md"), "from a\n");
+  assert.deepEqual((await readdir(b.state)).filter((n) => n === RECORD), [], "a finished update leaves no record");
+});
+
+test("a session that died mid-update leaves it running: the next cycle waits for it, sets nothing back and pushes nothing, and the vault ends at the remote's version", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  for (const rel of ["x/s.md", "x/t.md", "x/u.md"]) await writeRel(a.projects, rel, `${rel} from a\n`);
+  assert.ok((await cycle(remote, a)).pushed);
+  const pushedByA = await gitOk(["rev-parse", "main"], { cwd: remote });
+  // Only the last note's filter hangs, so the update writes the other two and then waits.
+  await gitOk(["config", "filter.slow.smudge", "sleep 3; cat"], { cwd: b.projects });
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "x/u.md filter=slow\n");
+  const input = { timezone: TZ, projectsDir: b.projects, remote, branch: "main", stateDir: b.state, machine: "b", quietMs: 0 };
+  const session = spawn(process.execPath, [join(import.meta.dirname, "fixtures", "cycle-session.ts"), JSON.stringify(input)], { stdio: "ignore" });
+  const group = await recordedGroup(b);
+  // Long enough for the update to have written the two quick notes and be inside the
+  // third one's filter: exactly what a repair would set back under it.
+  await sleep(700);
+  session.kill("SIGKILL");
+  await new Promise((done) => session.on("close", done));
+  assert.ok(groupAlive(group), "the update outlives the session that started it");
+
+  const waiting = await runCycle(input);
+  assert.equal(waiting.outcome, "unsynced", waiting.reason ?? "");
+  assert.equal(waiting.reason, `an earlier vault update is still running (process group ${group}); sync waits for it. If it is hung, end that process.`);
+  assert.deepEqual(statusFromCycle(waiting), [{ level: "warn", text: `unsynced: ${waiting.reason}` }], "a warn, not a notify: nothing is wrong yet");
+  assert.equal(waiting.committed, null, "nothing is snapshotted");
+  assert.equal(waiting.pushed, false);
+  assert.deepEqual(waiting.notices, [], "nothing is repaired");
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushedByA, "nothing is pushed while it runs");
+
+  await waitGone(group, "the orphaned update never finished");
+  const after = await runCycle(input);
+  assert.equal(after.outcome, "synced", after.reason ?? "");
+  assert.equal(after.committed, null, "the update's own work is never snapshotted as this machine's change");
+  for (const rel of ["x/s.md", "x/t.md", "x/u.md"]) assert.equal(await read(b, rel), `${rel} from a\n`, rel);
+  assert.equal(await gitOk(["rev-parse", "HEAD"], { cwd: b.projects }), pushedByA, "the vault is at the remote's commit");
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushedByA, "and the remote never received the old versions");
+});
+
+test("a cycle waits for a record's live process group, and the cycle after it finishes normally once that process is gone", async () => {
+  const { remote, b, slow } = await behindSlowFilter("sleep 10; cat", 500);
+  const first = await runCycle(slow);
+  assert.deepEqual(first.timedOut, { nextLimitMs: 1000, ceiling: false, note: null }, first.reason ?? "");
+  const pushed = await gitOk(["rev-parse", "main"], { cwd: remote });
+  // A record naming a process group that is alive: another session's update.
+  const alive = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  const group = alive.pid ?? 0;
+  assert.ok(group >= 2);
+  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group }));
+  const waiting = await runCycle(slow);
+  assert.equal(waiting.outcome, "unsynced", waiting.reason ?? "");
+  assert.match(waiting.reason ?? "", new RegExp(`^an earlier vault update is still running \\(process group ${group}\\); sync waits for it\\.`));
+  assert.equal(waiting.committed, null);
+  assert.deepEqual(waiting.notices, []);
+  assert.equal(waiting.timedOut, null, "waiting is not a timeout: the limit stays where it was");
+  assert.equal(await rung(b), "1");
+  assert.equal(await streak(b), "0", "and it is not a block");
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushed, "nothing pushed");
+  assert.equal((await recordOf(b)).group, group, "the record is left exactly as it was");
+
+  process.kill(-group, "SIGKILL");
+  await new Promise((done) => alive.on("exit", done));
+  await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });
+  const after = await runCycle({ ...slow, liveUpdateTimeoutMs: undefined });
+  assert.equal(after.outcome, "synced", after.reason ?? "");
+  assert.equal(await read(b, "x/t.md"), "from a\n");
+  assert.deepEqual((await readdir(b.state)).filter((n) => n === RECORD), []);
+});
+
+test("a record naming a process group that is gone is repaired like any other, and a killed update leaves none to wait for", async () => {
+  const { remote, b, slow } = await behindSlowFilter("sleep 10; cat", 500);
+  assert.equal((await runCycle(slow)).outcome, "unsynced");
+  assert.equal((await recordOf(b)).group, undefined, "git was killed with its group, so nothing is left running");
+  // A record naming a process that has exited: the repair goes ahead.
+  const ended = spawn(process.execPath, ["-e", ""], { detached: true, stdio: "ignore" });
+  await new Promise((done) => ended.on("exit", done));
+  const group = ended.pid ?? 0;
+  await waitGone(group, "the helper process never exited");
+  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group }));
+  await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });
+  const after = await runCycle({ ...slow, liveUpdateTimeoutMs: undefined });
+  assert.equal(after.outcome, "synced", after.reason ?? "");
+  assert.deepEqual(after.notices, ["finished an interrupted vault update; 1 file set back to update again"]);
   assert.equal(await read(b, "x/t.md"), "from a\n");
   assert.equal(await remoteFile(remote, "x/t.md"), "from a");
 });

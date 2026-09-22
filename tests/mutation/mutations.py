@@ -377,3 +377,13 @@ mutate("core/session.ts", '  const note = r.timedOut.note === null ? "" : ` whil
        '  const note = "";', SE, pattern="statusFromCycle gives a live update that timed out")
 mutate("core/session.ts", "  const also = said.startsWith(TIMED_OUT) ? said.slice(TIMED_OUT.length) : `; ${said}`;", '  const also = "";', SE,
        pattern="statusFromCycle gives a live update that timed out")
+# Fix round 1, Important 1: an update outlives the session that started it (git is detached,
+# and its kill timer dies with the session). The cycle waits for a recorded group that is
+# alive, rather than setting its notes back and pushing them, and a normal exit takes the
+# groups this process started with it.
+WAITS = "waits for a record's live process group"
+mutate(F_RC, "  return groupAlive(record.group) ? record.group : null;", "  return null;", C, runs=5, pattern=WAITS)
+mutate(CY, "      result.reason = `an earlier vault update is still running (process group ${running}); sync waits for it. If it is hung, end that process.`;\n      return result;",
+       "      result.reason = `an earlier vault update is still running (process group ${running}); sync waits for it. If it is hung, end that process.`;", C, runs=5, pattern=WAITS)
+mutate(CY, "    onSpawn: (group) => recordIntent(input.stateDir, live, next, group),\n", "", C, pattern="records its process group")
+mutate("core/git.ts", '  if (started.size === 0) process.on("exit", killStarted);\n', "", G, pattern="session that exits normally takes the git")

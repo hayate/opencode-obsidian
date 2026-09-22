@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { chmod, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -342,4 +342,43 @@ test("git commands a commit hook runs are not forced into literal-pathspec mode"
   await chmod(hook, 0o755);
   const r = await git(["commit", "-q", "-m", "hook runs check-ignore"], { cwd: dir });
   assert.equal(r.code, 0, r.stderr);
+});
+
+// Spec 5.4 step 5 (fix round 1): git is detached, in its own group, and its timeout is a
+// timer in this process. A session that exits while git runs must not leave it running:
+// the next session would repair and push over what it is still writing.
+test("a session that exits normally takes the git it started with it, and installs no handler once nothing runs", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  const from = await commitFile(dir, "x/n.md", "old\n", "old");
+  const to = await commitFile(dir, "x/n.md", "new\n", "new");
+  await gitOk(["reset", "-q", "--hard", from], { cwd: dir });
+  await gitOk(["config", "filter.slow.smudge", "sleep 30; cat"], { cwd: dir });
+  await writeFile(join(dir, ".git", "info", "attributes"), "*.md filter=slow\n");
+  const fixture = fileURLToPath(new URL("./fixtures/git-exit.ts", import.meta.url));
+  const child = spawn(process.execPath, [fixture, dir, to], { stdio: ["ignore", "pipe", "inherit"] });
+  let out = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+    out += chunk;
+  });
+  const code: number = await new Promise((done) => child.on("close", (status) => done(status ?? -1)));
+  assert.equal(code, 0, "the session exited normally");
+  const group = Number(out.trim());
+  assert.ok(Number.isInteger(group) && group >= 2, `the session reported its git's group: ${JSON.stringify(out)}`);
+  const started = Date.now();
+  for (;;) {
+    try {
+      process.kill(-group, 0);
+    } catch (err) {
+      assert.equal((err as NodeJS.ErrnoException).code, "ESRCH");
+      break;
+    }
+    assert.ok(Date.now() - started < 10_000, "the git the session started outlived it");
+    await sleep(20);
+  }
+  // The handler goes with the last child, so a host that runs no git keeps its listeners
+  // as they were.
+  const listeners = process.listenerCount("exit");
+  await gitOk(["--version"], { cwd: process.cwd() });
+  assert.equal(process.listenerCount("exit"), listeners, "no exit listener is left behind");
 });

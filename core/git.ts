@@ -16,10 +16,47 @@ export interface GitOptions {
   timeoutMs?: number;
   env?: Record<string, string | undefined>;
   input?: string;
+  // Called with the spawned child's pid, which is its process group id (the child is
+  // detached below). The live update records it, so a session that starts after this one
+  // dies can see the update still running (cycle.ts, recovery.ts). A promise it returns
+  // is settled before this call's result, so what it writes is on disk before the caller
+  // goes on, and a failure of it is the call's failure.
+  onSpawn?: (pid: number) => void | Promise<void>;
 }
 
 export const LOCAL_TIMEOUT_MS = 30_000;
 export const NETWORK_TIMEOUT_MS = 45_000;
+
+// The process groups this process started and has not yet seen exit. A session that
+// exits while git runs would leave it running with nothing to stop it: the timeout below
+// is a timer in this process, and the child is detached, in its own group. It would go on
+// writing the vault while the next session repairs and pushes over it (spec 5.4 step 5).
+// So a normal exit takes them with it, synchronously. Nothing else about the host
+// changes: a plugin never installs signal handlers in it, so a crash, a SIGKILL, or a
+// host that exits without running its handlers still leaves the group running, and the
+// cycle covers that by waiting for a recorded group that is alive.
+const started = new Set<number>();
+
+function killStarted(): void {
+  for (const group of started) {
+    try {
+      process.kill(-group, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+// Registers a group for the exit above, and returns the way to forget it. The handler is
+// installed only while a child of this module runs, so the host keeps its own listeners.
+function killOnExit(pid: number): () => void {
+  if (started.size === 0) process.on("exit", killStarted);
+  started.add(pid);
+  return () => {
+    started.delete(pid);
+    if (started.size === 0) process.off("exit", killStarted);
+  };
+}
 
 export class GitError extends Error {
   readonly args: string[];
@@ -66,6 +103,13 @@ function runOnce(args: string[], opts: GitOptions): Promise<GitResult> {
       detached: true,
       stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
+    const forget = child.pid === undefined ? (): void => undefined : killOnExit(child.pid);
+    // Handled the moment it is made: an unhandled rejection would take the host down
+    // while git is still running.
+    const spawned = Promise.resolve(child.pid !== undefined ? opts.onSpawn?.(child.pid) : undefined).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -85,11 +129,19 @@ function runOnce(args: string[], opts: GitOptions): Promise<GitResult> {
     }, opts.timeoutMs ?? LOCAL_TIMEOUT_MS);
     child.on("error", (err) => {
       clearTimeout(timer);
+      forget();
       reject(err);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({ code: code ?? -1, stdout, stderr, timedOut });
+      forget();
+      const result: GitResult = { code: code ?? -1, stdout, stderr, timedOut };
+      resolve(
+        spawned.then((failed) => {
+          if (failed !== undefined) throw failed;
+          return result;
+        }),
+      );
     });
     if (opts.input !== undefined) {
       // A git that exits before reading all its input closes the pipe, and the

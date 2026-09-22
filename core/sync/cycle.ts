@@ -11,7 +11,7 @@ import { EMPTY_TREE, redactUrlCredentials, scanRange, scanStaged, scanText } fro
 import { quoted, writeAtomic } from "../store.ts";
 import { ensureStateClone } from "./clone.ts";
 import { conflictStamp } from "./copies.ts";
-import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, RepairTimedOut, type Finished } from "./recovery.ts";
+import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, RepairTimedOut, runningUpdate, type Finished } from "./recovery.ts";
 import { mergeAndResolve, type Conflict } from "./resolve.ts";
 import { identityProblem } from "./state.ts";
 
@@ -563,7 +563,15 @@ async function updateLive(clone: string, input: CycleInput, live: string, next: 
     return;
   }
   await recordIntent(input.stateDir, live, next);
-  const reset = await git(["reset", "-q", "--keep", next], { cwd: dir, timeoutMs: limitOf(ladder) });
+  const reset = await git(["reset", "-q", "--keep", next], {
+    cwd: dir,
+    timeoutMs: limitOf(ladder),
+    // The record names this update's process group from the moment git exists, so a
+    // cycle that starts after this session dies waits for it instead of repairing over
+    // it (spec 5.4 step 5). Only the instant between the spawn and this write is not
+    // covered.
+    onSpawn: (group) => recordIntent(input.stateDir, live, next, group),
+  });
   if (reset.code === 0 && !reset.timedOut) {
     await clearInterrupted(input.stateDir);
     result.liveUpdated = true;
@@ -583,7 +591,9 @@ async function updateLive(clone: string, input: CycleInput, live: string, next: 
   const blocked = [...reset.stderr.matchAll(REFUSED)].map((m) => m[1] ?? m[2] ?? m[3] ?? "");
   if (!blocked.length) {
     // Any other error (a smudge filter that fails) can stop it partway: the intent
-    // stays, and the next cycle finishes it before its snapshot.
+    // stays, and the next cycle finishes it before its snapshot. git has exited, so the
+    // record drops its process group and nothing waits for it.
+    await recordIntent(input.stateDir, live, next);
     result.outcome = "unsynced";
     result.reason = `updating the vault failed (${firstLines(reset.stderr) || `git exited ${reset.code}`}); the next sync finishes it`;
     return;
@@ -617,6 +627,18 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       result.reason = "lost the sync lock";
       return false;
     };
+    // Spec 5.4 step 5: an update whose session died keeps running, in the process group
+    // git.ts recorded with the intent (the kill timer died with that session). Repairing
+    // or snapshotting now would set its notes back under it and push the old versions as
+    // this machine's change, so this cycle does nothing at all: it repairs nothing,
+    // snapshots nothing, pushes nothing, and, like a cycle that found the lock busy, it
+    // leaves the blocked-cycle streak alone.
+    const running = await runningUpdate(input.stateDir);
+    if (running !== null) {
+      result.outcome = "unsynced";
+      result.reason = `an earlier vault update is still running (process group ${running}); sync waits for it. If it is hung, end that process.`;
+      return result;
+    }
     // Every cycle that runs breaks the streak, whatever its outcome, unless it ends
     // blocked again; a busy cycle never ran and leaves it alone.
     const streak = await readBlocked(input.stateDir);
