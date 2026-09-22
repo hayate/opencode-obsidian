@@ -1,7 +1,7 @@
 """The mutation gate's own behaviour, against a tiny repository with a real node test.
 
 Run: python3 -m unittest discover -s tests/mutation -p 'test_*.py'"""
-import contextlib, io, os, pathlib, sys, tempfile, textwrap, time, unittest
+import contextlib, io, os, pathlib, re, sys, tempfile, textwrap, time, unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gate  # noqa: E402
@@ -110,7 +110,11 @@ class Gate(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("CAUGHT 1/1 (1 timed out): lib.mjs", out)
         self.assertEqual((self.root / "lib.mjs").read_text(), LIB)
+        # Killed with its group; as an orphan it is reaped a moment later, so allow for that.
         hung = int(pids.read_text().split()[-1])
+        deadline = time.monotonic() + 10
+        while self.alive(hung) and time.monotonic() < deadline:
+            time.sleep(0.1)
         self.assertFalse(self.alive(hung), "the timed-out run's test process is killed")
 
     def test_a_baseline_that_times_out_is_red_never_a_pass(self):
@@ -139,6 +143,18 @@ class Gate(unittest.TestCase):
         for n in range(1, 6):
             shards = [gate.shard_of(items, (i, n)) for i in range(1, n + 1)]
             self.assertEqual(sorted(k for s in shards for k in (items.index(x) for x in s)), list(range(11)))
+
+    def test_the_workflow_runs_each_platform_s_shards_1_to_n_once_and_passes_that_n(self):
+        root = pathlib.Path(__file__).resolve().parents[2]
+        workflow = (root / ".github" / "workflows" / "mutation.yml").read_text()
+        rows = re.findall(r"^\s*- \{ os: ([\w.-]+), shard: (\d+), of: (\d+) \}$", workflow, re.M)
+        platforms = {os_ for os_, _, _ in rows}
+        self.assertEqual(platforms, {"ubuntu-latest", "macos-latest"}, workflow)
+        for os_ in platforms:
+            mine = [(int(i), int(n)) for o, i, n in rows if o == os_]
+            n = mine[0][1]
+            self.assertEqual(sorted(mine), [(i, n) for i in range(1, n + 1)], f"{os_}: every shard 1..{n}, once, all of {n}")
+        self.assertIn("python3 -u tests/mutation/gate.py --shard ${{ matrix.shard }}/${{ matrix.of }}", workflow)
 
     def test_the_repository_list_loads_and_every_target_is_in_place(self):
         root = pathlib.Path(__file__).resolve().parents[2]
