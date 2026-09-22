@@ -1650,18 +1650,18 @@ async function behindSlowFilter(smudge: string, base: number): Promise<{ remote:
 }
 
 test("a live update slower than the base limit completes once its limit has doubled enough, and then the limit is back at the base", async () => {
-  // Longer than twice the base, shorter than four times it.
-  const { remote, b, slow } = await behindSlowFilter("sleep 0.7; cat", 300);
+  // Longer than twice the base, shorter than four times it (git adds about 0.1 s).
+  const { remote, b, slow } = await behindSlowFilter("sleep 0.85; cat", 400);
   const first = await runCycle(slow);
   assert.equal(first.outcome, "unsynced", first.reason ?? "");
   assert.equal(first.reason, "updating the vault timed out");
-  assert.deepEqual(first.timedOut, { nextLimitMs: 600, ceiling: false });
-  assert.deepEqual(statusFromCycle(first), [{ level: "warn", text: "unsynced: updating the vault timed out; the next sync finishes it, with its limit doubled to 600 ms" }]);
+  assert.deepEqual(first.timedOut, { nextLimitMs: 800, ceiling: false });
+  assert.deepEqual(statusFromCycle(first), [{ level: "warn", text: "unsynced: updating the vault timed out; the next sync finishes it, with its limit doubled to 800 ms" }]);
   assert.equal(await rung(b), "1");
   // The repair rewrites the note through the same filter, with the same limit.
   const second = await runCycle(slow);
   assert.equal(second.outcome, "unsynced", second.reason ?? "");
-  assert.deepEqual(second.timedOut, { nextLimitMs: 1200, ceiling: false });
+  assert.deepEqual(second.timedOut, { nextLimitMs: 1600, ceiling: false });
   assert.equal(second.committed, null, "no snapshot while the update is unfinished");
   assert.equal(await rung(b), "2");
   const third = await runCycle(slow);
@@ -1735,10 +1735,10 @@ test("a live update's limit that cannot be read is the base: a garbled record co
 });
 
 test("a repair gets the live update's current limit: one that needs longer than the base, but not longer than the doubled limit, finishes the update", async () => {
-  // Longer than the base, shorter than twice it.
-  const { remote, b, slow } = await behindSlowFilter("sleep 0.6; cat", 500);
+  // Longer than the base, shorter than twice it (git adds about 0.1 s).
+  const { remote, b, slow } = await behindSlowFilter("sleep 0.65; cat", 600);
   const first = await runCycle(slow);
-  assert.deepEqual(first.timedOut, { nextLimitMs: 1000, ceiling: false }, first.reason ?? "");
+  assert.deepEqual(first.timedOut, { nextLimitMs: 1200, ceiling: false }, first.reason ?? "");
   const second = await runCycle(slow);
   assert.equal(second.outcome, "synced", second.reason ?? "");
   assert.deepEqual(second.notices, ["finished an interrupted vault update; 1 file set back to update again"], "the repair set the note back");
