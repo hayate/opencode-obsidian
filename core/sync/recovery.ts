@@ -266,13 +266,19 @@ function spellings(old: Map<string, Entry>): (rel: string) => string[] {
 // walked from the vault root as the cycle's snapshot reads spellings. Only an entry
 // that is the wanted one under another spelling is renamed: a different file (a stale
 // core.ignorecase=true on a disk where case matters) is never renamed over the one set
-// back, and where case matters nothing is.
+// back, and where case matters nothing is. The walk ends at a wanted spelling that
+// names nothing (where case matters, the old tree's first spelling of a folder the user
+// deleted): nothing below it can need a respelling, and walking into it would throw on
+// every run and strand sync. Where the disk ignores case every wanted spelling names
+// what the set-back just put there (the note and its folders), so the walk never ends
+// early there.
 async function respell(dir: string, names: string[]): Promise<void> {
   let folder = dir;
   for (const part of names) {
     const wanted = join(folder, part);
     const twin = (await readdir(folder)).find((n) => n !== part && fold(n) === fold(part));
     if (twin !== undefined && (await oneEntry(join(folder, twin), wanted))) await rename(join(folder, twin), wanted);
+    if (await missing(wanted)) return;
     folder = wanted;
   }
 }

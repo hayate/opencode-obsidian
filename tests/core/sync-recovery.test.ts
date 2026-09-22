@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { git, GitError, gitOk } from "../../core/git.ts";
@@ -591,6 +591,22 @@ test("where the old tree spells a folder two ways, a note set back into it keeps
   assert.equal(await status(v.dir), await status(oracle));
 });
 
+test("where the old tree holds two spellings of a note from two Unicode planes, the repair orders them by bytes, as git's own checkout does", async (t) => {
+  // U+FA6C's NFC form is U+242EE: one name on this disk. By bytes (git's order) U+FA6C
+  // comes first; by UTF-16 code units U+242EE's surrogate pair does. The one file goes
+  // back to the last old twin's version, so the order decides what it holds.
+  const compat = "𤋮.md";
+  const astral = "\u{242EE}.md";
+  const v = await caseHistory(t, { [compat]: "compat\n", [astral]: "astral\n", "z.md": "old\n" }, { [compat]: "compat\n", [astral]: "astral changed\n", "z.md": "new\n" });
+  if (!v) return;
+  const oracle = await checkedOutByGit(v.dir);
+  const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
+  assert.equal(await readFile(join(v.dir, astral), "utf8"), "astral\n", "killed on z.md, which git writes first: the one file is as git's checkout of the old tree left it");
+  await finishInterrupted(state, v.dir);
+  assert.deepEqual(await files(v.dir), await files(oracle));
+  assert.equal(await status(v.dir), await status(oracle));
+});
+
 // Whether the disk the tests write to tells Note.md and note.md apart, asked of the
 // disk itself with a probe file (never read from the platform's name).
 async function caseMatters(): Promise<boolean> {
@@ -634,6 +650,31 @@ test("a stale core.ignorecase=true on a disk where case matters never sets an un
   await finishInterrupted(state, v.dir);
   assert.equal(await readFile(join(v.dir, "note.md"), "utf8"), "the user's edit\n");
 });
+
+// Where case matters, X/a.md and x/b.md sit in two folders. The update changes x/b.md
+// and is killed on z.md; then the user deletes folder X, the old tree's first spelling
+// of the folder x/b.md goes back into.
+for (const stale of [false, true]) {
+  test(`where case matters and the old tree spells a folder two ways, the user's deletion of the first spelling never stops a repair into the other (core.ignorecase ${stale ? "a stale true" : "false"})`, async (t) => {
+    const before = { "X/a.md": "a\n", "x/b.md": "old b\n", "z.md": "old\n" };
+    const after = { "x/b.md": "new b\n", "z.md": "new\n" };
+    if (!stale && !(await caseMatters())) {
+      t.skip("this disk ignores case: X and x are one folder here");
+      return;
+    }
+    const v = stale ? await staleIgnorecase(t, before, after) : await history(before, after);
+    if (!v) return;
+    const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
+    assert.equal(await readFile(join(v.dir, "x/b.md"), "utf8"), "new b\n", "the kill came after git wrote x/b.md");
+    await rm(join(v.dir, "X"), { recursive: true });
+    assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/b.md", "z.md"], kept: [], moved: false });
+    assert.equal(await finishInterrupted(state, v.dir), null, "the record is gone");
+    assert.equal(await readFile(join(v.dir, "x/b.md"), "utf8"), "old b\n");
+    assert.equal(await readFile(join(v.dir, "z.md"), "utf8"), "old\n");
+    assert.equal(await exists(join(v.dir, "X")), false, "the user's deletion of X stands");
+    assert.equal(await status(v.dir), "D X/a.md", "and it is all that differs from the old version");
+  });
+}
 
 test("a path named like an object's own property (constructor) is judged as any other", async () => {
   const w = await interrupted({ constructor: "from the update\n" }, { prints: false });
