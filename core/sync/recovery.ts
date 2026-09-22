@@ -46,6 +46,16 @@ async function missing(path: string): Promise<boolean> {
   }
 }
 
+// A folder at the path itself: lstat, so a symlink, even to a folder, is not one.
+async function isFolder(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isDirectory();
+  } catch (err) {
+    if (absent(err)) return false;
+    throw err;
+  }
+}
+
 // What is at a path, by content: a file's bytes, a symlink's target, or nothing.
 // A folder is nothing here: its files answer for themselves, and a folder that goes
 // once the removals have emptied it never makes the path read as edited.
@@ -266,19 +276,20 @@ function spellings(old: Map<string, Entry>): (rel: string) => string[] {
 // walked from the vault root as the cycle's snapshot reads spellings. Only an entry
 // that is the wanted one under another spelling is renamed: a different file (a stale
 // core.ignorecase=true on a disk where case matters) is never renamed over the one set
-// back, and where case matters nothing is. The walk ends at a wanted spelling that
-// names nothing (where case matters, the old tree's first spelling of a folder the user
-// deleted): nothing below it can need a respelling, and walking into it would throw on
-// every run and strand sync. Where the disk ignores case every wanted spelling names
-// what the set-back just put there (the note and its folders), so the walk never ends
-// early there.
+// back, and where case matters nothing is. The walk goes down only into a folder, never
+// through a symlink: it ends at a wanted spelling that names nothing or anything else
+// (where case matters, the old tree's first spelling of a folder the user deleted, or
+// replaced with a file). Nothing below it can need a respelling, and walking into it
+// would throw on every run and strand sync. Where the disk ignores case each wanted
+// folder spelling names a folder the set-back went through, so the walk ends early
+// there only at a symlink the user put in a folder's place.
 async function respell(dir: string, names: string[]): Promise<void> {
   let folder = dir;
   for (const part of names) {
     const wanted = join(folder, part);
     const twin = (await readdir(folder)).find((n) => n !== part && fold(n) === fold(part));
     if (twin !== undefined && (await oneEntry(join(folder, twin), wanted))) await rename(join(folder, twin), wanted);
-    if (await missing(wanted)) return;
+    if (!(await isFolder(wanted))) return;
     folder = wanted;
   }
 }

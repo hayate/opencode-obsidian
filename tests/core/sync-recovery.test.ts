@@ -676,6 +676,24 @@ for (const stale of [false, true]) {
   });
 }
 
+test("where case matters and the old tree spells a folder two ways, a file the user saved in place of the first spelling never stops a repair into the other", async (t) => {
+  if (!(await caseMatters())) {
+    t.skip("this disk ignores case: X and x are one folder here");
+    return;
+  }
+  const v = await history({ "X/a.md": "a\n", "x/b.md": "old b\n", "z.md": "old\n" }, { "x/b.md": "new b\n", "z.md": "new\n" });
+  const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
+  assert.equal(await readFile(join(v.dir, "x/b.md"), "utf8"), "new b\n", "the kill came after git wrote x/b.md");
+  await rm(join(v.dir, "X"), { recursive: true });
+  await writeFile(join(v.dir, "X"), "the user's file\n");
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/b.md", "z.md"], kept: [], moved: false });
+  assert.equal(await finishInterrupted(state, v.dir), null, "the record is gone");
+  assert.equal(await readFile(join(v.dir, "x/b.md"), "utf8"), "old b\n");
+  assert.equal(await readFile(join(v.dir, "z.md"), "utf8"), "old\n");
+  assert.equal(await readFile(join(v.dir, "X"), "utf8"), "the user's file\n", "the user's file stays as it is");
+  assert.equal(await status(v.dir), "D X/a.md\n?? X", "and it is all that differs from the old version");
+});
+
 test("a path named like an object's own property (constructor) is judged as any other", async () => {
   const w = await interrupted({ constructor: "from the update\n" }, { prints: false });
   assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["constructor", "x/a.md"], kept: [], moved: false });
