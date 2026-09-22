@@ -351,7 +351,7 @@ mutate(K, ('[...noHooks, "remote", "rename",', '[...noHooks, "remote", "add",'),
 LADDER = "slower than the base limit"; CEILING = "never finishes climbs"; KEPT = "a refusal leaves the live update's limit"
 mutate(CY, "level: Math.min(ladder.level + 1, MAX_LEVEL) };", "level: Math.min(ladder.level, MAX_LEVEL) };", C, runs=5, pattern=LADDER)
 mutate(CY, "level: Math.min(ladder.level + 1, MAX_LEVEL) };", "level: ladder.level + 1 };", C, pattern=CEILING)
-mutate(CY, "ceiling: ladder.level === MAX_LEVEL };", "ceiling: false };", C, pattern=CEILING)
+mutate(CY, "ceiling: ladder.level === MAX_LEVEL, note };", "ceiling: false, note };", C, pattern=CEILING)
 mutate(CY, "    // The limit was enough: the next update starts again from the base.\n    await writeLevel(input.stateDir, 0);\n", "", C, runs=5, pattern=LADDER)
 mutate(CY, "  await clearInterrupted(input.stateDir);\n  result.blockedBy = blocked;", "  await clearInterrupted(input.stateDir);\n  await writeLevel(input.stateDir, 0);\n  result.blockedBy = blocked;", C, pattern=KEPT)
 mutate(CY, "  if (!blocked.length) {", "  if (!blocked.length) {\n    await writeLevel(input.stateDir, 0);", C, pattern=KEPT)
@@ -364,10 +364,10 @@ mutate(CY, "/^[0-6]$/.test(text) ? Number(text) : 0", "/^[0-6]$/.test(text.trim(
 mutate(CY, "/^[0-6]$/.test(text)", "/^[0-9]$/.test(text)", C, pattern="cannot be read is the base")
 # The repair that timed out stops the cycle before its snapshot: without this return, the
 # half-repaired vault would be snapshotted and pushed.
-mutate(CY, "      await timedOut(input.stateDir, ladder, result);\n      return result;", "      await timedOut(input.stateDir, ladder, result);", C, runs=5,
+mutate(CY, "      await timedOut(input.stateDir, ladder, result, err.path);\n      return result;", "      await timedOut(input.stateDir, ladder, result, err.path);", C, runs=5,
        pattern="repair that times out stops")
-mutate(F_RC, "err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result) : err", "err", RC, pattern="a repair that times out saves")
-mutate("core/session.ts", "  if (!r.timedOut.ceiling) return", "  if (true) return", SE, pattern="statusFromCycle gives a live update that timed out")
+mutate(F_RC, "err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result, source) : err", "err", RC, pattern="a repair that times out saves")
+mutate("core/session.ts", "  if (!r.timedOut.ceiling) {", "  if (true) {", SE, pattern="statusFromCycle gives a live update that timed out")
 mutate("core/session.ts", "  if (ms % 60_000 === 0) return `${ms / 60_000} min`;\n", "", SE, pattern="statusFromCycle gives a live update that timed out")
 # Fix round 1: the ceiling names the note the repair was rewriting, and a problem recorded
 # with the reason (a failed lock release) still reaches the line.
