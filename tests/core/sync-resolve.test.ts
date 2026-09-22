@@ -446,6 +446,46 @@ test("the check rejects a displaced folder left in place while the local file mo
   assert.equal(checkWith(renamedInEditedThere, [["p/b.md", e("1")], [file, e("2")], ["z.md", e("4")], ["keep.md", e("5")]]), notMoved);
 });
 
+// The folder split one level deeper: p/ stays, only p/sub went to a copy of itself, and
+// the local file to a copy of p. The records are real git's (2.50.1).
+const splitDeeper = "p/sub.conflict-2026-09-22-0915-111111";
+
+test("the check holds a displaced folder to a copy of itself, not of a subfolder: a note renamed into it there and deleted here", () => {
+  const facts: MergeFacts = {
+    records: [
+      { paths: ["p/sub/b.md", "q.md"], type: "CONFLICT (rename/delete)" },
+      { paths: ["p~local", "p"], type: "CONFLICT (file/directory)" },
+    ],
+    stages: new Map([["p/sub/b.md", { 1: e("1"), 2: e("1") }], ["p~local", { 3: e("2") }]]),
+    result: new Map([["p/sub/b.md", e("1")], ["p~local", e("2")], ["keep.md", e("5")]]),
+    remote: new Map([["p/sub/b.md", e("1")], ["p/sub/a.md", e("6")], ["keep.md", e("5")]]),
+    local: new Map([["p", e("2")], ["keep.md", e("5")]]),
+  };
+  assert.equal(checkWith(facts, [["p", e("2")], [`${aside}/sub/b.md`, e("1")], ["keep.md", e("5")]]), "");
+  assert.equal(
+    checkWith(facts, [["p.conflict-2026-09-22-0915-222222", e("2")], [`${splitDeeper}/b.md`, e("1")], ["keep.md", e("5")]]),
+    "p/sub/b.md was not moved with its folder",
+  );
+});
+
+test("the check holds a displaced folder to a copy of itself, not of a subfolder: a note edited in it there and deleted here", () => {
+  const facts: MergeFacts = {
+    records: [
+      { paths: ["p/sub/a.md"], type: "CONFLICT (modify/delete)" },
+      { paths: ["p~local", "p"], type: "CONFLICT (file/directory)" },
+    ],
+    stages: new Map([["p/sub/a.md", { 1: e("6"), 2: e("1") }], ["p~local", { 3: e("2") }]]),
+    result: new Map([["p/sub/a.md", e("1")], ["p~local", e("2")], ["keep.md", e("5")]]),
+    remote: new Map([["p/sub/a.md", e("1")], ["keep.md", e("5")]]),
+    local: new Map([["p", e("2")], ["keep.md", e("5")]]),
+  };
+  assert.equal(checkWith(facts, [["p", e("2")], [`${aside}/sub/a.md`, e("1")], ["keep.md", e("5")]]), "");
+  assert.equal(
+    checkWith(facts, [["p.conflict-2026-09-22-0915-222222", e("2")], [`${splitDeeper}/a.md`, e("1")], ["keep.md", e("5")]]),
+    "p/sub/a.md was not moved with its folder",
+  );
+});
+
 test("a rename colliding with a new note, with content changed on both sides, keeps all three versions", async () => {
   const edited = (side: string): string => TEXT.replace("line two", `line two ${side}`);
   const clone = await scenario(

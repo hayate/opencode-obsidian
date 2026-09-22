@@ -383,11 +383,16 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
   return { kind: "clean", tree, conflicts };
 }
 
+// x is p's own place inside a copy of p's folder f (the folder moved aside).
+function movedAside(f: string, p: string, x: string): boolean {
+  const rel = p.slice(f.length);
+  return p.startsWith(`${f}/`) && x.length > rel.length && x.endsWith(rel) && isCopyOf(f, x.slice(0, x.length - rel.length));
+}
+
 // x is p's own place inside a copy of one of p's folders (a folder moved aside).
 function movedWith(p: string, x: string): boolean {
   for (let slash = p.indexOf("/"); slash >= 0; slash = p.indexOf("/", slash + 1)) {
-    const rel = p.slice(slash);
-    if (x.length > rel.length && x.endsWith(rel) && isCopyOf(p.slice(0, slash), x.slice(0, x.length - rel.length))) return true;
+    if (movedAside(p.slice(0, slash), p, x)) return true;
   }
   return false;
 }
@@ -407,8 +412,9 @@ function insideCopyOf(p: string, x: string): boolean {
 // - git's merged results (neither side's version) are gone from those paths and are
 //   in no new copy of them; an unrelated note with the same bytes is someone's note;
 // - git's relocations (conflict paths neither commit has) are gone;
-// - a remote folder a local file displaced moved aside whole: git's merge of it, and
-//   at a conflict path inside it the remote commit's own entry;
+// - each entry of a remote folder a local file displaced sits at its own place inside
+//   a copy of that folder (not of a subfolder): git's merge of it, and at a conflict
+//   path inside it the remote commit's own entry;
 // - every other path is exactly git's merge, and the tree is exactly the resolution.
 // A note's own text is never inspected, so notes that quote markers pass.
 export function checkResolved(written: Map<string, Entry>, resolution: Map<string, Entry>, facts: MergeFacts): string[] {
@@ -453,16 +459,18 @@ export function checkResolved(written: Map<string, Entry>, resolution: Map<strin
   }
 
   // A local file at a conflict path displaced the remote folder git merged there, and
-  // each entry inside it must sit at its own place in a copy of the folder. At a
-  // conflict path that entry is the remote commit's own, never git's result: git's
-  // result there can be its own merge (rename/rename) or lack the note. Elsewhere it
-  // is git's result.
+  // each entry inside it must sit at its own place inside a copy of that folder
+  // itself: a copy of a subfolder, with the folder left in place, does not count. At a
+  // conflict path that entry is the remote commit's own, never git's result, which
+  // there can be git's own merge (rename/rename); the loop also covers, defensively, a
+  // conflict path git's result lacks. Elsewhere it is git's result.
   const displacedEntry = (x: string): boolean => displacing.some((p) => x.startsWith(`${p}/`));
   for (const x of new Set([...result.keys(), ...sides[2].tree.keys()])) {
     if (!displacedEntry(x)) continue;
     const entry = conflictPaths.has(x) ? sides[2].tree.get(x) : result.get(x);
     if (!entry) continue;
-    if (!entries.some(([at, e]) => same(e, entry) && movedWith(x, at))) problems.add(`${x} was not moved with its folder`);
+    const moved = (at: string): boolean => displacing.some((f) => movedAside(f, x, at));
+    if (!entries.some(([at, e]) => same(e, entry) && moved(at))) problems.add(`${x} was not moved with its folder`);
   }
   const involved = (x: string): boolean =>
     conflictPaths.has(x) ||
