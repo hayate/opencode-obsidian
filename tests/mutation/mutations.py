@@ -198,7 +198,7 @@ mutate(CY, "    await recordIntent(input.stateDir, live, next);\n    result.outc
 # The intent written before git is spawned: the group write repeats it as soon as git exists,
 # so only a session death in the instant between them, or a group write that fails, leaves the
 # vault changing with no record at all.
-mutate(CY, "  await recordIntent(input.stateDir, live, next);\n  const reset = await git(", "  const reset = await git(", C,
+mutate(CY, "  await recordIntent(input.stateDir, live, next);\n  const reset = await git(", "  const reset = await git(", C, pattern="fails partway",
        survives=("linux", "darwin"),
        why="defence in depth behind the group write, which records the same intent as soon as git is spawned: what it alone covers is a session death inside that instant, or a group write that fails, neither of which a deterministic test can stage")
 mutate(CY, "finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) })", "finishInterrupted(input.stateDir, dir)", C, pattern="repair that times out stops")

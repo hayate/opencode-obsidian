@@ -1823,6 +1823,7 @@ test("a session that died mid-update leaves it running: the next cycle waits for
   await writeFile(join(b.projects, ".git", "info", "attributes"), "x/u.md filter=slow\n");
   const input = { timezone: TZ, projectsDir: b.projects, remote, branch: "main", stateDir: b.state, machine: "b", quietMs: 0 };
   const session = spawn(process.execPath, [join(import.meta.dirname, "fixtures", "cycle-session.ts"), JSON.stringify(input)], { stdio: "ignore" });
+  session.unref();
   const group = await recordedGroup(b);
   // Long enough for the update to have written the two quick notes and be inside the
   // third one's filter: exactly what a repair would set back under it.
@@ -1856,6 +1857,8 @@ test("a cycle waits for a record's live process group, and the cycle after it fi
   const pushed = await gitOk(["rev-parse", "main"], { cwd: remote });
   // A record naming a process group that is alive: another session's update.
   const alive = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  // Unreferenced, so a failing assertion below never makes this file wait it out.
+  alive.unref();
   const group = alive.pid ?? 0;
   assert.ok(group >= 2);
   await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group }));
@@ -1888,6 +1891,7 @@ test("a running update is waited for even when the vault's history moved by hand
   // record kept; but an update is still running, so the cycle waits for it instead.
   await gitOk(["commit", "-q", "--allow-empty", "-m", "by hand"], { cwd: b.projects });
   const alive = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  alive.unref();
   const group = alive.pid ?? 0;
   await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group }));
   const waiting = await runCycle(slow);
