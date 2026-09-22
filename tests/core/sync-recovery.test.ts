@@ -921,7 +921,15 @@ test("a record that cannot be read stops sync with a message that names the file
   // A group of 0 or 1 is no update's: process.kill(-1, ...) reaches every process this
   // user may signal, so such a record is read as unreadable like any other.
   const groups = [0, 1, -7, 2.5, "2"].map((group) => JSON.stringify({ from: w.from, to: w.to, group }));
-  for (const text of ["{ not json", JSON.stringify({ prints: {} }), JSON.stringify({ from: "HEAD", to: "main" }), ...groups]) {
+  // The boot a group belongs to and the moment it started are numbers or nothing. A
+  // string there would compare as NaN, which is never greater than the tolerance, so the
+  // group would count as this boot's and the cycle would wait on it with a nonsense age.
+  // 1e999 is the one way JSON holds a number that is not finite.
+  const stamps = [{ boot: "x" }, { startedAt: "y" }, { boot: true }, { startedAt: null }].map((stamp) =>
+    JSON.stringify({ from: w.from, to: w.to, group: 4242, ...stamp }),
+  );
+  stamps.push(`{"from":"${w.from}","to":"${w.to}","group":4242,"boot":1e999}`);
+  for (const text of ["{ not json", JSON.stringify({ prints: {} }), JSON.stringify({ from: "HEAD", to: "main" }), ...groups, ...stamps]) {
     await writeFile(record, text);
     await assert.rejects(finishInterrupted(w.state, w.dir), (err: Error) => {
       assert.ok(err.message.includes(record), err.message);

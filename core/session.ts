@@ -144,18 +144,26 @@ function duration(ms: number): string {
   return `${ms} ms`;
 }
 
-// How long something has been running, as the user reads it: whole seconds up to a
-// minute, then whole minutes. Rounded, unlike a limit, which is exact by construction.
+// How long something has been running, as the user reads it: seconds, then minutes, then
+// hours and days, each rounded (unlike a limit, which is exact by construction). A hang
+// nobody has seen can outlast a day, and "1440 min" is not something anyone reads.
 function age(ms: number): string {
   const seconds = Math.round(ms / 1000);
-  return seconds < 60 ? `${seconds} s` : `${Math.round(seconds / 60)} min`;
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"}`;
 }
 
 // Spec 5.4 step 5: a live update, or the repair of one, killed on its limit gets twice
 // the time next, up to the longest limit; one killed even with that escalates to a
-// notify (the adapter notifies on errors), and sync keeps retrying with it. It says the
-// next sync tries again, never that it finishes: at the ceiling six timeouts in a row
-// are the normal case. An update another session left running is waited for, at warn
+// notify (the adapter notifies on errors), and sync keeps retrying with it. Neither line
+// says the next sync finishes the update, only that it tries: at the ceiling six timeouts
+// in a row are the normal case, and an update hung past that limit will often hang its
+// repair on the same filter. An update another session left running is waited for, at warn
 // level, until it has run longer than that longest limit, when it is hung and says so.
 // No line says when the retry comes: a cycle runs when an OpenCode session starts.
 // Anything runCycle appended to the reason (a failed lock release) goes last, after this
@@ -171,7 +179,7 @@ function unsynced(r: CycleResult): StatusItem {
     }
     return {
       level: "error",
-      text: `unsynced: an earlier vault update has been running for ${age(runningMs)} (process group ${group}), longer than the longest limit a live update gets: it is hung. End that process, and the next sync finishes the update${also}`,
+      text: `unsynced: an earlier vault update has been running for ${age(runningMs)} (process group ${group}), longer than the longest limit a live update gets: it is hung. End that process, and the next sync tries the update again${also}`,
     };
   }
   if (r.timedOut === null) return { level: "warn", text: `unsynced: ${said}` };

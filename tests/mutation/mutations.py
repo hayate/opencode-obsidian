@@ -441,8 +441,16 @@ mutate(F_RC, "  return { group: record.group, runningMs: Math.max(0, Date.now() 
 mutate(CY, "result.waiting = { ...running, hung: running.runningMs > limitOf({ ...ladder, level: MAX_LEVEL }) };",
        "result.waiting = { ...running, hung: false };", C, pattern=HUNG)
 mutate("core/session.ts", "    if (!hung) {", "    if (true) {", SE, pattern="statusFromCycle waits at warn for an update")
-mutate("core/session.ts", "  return seconds < 60 ? `${seconds} s` : `${Math.round(seconds / 60)} min`;", "  return `${seconds} s`;", SE,
-       pattern="statusFromCycle waits at warn for an update")
+# Fix round 3: an age is read in the unit that suits it, and the stamps a record carries are
+# numbers or nothing (a string there compares as NaN, which no tolerance ever exceeds).
+AGES = "statusFromCycle waits at warn for an update"
+mutate("core/session.ts", "  if (seconds < 60) return `${seconds} s`;\n", "", SE, pattern=AGES)
+mutate("core/session.ts", "  if (minutes < 60) return `${minutes} min`;\n", "", SE, pattern=AGES)
+mutate("core/session.ts", '  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"}`;\n', "", SE, pattern=AGES)
+mutate("core/session.ts", '`${hours} hour${hours === 1 ? "" : "s"}`', '`${hours} hours`', SE, pattern=AGES)
+mutate("core/session.ts", '`${days} day${days === 1 ? "" : "s"}`', '`${days} days`', SE, pattern=AGES)
+mutate(F_RC, '  for (const stamp of [boot, startedAt]) if (stamp !== undefined && (typeof stamp !== "number" || !Number.isFinite(stamp))) return false;\n', "", RC,
+       pattern="a record that cannot be read")
 # Fix round 2: each repair run builds under a name of its own, and sweeps what earlier runs
 # left, best effort.
 mutate(F_RC, '`${SCRATCH}-${randomBytes(4).toString("hex")}`', "SCRATCH", RC, pattern="scratch worktree of its own")

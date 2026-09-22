@@ -354,9 +354,26 @@ test("statusFromCycle waits at warn for an update another session is still runni
   assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 1_920_000, hung: true } }), [
     {
       level: "error",
-      text: "unsynced: an earlier vault update has been running for 32 min (process group 4242), longer than the longest limit a live update gets: it is hung. End that process, and the next sync finishes the update",
+      text: "unsynced: an earlier vault update has been running for 32 min (process group 4242), longer than the longest limit a live update gets: it is hung. End that process, and the next sync tries the update again",
     },
   ]);
+  // An age is read in the unit that suits it: a hang can outlast a day, and nobody reads
+  // "1440 min". Nothing here promises that the next sync finishes the update: at this
+  // point its repair often hangs on the same filter.
+  const ages: Array<[number, string]> = [
+    [0, "0 s"],
+    [12_400, "12 s"],
+    [59_600, "1 min"],
+    [1_920_000, "32 min"],
+    [3_600_000, "1 hour"],
+    [7_200_000, "2 hours"],
+    [86_400_000, "1 day"],
+    [601_200_000, "7 days"],
+  ];
+  for (const [runningMs, reads] of ages) {
+    const [line] = statusFromCycle({ ...base, waiting: { group: 7, runningMs, hung: true } });
+    assert.match(line?.text ?? "", new RegExp(`^unsynced: an earlier vault update has been running for ${reads} \\(process group 7\\)`), `${runningMs} ms`);
+  }
   // A problem runCycle recorded with the reason comes last here too.
   const lock = { ...base, reason: "an earlier vault update is still running; releasing the sync lock failed: EACCES" };
   assert.deepEqual(statusFromCycle({ ...lock, waiting: { group: 4242, runningMs: 0, hung: false } }), [

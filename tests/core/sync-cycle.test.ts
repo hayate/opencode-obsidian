@@ -1973,7 +1973,7 @@ test("an update still running after the longest limit a live update gets is hung
   assert.deepEqual(statusFromCycle(hung), [
     {
       level: "error",
-      text: `unsynced: an earlier vault update has been running for 60 min (process group ${group}), longer than the longest limit a live update gets: it is hung. End that process, and the next sync finishes the update`,
+      text: `unsynced: an earlier vault update has been running for 1 hour (process group ${group}), longer than the longest limit a live update gets: it is hung. End that process, and the next sync tries the update again`,
     },
   ]);
   // A clock moved back under a running update: it reads as just started, never as hung.
