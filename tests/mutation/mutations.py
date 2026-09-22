@@ -319,3 +319,5 @@ mutate("core/session.ts", "  return out.map((item) => ({ ...item, text: oneLine(
 # git's refusals are read as its whole lines, a quoted path spanning a line break.
 mutate(CY, (r"/^error: (?:Entry '", r"would lose untracked files in it)$/gm"), (r"/(?:Entry '", r"would lose untracked files in it)/gm"), C, pattern="named with git's refusal wording")
 mutate(CY, r"(?:Entry '([\s\S]+?)' (?:not uptodate", r"(?:Entry '(.+?)' (?:not uptodate", C, pattern="whose name holds a line break is named")
+# Both scans read renames as git does by default, whatever diff.renames says.
+mutate("core/secrets.ts", '      "--find-renames",\n', "", SEC, pattern="read renames as git does")

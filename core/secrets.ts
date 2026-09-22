@@ -168,6 +168,10 @@ export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 // the + lines. --src-prefix/--dst-prefix: diff.mnemonicPrefix / noprefix /
 // dstPrefix change the +++ header, and scanDiff strips only git's own "b/"; a path
 // it cannot parse means the later unstage matches nothing and the secret stays staged.
+// --find-renames: git's default rename detection, pinned, so no diff.renames (the
+// vault's or the user's) changes what is scanned. "copies" would print a new copy of
+// a note as "copy from" with no added line, its secret unscanned (verified, git
+// 2.50.1); "false" would scan a pure rename as a whole new file.
 async function scanned(cwd: string, what: string[]): Promise<Map<string, SecretHit[]>> {
   const diff = await gitOk(
     [
@@ -179,6 +183,7 @@ async function scanned(cwd: string, what: string[]): Promise<Map<string, SecretH
       "--no-color",
       "--no-ext-diff",
       "--no-textconv",
+      "--find-renames",
       "--src-prefix=a/",
       "--dst-prefix=b/",
       "-U0",

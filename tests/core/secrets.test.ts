@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { redactUrlCredentials, scanDiff, scanRange, scanText, unquoteGitPath } from "../../core/secrets.ts";
+import { redactUrlCredentials, scanDiff, scanRange, scanStaged, scanText, unquoteGitPath } from "../../core/secrets.ts";
 import { gitOk } from "../../core/git.ts";
 import { commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
 
@@ -212,4 +212,20 @@ test("scanRange scans what a commit range adds, with the same pinned diff as the
   await gitOk(["commit", "-q", "-m", "b"], { cwd: dir });
   const hits = await scanRange(dir, from, "HEAD");
   assert.deepEqual([...hits.keys()], ["x/b.md"]);
+});
+
+test("both scans read renames as git does by default, whatever diff.renames says: a new copy's lines are scanned, a pure rename adds none", async () => {
+  const note = `a note long enough\nto be recognised as the same file\ntoken ${j("gh", "p_", noise(36))}\n`;
+  for (const setting of ["copies", "false"]) {
+    const dir = await tempDir();
+    await initRepo(dir);
+    const from = await commitFile(dir, "x/a.md", note, "a");
+    await gitOk(["config", "diff.renames", setting], { cwd: dir });
+    await gitOk(["mv", "x/a.md", "x/b.md"], { cwd: dir });
+    await writeRel(dir, "x/c.md", note);
+    await gitOk(["add", "-A"], { cwd: dir });
+    assert.deepEqual([...(await scanStaged(dir)).keys()], ["x/c.md"], `diff.renames=${setting}, staged`);
+    await gitOk(["commit", "-q", "-m", "moved and copied"], { cwd: dir });
+    assert.deepEqual([...(await scanRange(dir, from, "HEAD")).keys()], ["x/c.md"], `diff.renames=${setting}, a range`);
+  }
 });
