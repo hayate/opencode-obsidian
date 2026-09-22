@@ -324,3 +324,8 @@ mutate("core/secrets.ts", '      "--find-renames",\n', "", SEC, pattern="read re
 # The outbound scan reads each unsent commit's message too.
 mutate(CY, '    if (scanText(await gitOk(["log", "-1", "--format=%B", commit], { cwd: clone })).length) inCommits.push({ file: null, commit });\n', "", C,
        pattern="in the message of an unsent commit")
+# A repository in another object format than sha1 is refused where sync meets it, and the
+# plugin's own init makes sha1.
+mutate("core/sync/state.ts", '  if (format) return { kind: "stopped", reason: format };\n', "", S, pattern="a sha256 repository is refused")
+mutate("core/sync/state.ts", "    if (format) return format;\n", "", S, pattern="a sha256 repository is refused")
+mutate("core/sync/state.ts", '["init", "-q", "--object-format=sha1"]', '["init", "-q"]', S, pattern="an import makes a sha1 repository")

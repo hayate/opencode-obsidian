@@ -117,6 +117,54 @@ test("notes in a non-repo Projects/ are imported into an empty remote, refused f
   assertKind(refused, "stopped");
 });
 
+// A remote in git's sha256 object format, holding one note when seeded.
+async function sha256Remote(seeded: boolean): Promise<string> {
+  const path = join(await tempDir("sro-remote-"), "projects.git");
+  await gitOk(["init", "-q", "--bare", "--object-format=sha256", "-b", "main", path], { cwd: await tempDir() });
+  if (seeded) {
+    const work = join(await tempDir(), "seed");
+    await gitOk(["clone", "-q", path, work], { cwd: await tempDir() });
+    await commitFile(work, "kabin-api/HANDOFF.md", "# kabin-api\n", "seed");
+    await gitOk(["push", "-q", "origin", "HEAD"], { cwd: work });
+  }
+  return path;
+}
+
+test("a sha256 repository is refused in one sentence wherever sync meets it (Projects/ itself, a clone, an empty remote to bootstrap), and nothing is pushed", async () => {
+  const reason = (state: SyncState): string => (state.kind === "stopped" ? state.reason : JSON.stringify(state));
+  const remote = await sha256Remote(true);
+  const existing = await vault();
+  await gitOk(["clone", "-q", remote, existing.projectsDir], { cwd: existing.root });
+  assert.equal(
+    reason(await prepareProjects(existing, { remote }, TZ)),
+    "Projects/ is a sha256 git repository, and sync works only with sha1 ones (git's default): point OBSIDIAN_PROJECTS_REMOTE at a sha1 repository, and let the plugin clone it into an empty Projects/",
+  );
+  const cloned = await vault();
+  assert.equal(
+    reason(await prepareProjects(cloned, { remote }, TZ)),
+    "the remote is a sha256 git repository, and sync works only with sha1 ones (git's default): point OBSIDIAN_PROJECTS_REMOTE at a sha1 repository, and let the plugin clone it into an empty Projects/",
+  );
+  assert.equal(await stat(cloned.projectsDir).then(() => true, () => false), false, "Projects/ is left as it was");
+  const empty = await sha256Remote(false);
+  const bootstrap = await vault();
+  assert.match(reason(await prepareProjects(bootstrap, { remote: empty }, TZ)), /^the remote is a sha256 git repository/);
+  assert.equal(await gitOk(["ls-remote", "--heads", empty], { cwd: bootstrap.root }), "", "nothing pushed");
+});
+
+test("an import makes a sha1 repository even where git's default object format is sha256", async () => {
+  const v = await vault();
+  await writeRel(v.projectsDir, "vero/HANDOFF.md", "# vero\n");
+  const empty = await bareRemote();
+  process.env.GIT_DEFAULT_HASH = "sha256";
+  try {
+    assertKind(await prepareProjects(v, { remote: empty }, TZ), "ready");
+  } finally {
+    delete process.env.GIT_DEFAULT_HASH;
+  }
+  assert.equal(await gitOk(["rev-parse", "--show-object-format"], { cwd: v.projectsDir }), "sha1");
+  assert.match(await gitOk(["ls-tree", "-r", "--name-only", "main"], { cwd: empty }), /vero\/HANDOFF\.md/);
+});
+
 test("an origin that differs from the variable by even a .git suffix stops", async () => {
   const v = await vault();
   const remote = await seededRemote();

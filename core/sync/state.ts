@@ -186,6 +186,16 @@ async function sweepLeftoverClones(root: string, projectsDir: string): Promise<v
   }
 }
 
+// The plugin names git's sha1 empty tree and writes sha1 ids, so a repository in any
+// other object format fails every cycle with git's own error ("bad --attr-source",
+// verified with a sha256 repository, git 2.50.1). Sync refuses it where it meets it,
+// in one sentence: Projects/ itself, or a clone of the remote before it is put in place.
+async function objectFormatProblem(dir: string, what: string): Promise<string | null> {
+  const format = await gitOk(["rev-parse", "--show-object-format"], { cwd: dir });
+  if (format === "sha1") return null;
+  return `${what} is a ${format} git repository, and sync works only with sha1 ones (git's default): point OBSIDIAN_PROJECTS_REMOTE at a sha1 repository, and let the plugin clone it into an empty Projects/`;
+}
+
 async function cloneIntoPlace(root: string, projectsDir: string, remote: string): Promise<{ populated: boolean } | string> {
   await sweepLeftoverClones(root, projectsDir);
   const tmp = join(root, `.${basename(projectsDir)}.${randomBytes(4).toString("hex")}.sro-tmp`);
@@ -194,6 +204,8 @@ async function cloneIntoPlace(root: string, projectsDir: string, remote: string)
     if (clone.code !== 0 || clone.timedOut) {
       return `clone of ${remote} failed: ${clone.stderr.trim() || (clone.timedOut ? "timed out" : `git exited ${clone.code}`)}`;
     }
+    const format = await objectFormatProblem(tmp, "the remote");
+    if (format) return format;
     const populated = (await git(["rev-parse", "--verify", "-q", "HEAD"], { cwd: tmp })).code === 0;
     if (!populated) {
       const branches = await remoteHasBranches(tmp, remote);
@@ -270,6 +282,9 @@ async function checkRepo(projectsDir: string, remote: string): Promise<SyncState
     const detail = firstLines(head.stderr) || (head.timedOut ? "timed out" : `git exited ${head.code}`);
     return { kind: "stopped", reason: `Projects/'s HEAD could not be verified: ${detail}` };
   }
+  // After HEAD: git runs here (a refusal such as dubious ownership has its own words above).
+  const format = await objectFormatProblem(projectsDir, "Projects/");
+  if (format) return { kind: "stopped", reason: format };
   const origin = await git(["config", "--get", "remote.origin.url"], { cwd: projectsDir });
   if (origin.code !== 0 || origin.stdout.trim() !== remote) {
     return {
@@ -355,7 +370,9 @@ async function prepare(vault: Vault, cfg: SyncConfig, timezone: string): Promise
   }
   const remote = cfg.remote;
   return firstPush(dir, remote, async () => {
-    await gitOk(["init", "-q"], { cwd: dir });
+    // sha1 whatever git's default is here (init.defaultObjectFormat, GIT_DEFAULT_HASH):
+    // the plugin never makes a repository it would refuse.
+    await gitOk(["init", "-q", "--object-format=sha1"], { cwd: dir });
     await gitOk(["remote", "add", "origin", remote], { cwd: dir });
     return commitAndPushNew(dir, timezone, "import Projects/");
   });
