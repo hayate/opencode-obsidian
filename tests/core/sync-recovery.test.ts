@@ -187,7 +187,8 @@ test("a HEAD that cannot be read leaves the record for the next run, never read 
   const headFile = join(w.dir, ".git", "HEAD");
   const saved = await readFile(headFile, "utf8");
   await writeFile(headFile, "ref: refs/heads/no-such-branch\n");
-  await assert.rejects(finishInterrupted(w.state, w.dir));
+  // git's own error, never the stop for a history that moved, whose way out is to delete the record.
+  await assert.rejects(finishInterrupted(w.state, w.dir), GitError);
   await writeFile(headFile, saved);
   assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/a.md"], kept: [] });
 });

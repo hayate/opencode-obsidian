@@ -251,9 +251,12 @@ mutate(F_RC, "if (twin !== undefined && (await oneEntry(join(folder, twin), want
 mutate(F_RC, "        for (const rel of unit) {\n          const work = printed(rel) ? (await fingerprint(dir, rel)) === prints[rel] : await updatesWork(dir, rel, unit, versions);\n          if (!work) return false;\n        }\n        return true;",
        '        for (const rel of unit.filter(printed)) if ((await fingerprint(dir, rel)) !== prints[rel]) return false;\n        return unit.every(printed) || updatesWork(dir, unit[0] ?? "", unit, versions);', RC,
        pattern="never sets an unchanged note back over the user's edit", **CASE_SENSITIVE)
-mutate(F_RC, "    if (!(await isFolder(wanted))) return;\n", "", RC, pattern="the first spelling never stops a repair|never goes through a symlink")
+# A set-back refuses a note behind a symlink before respell runs (onDisk), so where the disk
+# ignores case respell walks only folders the set-back just went through: its guard is left to
+# the tests of a disk that tells case apart.
+mutate(F_RC, "    if (!(await isFolder(wanted))) return;\n", "", RC, pattern="the first spelling never stops a repair", **CASE_SENSITIVE)
 mutate(F_RC, "    if (!(await isFolder(wanted))) return;\n", "    if (await missing(wanted)) return;\n", RC,
-       pattern="a file the user saved in place of the first spelling|never goes through a symlink")
+       pattern="a file the user saved in place of the first spelling", **CASE_SENSITIVE)
 # cycle.ts and session.ts: every unsent commit scanned, git's refusals by name, a conflict
 # reported once its copy is pushed, and the status wording.
 mutate(CY, "(?:not uptodate|would be overwritten by merge)", "(?:not uptodate)", C, pattern="an edit staged by hand")
@@ -286,7 +289,8 @@ mutate(F_RC, "    if (absent(err)) return;\n    throw err;\n  }\n  await prune(d
 mutate(F_RC, "    for (const rel of unit) left.set(rel, null);\n", "", RC, pattern="records a file it had removed as nothing")
 mutate(F_RC, ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";', "    return (await lstat(path)).isDirectory();"),
        ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, stat, unlink } from "node:fs/promises";', "    return (await stat(path)).isDirectory();"), RC,
-       pattern="never goes through a symlink", **CASE)
+       pattern="never goes through a symlink", survives=("linux", "darwin"),
+       why="defence in depth behind onDisk: respell walks only folders a set-back just went through, so no test meets a symlink there, and where case matters its renames need one file under two spellings")
 mutate(F_R, "    if (!hasRule(record.type)) return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths);\n    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n",
        "    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n    if (!hasRule(record.type)) return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths);\n", R,
        pattern="even when a collision or a folder moved aside covers its paths")
