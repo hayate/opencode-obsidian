@@ -135,7 +135,7 @@ mutate("core/sync/clone.ts", "  } finally {\n    await rm(tmp, { recursive: true
 # recovery.ts: only untouched paths are repaired.
 mutate("core/sync/recovery.ts", "printed(rel) ? (await fingerprint(dir, rel)) === prints[rel] :", "printed(rel) ? true :", RC,
        pattern="a path the user changed after the kill is kept")
-mutate("core/sync/recovery.ts", "  } else if (head !== record.from) {\n    done.moved = true;", "  } else if (false) {\n    done.moved = true;", RC)
+mutate("core/sync/recovery.ts", "  } else if (head !== record.from) {\n", "  } else if (false) {\n", RC, pattern="history moved since")
 mutate("core/sync/recovery.ts", '    await remove(dir, unit[0] ?? "");\n', "", RC, pattern="already created is removed with the rest")
 mutate("core/sync/recovery.ts", "  if (head === record.to) {", "  if (false) {", RC)
 # cycle.ts: two parents, the rewrite stop, adopt, the outbound scan, step 5.

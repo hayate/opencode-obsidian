@@ -525,7 +525,6 @@ async function updateLive(clone: string, input: CycleInput, live: string, next: 
 }
 
 function describeFinished(done: Finished): string {
-  if (done.moved) return "an interrupted vault update was left as it was: the vault's history moved since";
   const parts = ["finished an interrupted vault update"];
   if (done.restored.length) parts.push(`${done.restored.length} file${done.restored.length === 1 ? "" : "s"} set back to update again`);
   if (done.kept.length) parts.push(`your edits since kept in ${joinNames(done.kept)}`);
@@ -554,7 +553,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     await writeBlocked(input.stateDir, 0);
     // An interrupted update is finished before anything is snapshotted.
     const finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: input.liveUpdateTimeoutMs });
-    if (finished && (finished.moved || finished.restored.length || finished.kept.length)) result.notices.push(describeFinished(finished));
+    if (finished && (finished.restored.length || finished.kept.length)) result.notices.push(describeFinished(finished));
     const snap = await snapshot(input, result);
     if (!snap.ok || !(await stillHeld())) return result;
     if (!snap.pushAllowed) {

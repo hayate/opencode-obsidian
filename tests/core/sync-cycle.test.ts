@@ -1020,6 +1020,41 @@ test("a live update that fails partway (a smudge filter fails) is finished by th
   assert.deepEqual((await remoteNames(remote)).filter((n) => n.includes(".conflict-")), [], "nor moved to a conflict copy");
 });
 
+test("an unfinished live update whose history then moved by hand stops sync with the record kept; undoing what it left and deleting the record lets sync carry on with nothing lost", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/s.md", "s from a\n");
+  await writeRel(a.projects, "x/t.md", "t from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  const pushedByA = await gitOk(["rev-parse", "main"], { cwd: remote });
+  // git writes x/s.md, unlinks x/t.md, then its smudge fails; then the user commits by hand.
+  for (const [key, value] of [["filter.bad.clean", "cat"], ["filter.bad.smudge", "false"], ["filter.bad.required", "true"]]) {
+    await gitOk(["config", key ?? "", value ?? ""], { cwd: b.projects });
+  }
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "x/t.md filter=bad\n");
+  assert.match((await cycle(remote, b)).reason ?? "", /updating the vault failed/);
+  await gitOk(["config", "filter.bad.smudge", "cat"], { cwd: b.projects });
+  await gitOk(["commit", "-q", "--allow-empty", "-m", "by hand"], { cwd: b.projects });
+  const record = join(b.state, "interrupted-update.json");
+  const stopped = await cycle(remote, b);
+  assert.equal(stopped.outcome, "aborted", stopped.reason ?? "");
+  assert.ok((stopped.reason ?? "").includes(record), stopped.reason ?? "");
+  assert.match(stopped.reason ?? "", /`git status` in Projects\/.*delete that file/s);
+  assert.equal(stopped.committed, null, "the half-done update is never snapshotted as the user's own changes");
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushedByA, "nothing pushed");
+  assert.equal(await gitOk(["status", "--porcelain"], { cwd: b.projects }), "D x/t.md\n?? x/s.md", "what git status shows the user");
+  // The way out the reason gives: undo what the update left half done, then delete the record.
+  await gitOk(["checkout", "--", "x/t.md"], { cwd: b.projects });
+  await rm(join(b.projects, "x/s.md"));
+  await rm(record);
+  const after = await cycle(remote, b);
+  assert.equal(after.outcome, "synced", after.reason ?? "");
+  assert.equal(await read(b, "x/t.md"), "t from a\n");
+  assert.equal(await read(b, "x/s.md"), "s from a\n");
+  assert.equal(await remoteFile(remote, "x/t.md"), "t from a", "no deletion was sent");
+  assert.deepEqual((await remoteNames(remote)).filter((n) => n.includes(".conflict-")), [], "and no conflict copy made");
+});
+
 test("a held-back new note the remote also adds blocks the update by name, and nothing is recorded as interrupted", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];

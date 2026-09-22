@@ -104,7 +104,7 @@ async function gate(dir: string, fails = false): Promise<{ started: string; go: 
 test("a path nobody touched since the kill goes back to the old version, cleanly", async () => {
   const w = await interrupted();
   const done = await finishInterrupted(w.state, w.dir);
-  assert.deepEqual(done, { restored: ["x/a.md"], kept: [], moved: false });
+  assert.deepEqual(done, { restored: ["x/a.md"], kept: [] });
   assert.equal(await readFile(join(w.dir, "x/a.md"), "utf8"), "old\n");
   assert.equal(await head(w.dir), w.from);
   assert.equal(await status(w.dir), "", "HEAD, index and files agree again");
@@ -115,7 +115,7 @@ test("a path the user changed after the kill is kept as it is", async () => {
   const w = await interrupted();
   await writeFile(join(w.dir, "x/a.md"), "the user's edit\n");
   const done = await finishInterrupted(w.state, w.dir);
-  assert.deepEqual(done, { restored: [], kept: ["x/a.md"], moved: false });
+  assert.deepEqual(done, { restored: [], kept: ["x/a.md"] });
   assert.equal(await readFile(join(w.dir, "x/a.md"), "utf8"), "the user's edit\n");
 });
 
@@ -133,19 +133,30 @@ test("an update that had in fact finished is left alone", async () => {
   const w = await interrupted();
   await gitOk(["reset", "-q", "--hard", w.to], { cwd: w.dir });
   const done = await finishInterrupted(w.state, w.dir);
-  assert.deepEqual(done, { restored: [], kept: [], moved: false });
+  assert.deepEqual(done, { restored: [], kept: [] });
   assert.equal(await readFile(join(w.dir, "x/a.md"), "utf8"), "new\n");
 });
 
-test("when the history moved since (git by hand), nothing is touched", async () => {
+test("when the history moved since (git by hand), nothing is touched and the record stays: sync stops, naming the record and what to do", async () => {
   const w = await interrupted();
   await gitOk(["commit", "-q", "--allow-empty", "-m", "by hand"], { cwd: w.dir });
   // The kill left x/a.md as it left it (here: unlinked, not yet rewritten).
   const read = (): Promise<string | null> => readFile(join(w.dir, "x/a.md"), "utf8").catch(() => null);
   const before = await read();
-  const done = await finishInterrupted(w.state, w.dir);
-  assert.deepEqual(done, { restored: [], kept: [], moved: true });
-  assert.equal(await read(), before);
+  const [name = ""] = await readdir(w.state);
+  const record = join(w.state, name);
+  const text = await readFile(record, "utf8");
+  for (let run = 1; run <= 2; run++) {
+    await assert.rejects(finishInterrupted(w.state, w.dir), (err: Error) => {
+      assert.ok(err.message.includes(record), err.message);
+      assert.match(err.message, /history moved/);
+      assert.match(err.message, /`git status` in Projects\//);
+      assert.match(err.message, /delete that file/i);
+      return true;
+    });
+    assert.equal(await readFile(record, "utf8"), text, "the record stays");
+    assert.equal(await read(), before);
+  }
 });
 
 test("an update whose fingerprints were never taken (the process died) sets back what is git's and keeps what is not", async () => {
@@ -154,7 +165,7 @@ test("an update whose fingerprints were never taken (the process died) sets back
   // smudge was hanging). Then the user writes their own text over x/1mine.txt.
   await writeFile(join(w.dir, "x/1mine.txt"), "the user's own text\n");
   const done = await finishInterrupted(w.state, w.dir);
-  assert.deepEqual(done, { restored: ["x/0new.txt", "x/a.md"], kept: ["x/1mine.txt"], moved: false });
+  assert.deepEqual(done, { restored: ["x/0new.txt", "x/a.md"], kept: ["x/1mine.txt"] });
   assert.equal(await exists(join(w.dir, "x/0new.txt")), false, "the update's own new file goes");
   assert.equal(await readFile(join(w.dir, "x/a.md"), "utf8"), "old\n", "a file the update had unlinked comes back");
   assert.equal(await readFile(join(w.dir, "x/1mine.txt"), "utf8"), "the user's own text\n");
@@ -166,7 +177,7 @@ test("a repair that times out saves where it got to: the next run finishes, and 
   await assert.rejects(finishInterrupted(w.state, w.dir, { timeoutMs: 500 }), /x\/a\.md|timed out/);
   await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: w.dir });
   const done = await finishInterrupted(w.state, w.dir);
-  assert.deepEqual(done, { restored: ["x/0new.txt", "x/a.md"], kept: [], moved: false });
+  assert.deepEqual(done, { restored: ["x/0new.txt", "x/a.md"], kept: [] });
   assert.equal(await readFile(join(w.dir, "x/a.md"), "utf8"), "old\n");
   assert.equal(await status(w.dir), "");
 });
@@ -178,7 +189,7 @@ test("a HEAD that cannot be read leaves the record for the next run, never read 
   await writeFile(headFile, "ref: refs/heads/no-such-branch\n");
   await assert.rejects(finishInterrupted(w.state, w.dir));
   await writeFile(headFile, saved);
-  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/a.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/a.md"], kept: [] });
 });
 
 test("a note the user saves while a slow repair runs is kept: the old version is built aside and put in place only if the path is untouched", async () => {
@@ -192,7 +203,7 @@ test("a note the user saves while a slow repair runs is kept: the old version is
   await writeFile(join(w.dir, "x/a.md"), "saved during the repair\n");
   await writeFile(go, "");
   const done = await finishing;
-  assert.deepEqual(done, { restored: [], kept: ["x/a.md"], moved: false });
+  assert.deepEqual(done, { restored: [], kept: ["x/a.md"] });
   assert.equal(await readFile(join(w.dir, "x/a.md"), "utf8"), "saved during the repair\n");
   assert.equal(await exists(join(w.dir, ".git", "index.lock")), false);
 });
@@ -218,7 +229,7 @@ test("an update that turned a note into a folder, killed after making the folder
   await recordInterrupted(state, dir, from, to);
   await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: dir });
   const done = await finishInterrupted(state, dir);
-  assert.deepEqual(done, { restored: ["x/p/b.txt", "x/p", "x/z.md"], kept: [], moved: false });
+  assert.deepEqual(done, { restored: ["x/p/b.txt", "x/p", "x/z.md"], kept: [] });
   assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
   assert.equal(await status(dir), "");
 });
@@ -227,7 +238,7 @@ test("a repair runs none of the vault's hooks (it is not the user's checkout)", 
   const w = await interrupted();
   const marker = join(w.dir, "..", `hook-ran-${Date.now()}`);
   await writeFile(join(w.dir, ".git", "hooks", "post-checkout"), `#!/bin/sh\ntouch '${marker}'\n`, { mode: 0o755 });
-  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/a.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/a.md"], kept: [] });
   assert.equal(await exists(marker), false);
 });
 
@@ -243,7 +254,7 @@ test("an update whose intent alone was recorded, with the vault untouched, leave
   const state = await tempDir();
   await recordIntent(state, from, to); // and the process died
   const { ino } = await stat(join(dir, "x/a.md"));
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/0new.txt", "x/a.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/0new.txt", "x/a.md"], kept: [] });
   assert.equal((await stat(join(dir, "x/a.md"))).ino, ino, "a path that already holds the old version is listed, and never rewritten");
   assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "old\n");
   assert.equal(await exists(join(dir, "x/0new.txt")), false);
@@ -258,7 +269,7 @@ test("an update that never started, turning a note into a folder, leaves the not
   );
   const state = await tempDir();
   await recordIntent(state, from, to); // and the process died
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/b.txt", "x/p", "x/z.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/b.txt", "x/p", "x/z.md"], kept: [] });
   assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
   assert.equal(await status(dir), "");
   assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
@@ -273,7 +284,7 @@ test("an update that turned a folder into a note, killed after writing the note:
   assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the new note\n", "the kill came after the note was written");
   await writeFile(join(dir, "x/p"), "the user's edit\n");
   // x/p/b.txt cannot come back without removing the user's note, where its folder was.
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/z.md"], kept: ["x/p", "x/p/b.txt"], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/z.md"], kept: ["x/p", "x/p/b.txt"] });
   assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the user's edit\n");
   assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
 });
@@ -286,7 +297,7 @@ test("a note the user adds in the folder the update made is kept, and the folder
   const state = await killUpdate(dir, from, to);
   assert.equal(await readFile(join(dir, "x/p/b.txt"), "utf8"), "in the new folder\n", "the kill came after the folder was made");
   await writeFile(join(dir, "x/p/mine.txt"), "the user's note\n");
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/b.txt", "x/z.md"], kept: ["x/p"], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/b.txt", "x/z.md"], kept: ["x/p"] });
   assert.equal(await readFile(join(dir, "x/p/mine.txt"), "utf8"), "the user's note\n");
   assert.equal(await exists(join(dir, "x/p/b.txt")), false, "the update's own file goes");
   assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
@@ -300,7 +311,7 @@ test("an update stopped before it wrote anything, turning a folder into a note, 
   const state = await tempDir();
   await recordIntent(state, from, to);
   await recordInterrupted(state, dir, from, to); // killed before it had written anything
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p", "x/p/b.txt", "x/z.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p", "x/p/b.txt", "x/z.md"], kept: [] });
   assert.equal(await readFile(join(dir, "x/p/b.txt"), "utf8"), "in the folder\n");
   assert.equal(await status(dir), "");
   assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
@@ -313,7 +324,7 @@ test("a note the update turned into nested folders comes back: a removal takes t
   );
   const state = await killUpdate(dir, from, to);
   assert.equal(await exists(join(dir, "x/p/q/c.txt")), true, "the kill came after the folders were made");
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [] });
   assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
   assert.equal(await status(dir), "");
 });
@@ -332,7 +343,7 @@ test("a file the update added in a folder it made goes, and the folder with it, 
   const { dir, from, to } = await history({ "x/a.md": "old\n" }, { "n/new.txt": "brand new\n", "x/a.md": "new\n" });
   const state = await killUpdate(dir, from, to);
   assert.equal(await readFile(join(dir, "n/new.txt"), "utf8"), "brand new\n", "the kill came after the update wrote n/new.txt");
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["n/new.txt", "x/a.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["n/new.txt", "x/a.md"], kept: [] });
   assert.equal(await exists(join(dir, "n")), false, "the folder the update made is gone");
   assert.equal(await status(dir), "");
 });
@@ -357,7 +368,7 @@ test("a file gone just before the repair unlinks it leaves the folders around it
     fsp.unlink = real;
     syncBuiltinESMExports();
   }
-  assert.deepEqual(done, { restored: ["n/new.txt", "x/a.md"], kept: [], moved: false });
+  assert.deepEqual(done, { restored: ["n/new.txt", "x/a.md"], kept: [] });
   assert.equal(await exists(join(dir, "n")), true, "the folder stays: the repair removed nothing from it");
 });
 
@@ -372,7 +383,7 @@ for (const prints of [true, false]) {
     // Gone, its folders left: a repair that died between the unlink and the prune, or the user's deletion.
     // Either way absence is what the set-back leaves there: restored, whatever the fingerprint says.
     await unlink(join(dir, "x/p/q/c.txt"));
-    assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [], moved: false });
+    assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [] });
     assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
     assert.equal(await status(dir), "");
     assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
@@ -384,7 +395,7 @@ test("Finder's .DS_Store in the empty tree at a note's path is litter, not conte
   const state = await killUpdate(dir, from, to);
   await unlink(join(dir, "x/p/q/c.txt"));
   await writeFile(join(dir, "x/p/q/.DS_Store"), "finder");
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [] });
   assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
   assert.equal(await status(dir), "");
 });
@@ -394,7 +405,7 @@ test("a note whose path holds a user's file deeper down is kept, and everything 
   const state = await killUpdate(dir, from, to);
   await writeFile(join(dir, "x/p/q/mine.txt"), "the user's note\n");
   await mkdir(join(dir, "x/p/q/r"));
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/z.md"], kept: ["x/p"], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/z.md"], kept: ["x/p"] });
   assert.equal(await readFile(join(dir, "x/p/q/mine.txt"), "utf8"), "the user's note\n");
   assert.equal((await stat(join(dir, "x/p/q/r"))).isDirectory(), true, "their empty folder beside it stays too");
   assert.equal(await exists(join(dir, "x/p/q/c.txt")), false, "the update's own file goes");
@@ -422,7 +433,7 @@ test("a file saved into the empty tree while the repair clears it keeps the path
     fsp.readdir = real;
     syncBuiltinESMExports();
   }
-  assert.deepEqual(done, { restored: ["x/p/q/c.txt", "x/z.md"], kept: ["x/p"], moved: false });
+  assert.deepEqual(done, { restored: ["x/p/q/c.txt", "x/z.md"], kept: ["x/p"] });
   assert.equal(await readFile(late, "utf8"), "saved meanwhile\n");
 });
 
@@ -447,7 +458,7 @@ test("a repair stopped after the emptied folder went, before the note came back,
     fsp.rename = rename;
     syncBuiltinESMExports();
   }
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/b.txt", "x/p", "x/z.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/b.txt", "x/p", "x/z.md"], kept: [] });
   assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
   assert.equal(await status(dir), "");
 });
@@ -461,7 +472,7 @@ test("a repair writes the old version through the filters the vault's committed 
   assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "SMUDGED:old\n", "the vault's own checkout runs the filter");
   const state = await killUpdate(dir, from, to, { slow: "x/z.txt" });
   assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "SMUDGED:new\n", "the kill came after x/a.md was written");
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/a.md", "x/z.txt"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/a.md", "x/z.txt"], kept: [] });
   assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "SMUDGED:old\n");
   assert.equal(await status(dir), "");
 });
@@ -496,7 +507,7 @@ for (const prints of [true, false]) {
   test(`a case-only rename the update had made is set back under the old spelling, never deleted (${prints ? "with" : "without"} fingerprints)`, async (t) => {
     const v = await caseRenamed(t, prints);
     if (!v) return;
-    assert.deepEqual(await finishInterrupted(v.state, v.dir), { restored: ["Note.md", "note.md", "z.md"], kept: [], moved: false });
+    assert.deepEqual(await finishInterrupted(v.state, v.dir), { restored: ["Note.md", "note.md", "z.md"], kept: [] });
     assert.deepEqual(await spellings(v.dir), ["Note.md"]);
     assert.equal(await readFile(join(v.dir, "Note.md"), "utf8"), "old note\n");
     assert.equal(await status(v.dir), "");
@@ -507,7 +518,7 @@ test("a case-only rename whose one file the user changed since is kept as the us
   const v = await caseRenamed(t, true);
   if (!v) return;
   await writeFile(join(v.dir, "note.md"), "the user's edit\n");
-  assert.deepEqual(await finishInterrupted(v.state, v.dir), { restored: ["z.md"], kept: ["Note.md", "note.md"], moved: false });
+  assert.deepEqual(await finishInterrupted(v.state, v.dir), { restored: ["z.md"], kept: ["Note.md", "note.md"] });
   assert.deepEqual(await spellings(v.dir), ["note.md"]);
   assert.equal(await readFile(join(v.dir, "note.md"), "utf8"), "the user's edit\n");
 });
@@ -571,7 +582,7 @@ test("a case-only rename of a folder the update had made is set back under the o
   if (!v) return;
   const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
   assert.deepEqual(await folderSpellings(v.dir), ["x"], "the kill came after git had made the folder x");
-  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["X/p.md", "x/p.md", "z.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["X/p.md", "x/p.md", "z.md"], kept: [] });
   assert.deepEqual(await folderSpellings(v.dir), ["X"]);
   assert.deepEqual(await readdir(join(v.dir, "X")), ["p.md"]);
   assert.equal(await readFile(join(v.dir, "X", "p.md"), "utf8"), "old note\n");
@@ -583,7 +594,7 @@ test("a note the update added beside its unchanged case twin is that one file he
   if (!v) return;
   const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
   assert.equal(await readFile(join(v.dir, "Note.md"), "utf8"), "new note\n", "the kill came after git wrote note.md over the one file");
-  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["Note.md", "note.md", "z.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["Note.md", "note.md", "z.md"], kept: [] });
   assert.deepEqual(await spellings(v.dir), ["Note.md"]);
   assert.equal(await readFile(join(v.dir, "Note.md"), "utf8"), "old note\n");
   assert.equal(await readFile(join(v.dir, "z.md"), "utf8"), "old\n");
@@ -597,7 +608,7 @@ for (const prints of [true, false]) {
     if (!v) return;
     const state = await killUpdate(v.dir, v.from, v.to, { prints });
     assert.deepEqual(await folderSpellings(v.dir), ["x"], "the kill came after git had made the folder x, during x/q.md");
-    assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/q.md", "X/p.md", "z.md"], kept: [], moved: false });
+    assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/q.md", "X/p.md", "z.md"], kept: [] });
     assert.deepEqual(await folderSpellings(v.dir), ["X"]);
     assert.equal(await readFile(join(v.dir, "X", "p.md"), "utf8"), "old note\n");
     assert.equal(await status(v.dir), "");
@@ -621,7 +632,7 @@ test("where the old tree spells a folder two ways, a note set back into it keeps
   const oracle = await checkedOutByGit(v.dir);
   const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
   assert.equal(await readFile(join(v.dir, "x/b.md"), "utf8"), "new b\n", "the kill came after git wrote x/b.md");
-  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/b.md", "z.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/b.md", "z.md"], kept: [] });
   assert.deepEqual(await files(v.dir), await files(oracle));
   assert.equal(await status(v.dir), await status(oracle));
 });
@@ -705,7 +716,7 @@ for (const stale of [false, true]) {
     const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
     assert.equal(await readFile(join(v.dir, "x/b.md"), "utf8"), "new b\n", "the kill came after git wrote x/b.md");
     await rm(join(v.dir, "X"), { recursive: true });
-    assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/b.md", "z.md"], kept: [], moved: false });
+    assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/b.md", "z.md"], kept: [] });
     assert.equal(await finishInterrupted(state, v.dir), null, "the record is gone");
     assert.equal(await readFile(join(v.dir, "x/b.md"), "utf8"), "old b\n");
     assert.equal(await readFile(join(v.dir, "z.md"), "utf8"), "old\n");
@@ -724,7 +735,7 @@ test("where case matters and the old tree spells a folder two ways, a file the u
   assert.equal(await readFile(join(v.dir, "x/b.md"), "utf8"), "new b\n", "the kill came after git wrote x/b.md");
   await rm(join(v.dir, "X"), { recursive: true });
   await writeFile(join(v.dir, "X"), "the user's file\n");
-  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/b.md", "z.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/b.md", "z.md"], kept: [] });
   assert.equal(await finishInterrupted(state, v.dir), null, "the record is gone");
   assert.equal(await readFile(join(v.dir, "x/b.md"), "utf8"), "old b\n");
   assert.equal(await readFile(join(v.dir, "z.md"), "utf8"), "old\n");
@@ -743,7 +754,7 @@ test("a repair's respelling walk never goes through a symlink the user put in a 
   await rm(join(v.dir, "X"), { recursive: true });
   await symlink(outside, join(v.dir, "X"));
   // X/Sub/p.md is behind the user's symlink: not in the vault, so it is kept, and nothing is written through it.
-  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["z.md"], kept: ["X/Sub/p.md"], moved: false });
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["z.md"], kept: ["X/Sub/p.md"] });
   assert.deepEqual(await readdir(outside), ["SUB"]);
   assert.deepEqual(await readdir(join(outside, "SUB")), [], "nothing is written outside the vault");
 });
@@ -753,7 +764,7 @@ test("a set-back two folders deep walks both real folders, each back to the old 
   if (!v) return;
   const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
   assert.deepEqual(await readdir(v.dir), [".git", "a"], "the kill came after git made a/b for a/b/p.md");
-  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["A/B/p.md", "a/b/p.md", "z.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["A/B/p.md", "a/b/p.md", "z.md"], kept: [] });
   assert.deepEqual(await files(v.dir), ["A/B/p.md: old p\n", "z.md: old\n"]);
   assert.equal(await status(v.dir), "");
 });
@@ -782,7 +793,7 @@ for (const same of [true, false]) {
     await gitOk(["reset", "-q", "--hard", from], { cwd: dir });
     const state = await tempDir();
     await recordIntent(state, from, to); // and the update never ran
-    assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/n.md", "x/p", "x/z.md"], kept: [], moved: false });
+    assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/n.md", "x/p", "x/z.md"], kept: [] });
     assert.deepEqual(await readdir(outside), ["n.md"], "a file outside the vault is never removed");
     assert.equal(await readFile(join(outside, "n.md"), "utf8"), same ? "the note\n" : "outside's own\n");
     assert.equal(await status(dir), "");
@@ -825,7 +836,7 @@ for (const outsideHolds of [false, true]) {
     for (const relative of [false, true]) {
       test(`a symlink the update made in a folder's place is never written or read through (outside ${outsideHolds ? "holds" : "lacks"} n.md, ${prints ? "with" : "without"} fingerprints, ${relative ? "relative" : "absolute"} link)`, async () => {
         const w = await symlinkUpdate(outsideHolds, prints, relative);
-        assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/p", "x/p/n.md", "x/z.md"], kept: [], moved: false });
+        assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/p", "x/p/n.md", "x/z.md"], kept: [] });
         assert.equal(await readFile(join(w.dir, "x/p/n.md"), "utf8"), "the note\n", "the note is back in its real folder");
         assert.equal(await status(w.dir), "");
         assert.deepEqual(await readdir(w.outside), outsideHolds ? ["n.md"] : [], "nothing is written outside the vault");
@@ -841,7 +852,7 @@ test("a folder the user replaced with a file, after an update that never ran, ke
   await recordIntent(state, from, to); // and the process died
   await rm(join(dir, "x/p"), { recursive: true });
   await writeFile(join(dir, "x/p"), "the user's file\n");
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/z.md"], kept: ["x/p/b.txt"], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/z.md"], kept: ["x/p/b.txt"] });
   assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the user's file\n");
   assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
 });
@@ -875,7 +886,7 @@ test("a folder swapped for a symlink between the repair's check and its removal:
     syncBuiltinESMExports();
   }
   assert.deepEqual(await readdir(outside), ["n.txt"], "nothing outside the vault is removed");
-  assert.deepEqual(done, { restored: ["x/p/n.txt", "x/z.md"], kept: [], moved: false });
+  assert.deepEqual(done, { restored: ["x/p/n.txt", "x/z.md"], kept: [] });
 });
 
 test("a symlink the update made, re-pointed by the user after the kill, is theirs: the note behind it is kept, and nothing is written through it", async () => {
@@ -883,14 +894,14 @@ test("a symlink the update made, re-pointed by the user after the kill, is their
   const other = await tempDir("sro-other-");
   await unlink(join(w.dir, "x/p"));
   await symlink(other, join(w.dir, "x/p"));
-  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/z.md"], kept: ["x/p", "x/p/n.md"], moved: false });
+  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/z.md"], kept: ["x/p", "x/p/n.md"] });
   assert.deepEqual(await readdir(other), [], "nothing is written outside the vault");
   assert.equal(await readlink(join(w.dir, "x/p")), other);
 });
 
 test("a path named like an object's own property (constructor) is judged as any other", async () => {
   const w = await interrupted({ constructor: "from the update\n" }, { prints: false });
-  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["constructor", "x/a.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["constructor", "x/a.md"], kept: [] });
   assert.equal(await exists(join(w.dir, "constructor")), false);
 });
 
@@ -935,7 +946,7 @@ test("a repair that stops reports its own error, and the next run takes what it 
     await chmod(a, mode & 0o7777);
   }
   await writeFile(join(r.dir, ".git", "info", "attributes"), "");
-  assert.deepEqual(await finishInterrupted(r.state, r.dir), { restored: ["x/a.md", "x/b.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(r.state, r.dir), { restored: ["x/a.md", "x/b.md"], kept: [] });
   assert.equal(await readFile(a, "utf8"), "old a\n");
   assert.equal(await status(r.dir), "");
 });
@@ -955,7 +966,7 @@ test("a repair that stops reports its own error even when the record cannot be u
   }
   // The older record errs toward keeping: x/a.md, back to the old version, reads as an edit.
   await writeFile(join(r.dir, ".git", "info", "attributes"), "");
-  assert.deepEqual(await finishInterrupted(r.state, r.dir), { restored: ["x/b.md"], kept: ["x/a.md"], moved: false });
+  assert.deepEqual(await finishInterrupted(r.state, r.dir), { restored: ["x/b.md"], kept: ["x/a.md"] });
   assert.equal(await readFile(join(r.dir, "x/a.md"), "utf8"), "old a\n");
   assert.equal(await readFile(join(r.dir, "x/b.md"), "utf8"), "old b\n");
 });
@@ -972,7 +983,7 @@ test("a stopped repair records a file it had removed as nothing there, so a fold
   assert.equal(await exists(join(dir, "x/0new.txt")), false, "the repair had removed it");
   await mkdir(join(dir, "x/0new.txt"));
   await writeFile(join(dir, ".git", "info", "attributes"), "");
-  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/0new.txt", "x/a.md", "x/b.md"], kept: [], moved: false });
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/0new.txt", "x/a.md", "x/b.md"], kept: [] });
   assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "old a\n");
   assert.equal(await readFile(join(dir, "x/b.md"), "utf8"), "old b\n");
 });

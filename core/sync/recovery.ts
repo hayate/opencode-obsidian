@@ -416,8 +416,6 @@ export interface Finished {
   // (also a path that could come back only over the user's files: a note of theirs
   // where its folder would be, or a folder they put a note in).
   kept: string[];
-  // The vault's history moved since (someone ran git by hand): nothing was touched.
-  moved: boolean;
 }
 
 export interface FinishOptions {
@@ -462,18 +460,25 @@ async function readRecord(path: string): Promise<Record_ | null> {
 }
 
 // Throws, leaving the record, whenever it cannot tell: a HEAD it cannot read, a
-// failed lookup, a repair that did not finish, a record it cannot read. Until the
-// record is gone no snapshot is taken.
+// failed lookup, a repair that did not finish, a record it cannot read, a history
+// that moved since. Until the record is gone no snapshot is taken.
 export async function finishInterrupted(stateDir: string, dir: string, opts: FinishOptions = {}): Promise<Finished | null> {
   const path = join(stateDir, RECORD);
   const record = await readRecord(path);
   if (record === null) return null;
   const head = await gitOk(["rev-parse", "-q", "--verify", "HEAD^{commit}"], { cwd: dir });
-  const done: Finished = { restored: [], kept: [], moved: false };
+  const done: Finished = { restored: [], kept: [] };
   if (head === record.to) {
     // The update had finished (HEAD moves last); nothing is left to repair.
   } else if (head !== record.from) {
-    done.moved = true;
+    // Someone moved the vault's history by hand (a commit, a reset) after the update
+    // stopped partway: its record no longer says what the old version is, so nothing
+    // can be judged. Dropped, the record would let the next snapshot send what the
+    // update left half done (a note it had unlinked) as the user's own change: it is
+    // kept, and sync stops until the user has looked.
+    throw new Error(
+      `an interrupted vault update cannot be finished: the vault's history moved since it began (git by hand), and its record '${path}' is kept. Check \`git status\` in Projects/: it shows what that update left half done, which sync would send as your own changes. Undo what you did not change yourself, then delete that file to let sync carry on.`,
+    );
   } else {
     const old = await treeOf(dir, record.from);
     const target = await treeOf(dir, record.to);
