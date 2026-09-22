@@ -375,9 +375,13 @@ async function setBack(
     // the note cannot come back without writing through it or over it (onDisk).
     const target = await onDisk(dir, source);
     if (target === null) return false;
-    await mkdir(dirname(target), { recursive: true });
-    if (!(await roomFor(target))) return false;
-    await rename(built, target);
+    // A path that already holds the old version (an update that never reached it) is
+    // left as it is: nothing to rewrite, and it counts as set back.
+    if ((await fingerprint(dir, source)) !== print) {
+      await mkdir(dirname(target), { recursive: true });
+      if (!(await roomFor(target))) return false;
+      await rename(built, target);
+    }
     for (const rel of unit) left.set(rel, print);
     await respell(dir, spell(source));
     return true;

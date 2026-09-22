@@ -242,7 +242,9 @@ test("an update whose intent alone was recorded, with the vault untouched, leave
   const { dir, from, to } = await history({ "x/a.md": "old\n" }, { "x/0new.txt": "brand new\n", "x/a.md": "new\n" });
   const state = await tempDir();
   await recordIntent(state, from, to); // and the process died
+  const { ino } = await stat(join(dir, "x/a.md"));
   assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/0new.txt", "x/a.md"], kept: [], moved: false });
+  assert.equal((await stat(join(dir, "x/a.md"))).ino, ino, "a path that already holds the old version is listed, and never rewritten");
   assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "old\n");
   assert.equal(await exists(join(dir, "x/0new.txt")), false);
   assert.equal(await status(dir), "");

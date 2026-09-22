@@ -305,3 +305,4 @@ mutate(F_RC, "async function updatesWork(dir: string, rel: string, unit: string[
        "async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[]): Promise<boolean> {\n  const path = join(dir, rel);\n", RC, pattern="replaced with a file, after an update that never ran")
 mutate(F_RC, "async function remove(dir: string, rel: string): Promise<void> {\n  const path = await onDisk(dir, rel);\n  if (path === null) return;\n",
        "async function remove(dir: string, rel: string): Promise<void> {\n  const path = join(dir, rel);\n", RC, pattern="swapped for a symlink between")
+mutate(F_RC, "    if ((await fingerprint(dir, source)) !== print) {", "    if (true) {", RC, pattern="intent alone was recorded")
