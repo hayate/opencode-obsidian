@@ -8,7 +8,7 @@
 // path that changed since: that is the user's edit.
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { git, gitOk, literal } from "../git.ts";
 import { writeAtomic } from "../store.ts";
 import { fold } from "./copies.ts";
@@ -81,13 +81,23 @@ async function ignoresCase(dir: string): Promise<boolean> {
 }
 
 // The changed paths as the disk holds them: case twins are one file, judged and set
-// back together; every other path alone. Removals first, so that a folder the update
+// back together; every other path alone. The twins of a changed path are every path
+// that folds to its name: the changed ones and those of the old tree the update left
+// unchanged (a tree with Note.md beside note.md, committed where case matters, is one
+// file here, which the update rewrote). Removals first, so that a folder the update
 // made where a note was is emptied before the note comes back.
 function units(changed: string[], old: Map<string, Entry>, twins: boolean): string[][] {
   const byName = new Map<string, string[]>();
   for (const rel of changed) {
     const name = twins ? fold(rel) : rel;
     byName.set(name, [...(byName.get(name) ?? []), rel]);
+  }
+  if (twins) {
+    for (const rel of old.keys()) {
+      const unit = byName.get(fold(rel));
+      if (unit !== undefined && !unit.includes(rel)) unit.push(rel);
+    }
+    for (const unit of byName.values()) unit.sort();
   }
   const restores = (unit: string[]): boolean => unit.some((rel) => old.has(rel));
   const all = [...byName.values()];
@@ -100,8 +110,8 @@ function units(changed: string[], old: Map<string, Entry>, twins: boolean): stri
 // file here either). Case twins are one file: any twin's version counts. Anything
 // else is someone's edit. hash-object --path applies the path's clean filter, as
 // git add does.
-async function updatesWork(dir: string, unit: string[], versions: Entry[]): Promise<boolean> {
-  const path = join(dir, unit[0] ?? "");
+async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[]): Promise<boolean> {
+  const path = join(dir, rel);
   let info;
   try {
     info = await lstat(path);
@@ -115,7 +125,7 @@ async function updatesWork(dir: string, unit: string[], versions: Entry[]): Prom
     now.push({ mode: "120000", oid: await gitOk(["hash-object", "--stdin", "--no-filters"], { cwd: dir, input: await readlink(path) }) });
   } else if (info.isFile()) {
     const mode = info.mode & 0o100 ? "100755" : "100644";
-    for (const rel of unit) now.push({ mode, oid: await gitOk(["hash-object", `--path=${rel}`, "--", path], { cwd: dir }) });
+    for (const twin of unit) now.push({ mode, oid: await gitOk(["hash-object", `--path=${twin}`, "--", path], { cwd: dir }) });
   } else {
     return false;
   }
@@ -137,14 +147,17 @@ async function prune(dir: string, folder: string): Promise<void> {
 }
 
 // Removes the file the update wrote at rel (case twins: one file, removed once).
-// A folder there is not the update's work: nothing to remove.
+// A folder there is not the update's work: nothing to remove. Only a removal prunes:
+// with nothing at rel, the folders around it are as they were (an empty one may be
+// the user's).
 async function remove(dir: string, rel: string): Promise<void> {
   const path = join(dir, rel);
   try {
     if ((await lstat(path)).isDirectory()) return;
     await unlink(path);
   } catch (err) {
-    if (!absent(err)) throw err;
+    if (absent(err)) return;
+    throw err;
   }
   await prune(dir, dirname(rel));
 }
@@ -175,13 +188,33 @@ async function roomFor(path: string): Promise<boolean> {
   }
 }
 
-// A rename onto a case twin keeps the twin's spelling (APFS, verified): the one file
-// then takes the old spelling back.
+// Whether two spellings name one entry on disk (same device and inode). Where the disk
+// ignores case, a twin and the wanted spelling do; where it tells case apart they are
+// two files, or the wanted one is not there.
+async function oneEntry(a: string, b: string): Promise<boolean> {
+  try {
+    const [x, y] = [await lstat(a), await lstat(b)];
+    return x.dev === y.dev && x.ino === y.ino;
+  } catch (err) {
+    if (absent(err)) return false;
+    throw err;
+  }
+}
+
+// A rename onto a case twin keeps the twin's spelling (APFS, verified), and a folder
+// git made for a case-only rename keeps git's: each component of rel, folders
+// included, takes the old tree's spelling back, walked from the vault root as the
+// cycle's snapshot reads spellings. Only an entry that is the wanted one under
+// another spelling is renamed: a different file (a stale core.ignorecase=true on a
+// disk where case matters) is never renamed over the one set back.
 async function respell(dir: string, rel: string): Promise<void> {
-  const folder = join(dir, dirname(rel));
-  const name = basename(rel);
-  const twin = (await readdir(folder)).find((n) => n !== name && fold(n) === fold(name));
-  if (twin !== undefined) await rename(join(folder, twin), join(folder, name));
+  let folder = dir;
+  for (const part of rel.split("/")) {
+    const wanted = join(folder, part);
+    const twin = (await readdir(folder)).find((n) => n !== part && fold(n) === fold(part));
+    if (twin !== undefined && (await oneEntry(join(folder, twin), wanted))) await rename(join(folder, twin), wanted);
+    folder = wanted;
+  }
 }
 
 // Puts a unit the caller found untouched back to the old version, and says false
@@ -345,9 +378,17 @@ export async function finishInterrupted(stateDir: string, dir: string, opts: Fin
     const left = new Map<string, string | null>();
     for (const unit of units(await changedPaths(dir, record.from, record.to), old, twins)) {
       const versions = unit.flatMap((rel) => [old.get(rel), target.get(rel)]).filter((e) => e !== undefined);
+      // Each path of the unit: unchanged since the kill where it has a fingerprint, the
+      // update's work by content where it has none (as an unchanged twin, which the kill
+      // never fingerprints).
+      // Where the disk ignores case every path names the one file; where core.ignorecase
+      // is stale they are separate files, and each must be the update's to be set back.
       const untouched = async (): Promise<boolean> => {
-        for (const rel of unit.filter(printed)) if ((await fingerprint(join(dir, rel))) !== prints[rel]) return false;
-        return unit.every(printed) || updatesWork(dir, unit, versions);
+        for (const rel of unit) {
+          const work = printed(rel) ? (await fingerprint(join(dir, rel))) === prints[rel] : await updatesWork(dir, rel, unit, versions);
+          if (!work) return false;
+        }
+        return true;
       };
       let back: boolean;
       try {

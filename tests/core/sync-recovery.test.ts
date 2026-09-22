@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { chmod, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { git, GitError, gitOk } from "../../core/git.ts";
@@ -316,6 +316,16 @@ test("a note the update turned into nested folders comes back: a removal takes t
   assert.equal(await status(dir), "");
 });
 
+test("a removal that finds nothing to remove leaves the folders around it alone, even an empty one the user made", async () => {
+  const { dir, from, to } = await history({ "x/a.md": "old\n" }, { "Inbox/new.md": "brand new\n", "x/a.md": "new\n" });
+  await mkdir(join(dir, "Inbox"));
+  const state = await tempDir();
+  await recordIntent(state, from, to); // and the process died
+  assert.notEqual(await finishInterrupted(state, dir), null);
+  assert.equal((await stat(join(dir, "Inbox"))).isDirectory(), true, "the user's empty folder is still there");
+  assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
+});
+
 test("a repair stopped after the emptied folder went, before the note came back, gets the note back next time", async () => {
   const { dir, from, to } = await history(
     { "x/p": "the note\n", "x/z.md": "old\n" },
@@ -399,6 +409,104 @@ test("a case-only rename whose one file the user changed since is kept as the us
   await writeFile(join(v.dir, "note.md"), "the user's edit\n");
   assert.deepEqual(await finishInterrupted(v.state, v.dir), { restored: ["z.md"], kept: ["Note.md", "note.md"], moved: false });
   assert.deepEqual(await spellings(v.dir), ["note.md"]);
+  assert.equal(await readFile(join(v.dir, "note.md"), "utf8"), "the user's edit\n");
+});
+
+// A vault at `before`, and a commit on top of it whose tree holds exactly `after`,
+// spelled as given: committed as a machine where case matters commits it, since git
+// on a disk that ignores case cannot stage a case-only rename by name. Null (and the
+// test skipped) where core.ignorecase is false.
+async function caseHistory(
+  t: TestContext,
+  before: Record<string, string>,
+  after: Record<string, string>,
+): Promise<{ dir: string; from: string; to: string } | null> {
+  const dir = await tempDir();
+  await initRepo(dir);
+  if ((await git(["config", "--bool", "core.ignorecase"], { cwd: dir })).stdout.trim() !== "true") {
+    t.skip("core.ignorecase is false here: the disk holds the two spellings as two entries");
+    return null;
+  }
+  for (const [rel, content] of Object.entries(before)) await writeRel(dir, rel, content);
+  await gitOk(["add", "-A"], { cwd: dir });
+  await gitOk(["commit", "-q", "-m", "old"], { cwd: dir });
+  const from = await head(dir);
+  const env = { GIT_INDEX_FILE: join(await tempDir(), "index") };
+  for (const [rel, content] of Object.entries(after)) {
+    const blob = await gitOk(["hash-object", "-w", "--stdin"], { cwd: dir, input: content });
+    await gitOk(["-c", "core.ignorecase=false", "update-index", "--add", "--cacheinfo", `100644,${blob},${rel}`], { cwd: dir, env });
+  }
+  const to = await gitOk(["commit-tree", await gitOk(["write-tree"], { cwd: dir, env }), "-p", from, "-m", "new"], { cwd: dir });
+  return { dir, from, to };
+}
+
+const folderSpellings = async (dir: string): Promise<string[]> => (await readdir(dir)).filter((name) => fold(name) === "x");
+
+test("a case-only rename of a folder the update had made is set back under the old folder's spelling", async (t) => {
+  const v = await caseHistory(t, { "X/p.md": "old note\n", "z.md": "old\n" }, { "x/p.md": "new note\n", "z.md": "new\n" });
+  if (!v) return;
+  const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
+  assert.deepEqual(await folderSpellings(v.dir), ["x"], "the kill came after git had made the folder x");
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["X/p.md", "x/p.md", "z.md"], kept: [], moved: false });
+  assert.deepEqual(await folderSpellings(v.dir), ["X"]);
+  assert.deepEqual(await readdir(join(v.dir, "X")), ["p.md"]);
+  assert.equal(await readFile(join(v.dir, "X", "p.md"), "utf8"), "old note\n");
+  assert.equal(await status(v.dir), "");
+});
+
+test("a note the update added beside its unchanged case twin is that one file here: it goes back to the twin's old version, never unlinked", async (t) => {
+  const v = await caseHistory(t, { "Note.md": "old note\n", "z.md": "old\n" }, { "Note.md": "old note\n", "note.md": "new note\n", "z.md": "new\n" });
+  if (!v) return;
+  const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
+  assert.equal(await readFile(join(v.dir, "Note.md"), "utf8"), "new note\n", "the kill came after git wrote note.md over the one file");
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["Note.md", "note.md", "z.md"], kept: [], moved: false });
+  assert.deepEqual(await spellings(v.dir), ["Note.md"]);
+  assert.equal(await readFile(join(v.dir, "Note.md"), "utf8"), "old note\n");
+  assert.equal(await readFile(join(v.dir, "z.md"), "utf8"), "old\n");
+  assert.equal(await status(v.dir), "");
+});
+
+// Whether the disk the tests write to tells Note.md and note.md apart, asked of the
+// disk itself with a probe file (never read from the platform's name).
+async function caseMatters(): Promise<boolean> {
+  const probe = await tempDir();
+  await writeFile(join(probe, "case-probe"), "");
+  return !(await exists(join(probe, "CASE-PROBE")));
+}
+
+// A vault on a disk where case matters, whose core.ignorecase says the opposite: the
+// setting git wrote on a disk that ignores case, kept when the vault was copied over.
+async function staleIgnorecase(
+  t: TestContext,
+  before: Record<string, string>,
+  after: Record<string, string | null>,
+): Promise<{ dir: string; from: string; to: string } | null> {
+  if (!(await caseMatters())) {
+    t.skip("this disk ignores case: Note.md and note.md are one file here, so core.ignorecase=true is not stale");
+    return null;
+  }
+  const v = await history(before, after);
+  await gitOk(["config", "core.ignorecase", "true"], { cwd: v.dir });
+  return v;
+}
+
+test("a stale core.ignorecase=true on a disk where case matters never renames a different file over the note set back", async (t) => {
+  const v = await staleIgnorecase(t, { "Note.md": "old note\n", "z.md": "old\n" }, { "Note.md": null, "note.md": "new note\n", "z.md": "new\n" });
+  if (!v) return;
+  const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
+  assert.equal(await readFile(join(v.dir, "note.md"), "utf8"), "new note\n", "the kill came after the rename");
+  await finishInterrupted(state, v.dir);
+  assert.equal(await readFile(join(v.dir, "Note.md"), "utf8"), "old note\n", "the old version stays where it was set back");
+  assert.equal(await readFile(join(v.dir, "note.md"), "utf8"), "new note\n", "the other file is never renamed over it");
+});
+
+test("a stale core.ignorecase=true on a disk where case matters never sets an unchanged note back over the user's edit of it", async (t) => {
+  const v = await staleIgnorecase(t, { "note.md": "old note\n", "z.md": "old\n" }, { "Note.md": "new note\n", "z.md": "new\n" });
+  if (!v) return;
+  const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
+  assert.equal(await readFile(join(v.dir, "Note.md"), "utf8"), "new note\n", "the kill came after git wrote Note.md");
+  await writeFile(join(v.dir, "note.md"), "the user's edit\n");
+  await finishInterrupted(state, v.dir);
   assert.equal(await readFile(join(v.dir, "note.md"), "utf8"), "the user's edit\n");
 });
 
