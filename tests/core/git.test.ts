@@ -222,6 +222,21 @@ test("a lock taken by another process after a killed reset released its own is n
   assert.doesNotMatch(r.stderr, /removed/);
 });
 
+test("a killed rm never has a lock removed: it runs no filters, so it had not reached the lock", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  await commitFile(dir, "a.md", "a\n", "a");
+  const lock = join(dir, ".git", "index.lock");
+  const fifo = join(dir, ".git", "hang.fifo");
+  await execFileAsync("mkfifo", [fifo]);
+  // rm blocks reading its config; meanwhile another process takes the lock.
+  const other = sleep(200).then(() => writeFile(lock, ""));
+  const r = await git(["-c", `include.path=${fifo}`, "rm", "-q", "--cached", "a.md"], { cwd: dir, timeoutMs: 1000 });
+  await other;
+  assert.equal(r.timedOut, true);
+  assert.equal(await exists(lock), true);
+});
+
 test("an index.lock that was already there when a killed command started is never removed", async () => {
   const dir = await tempDir();
   await initRepo(dir);

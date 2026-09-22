@@ -117,6 +117,7 @@ const RETRIED_ON_INDEX_LOCK = new Set(["add", "rm", "reset"]);
 // found with the index unchanged, is the one it took (spec 5.6). commit and checkout
 // are not here: their hooks after the release are the usual place they hang, so a
 // lock found after killing one proves nothing about who holds it.
+// A subset of RETRIED_ON_INDEX_LOCK: git() resolves the lock paths only for those.
 const CLEANED_AFTER_KILL = new Set(["add", "reset"]);
 
 function subcommand(args: string[]): string | undefined {
@@ -164,11 +165,10 @@ async function leftLockNotice(stderr: string, cwd: string): Promise<string | und
 }
 
 // The message alone proves nothing: a hook or a filter can print it after doing
-// work. So: a command from the list, not killed on timeout (it may have done
-// anything), and the lock really there.
-async function metIndexLock(args: string[], result: GitResult, lock: string | null): Promise<boolean> {
+// work. So: a command from the list (git() resolves the lock only for those), not
+// killed on timeout (it may have done anything), and the lock really there.
+async function metIndexLock(result: GitResult, lock: string | null): Promise<boolean> {
   if (result.code === 0 || result.timedOut) return false;
-  if (!RETRIED_ON_INDEX_LOCK.has(subcommand(args) ?? "")) return false;
   if (!/index\.lock'?: File exists/.test(result.stderr)) return false;
   return lock !== null && (await exists(lock));
 }
@@ -200,7 +200,7 @@ export async function git(args: string[], opts: GitOptions): Promise<GitResult> 
       );
       result.stderr += `${result.stderr && !result.stderr.endsWith("\n") ? "\n" : ""}${note}\n`;
     }
-    if (attempt >= INDEX_LOCK_RETRIES || !(await metIndexLock(args, result, paths?.lock ?? null))) return result;
+    if (attempt >= INDEX_LOCK_RETRIES || !(await metIndexLock(result, paths?.lock ?? null))) return result;
     await new Promise((resolve) => setTimeout(resolve, INDEX_LOCK_DELAY_MS));
   }
 }
