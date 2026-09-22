@@ -11,13 +11,19 @@ a mutation targets must update the mutation in the same change. A few are declar
 one platform, with the reason (case handling is only observable on a case-insensitive
 filesystem). Exit status: 0 when every mutation met its expectation; 1 when one survived that a
 test should catch, or was caught where it is declared to survive (the declaration is stale); 2
-when the gate cannot judge at all: a test file fails unmutated (every mutation would read as
-caught), or a mutation's target text is gone or in more than one place."""
-import argparse, os, pathlib, subprocess, sys
+when the gate cannot judge at all: a test file fails or times out unmutated (every mutation would
+read as caught), or a mutation's target text is gone or in more than one place. Each test run is
+bounded (TIMEOUT_S): a mutant whose run times out counts as caught, since a hang is a change the
+test notices."""
+import argparse, os, pathlib, signal, subprocess, sys
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+# One test run, mutated or not. The slowest is a whole sync-cycle.test.ts, about 1.5 minutes on
+# a laptop and a few more on a CI runner: 10 minutes is far past any run that is not hung, and a
+# hung mutant costs a shard no more than that.
+TIMEOUT_S = 600
 
 
 @dataclass(frozen=True)
@@ -69,12 +75,29 @@ def _env(m: Mutation) -> dict:
     return {**os.environ, "SRO_NETWORK_TESTS": "1"} if m.network else dict(os.environ)
 
 
-def _node_test(m: Mutation, root: pathlib.Path, pattern: Optional[str]) -> subprocess.CompletedProcess:
+@dataclass(frozen=True)
+class Run:
+    code: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+
+
+def _node_test(m: Mutation, root: pathlib.Path, pattern: Optional[str], timeout: float) -> Run:
     args = ["node", "--test"] + (["--test-name-pattern", pattern] if pattern else []) + [m.test]
-    return subprocess.run(args, cwd=root, capture_output=True, text=True, env=_env(m))
+    # Its own process group, so a timeout kills node and the test process it runs the file in.
+    proc = subprocess.Popen(args, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_env(m), start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return Run(proc.returncode, stdout, stderr, False)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        stdout, stderr = proc.communicate()
+        return Run(proc.returncode, stdout, stderr, True)
 
 
-def _caught(m: Mutation, root: pathlib.Path) -> int:
+def _caught(m: Mutation, root: pathlib.Path, timeout: float) -> Tuple[int, int]:
+    """How many of the mutant's runs failed, and how many of those timed out."""
     path = root / m.path
     original = path.read_text()
     text = original
@@ -82,7 +105,8 @@ def _caught(m: Mutation, root: pathlib.Path) -> int:
         text = text.replace(old, new, 1)
     path.write_text(text)
     try:
-        return sum(_node_test(m, root, m.pattern).returncode != 0 for _ in range(m.runs))
+        runs = [_node_test(m, root, m.pattern, timeout) for _ in range(m.runs)]
+        return sum(r.code != 0 or r.timed_out for r in runs), sum(r.timed_out for r in runs)
     finally:
         path.write_text(original)
 
@@ -99,7 +123,7 @@ def verdict(m: Mutation, caught: int, platform: str) -> Optional[str]:
     return f"SURVIVED {m.runs - caught}/{m.runs}: no test notices this change"
 
 
-def run(mutations: list, shard: Tuple[int, int], root: pathlib.Path, platform: str) -> int:
+def run(mutations: list, shard: Tuple[int, int], root: pathlib.Path, platform: str, timeout: float = TIMEOUT_S) -> int:
     mine = shard_of(mutations, shard)
     moved = moved_targets(mine, root)
     if moved:
@@ -112,12 +136,15 @@ def run(mutations: list, shard: Tuple[int, int], root: pathlib.Path, platform: s
     for m in mine:
         key = (m.test, m.network)
         if key not in green:
-            base = _node_test(m, root, None)
-            if base.returncode != 0:
+            base = _node_test(m, root, None, timeout)
+            if base.timed_out:
+                print(f"{m.test} timed out unmutated (after {timeout} s), so no mutation of it can be judged:\n{base.stdout[-3000:]}{base.stderr[-1000:]}")
+                return 2
+            if base.code != 0:
                 print(f"{m.test} fails unmutated, so no mutation of it can be judged:\n{base.stdout[-3000:]}{base.stderr[-1000:]}")
                 return 2
             green.add(key)
-        caught = _caught(m, root)
+        caught, timed_out = _caught(m, root, timeout)
         problem = verdict(m, caught, platform)
         if problem:
             problems.append((m, problem))
@@ -125,7 +152,7 @@ def run(mutations: list, shard: Tuple[int, int], root: pathlib.Path, platform: s
         elif platform in m.survives:
             print(f"SURVIVED 0/{m.runs} (expected on {platform}: {m.why}): {m.label()}", flush=True)
         else:
-            print(f"CAUGHT {caught}/{m.runs}: {m.label()}", flush=True)
+            print(f"CAUGHT {caught}/{m.runs}{f' ({timed_out} timed out)' if timed_out else ''}: {m.label()}", flush=True)
     if os.environ.get("GITHUB_ACTIONS") == "true":
         for m, problem in problems:
             print(f"::error file={m.path}::{m.old[0].strip()[:80]!r}: {problem}")

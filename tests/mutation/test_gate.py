@@ -1,7 +1,7 @@
 """The mutation gate's own behaviour, against a tiny repository with a real node test.
 
 Run: python3 -m unittest discover -s tests/mutation -p 'test_*.py'"""
-import contextlib, io, pathlib, sys, tempfile, textwrap, unittest
+import contextlib, io, os, pathlib, sys, tempfile, textwrap, time, unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gate  # noqa: E402
@@ -29,11 +29,18 @@ class Gate(unittest.TestCase):
         (self.root / "lib.mjs").write_text(LIB)
         (self.root / "lib.test.mjs").write_text(TEST)
 
-    def run_gate(self, mutations, shard=(1, 1)):
+    def run_gate(self, mutations, shard=(1, 1), **kw):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            status = gate.run(mutations, shard, self.root, sys.platform)
+            status = gate.run(mutations, shard, self.root, sys.platform, **kw)
         return status, out.getvalue()
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
 
     def m(self, old, new, **kw):
         return gate.Mutation("lib.mjs", (old,), (new,), "lib.test.mjs", **kw)
@@ -86,6 +93,31 @@ class Gate(unittest.TestCase):
         status, out = self.run_gate([self.m("a + b", "a - b")])
         self.assertEqual(status, 2, out)
         self.assertIn("fails unmutated", out)
+        self.assertNotIn("CAUGHT", out)
+
+    def test_a_mutant_whose_run_times_out_counts_as_caught_and_says_so(self):
+        # The mutant makes add loop forever: a hang is a change the test notices. The test
+        # process records its pid, and the whole run (node and its test process) is killed.
+        pids = self.root / "pids"
+        (self.root / "lib.test.mjs").write_text(TEST.replace(
+            'test("adds", () => assert.equal(add(2, 2), 4));',
+            'import { appendFileSync } from "node:fs";\n'
+            'test("adds", () => { appendFileSync(new URL("./pids", import.meta.url), `${process.pid}\\n`);'
+            ' let n = 0; while (add(2, 2) !== 4) n++; assert.equal(add(2, 2), 4); });'))
+        started = time.monotonic()
+        status, out = self.run_gate([self.m("a + b", "a - b")], timeout=3)
+        self.assertLess(time.monotonic() - started, 30, out)
+        self.assertEqual(status, 0, out)
+        self.assertIn("CAUGHT 1/1 (1 timed out): lib.mjs", out)
+        self.assertEqual((self.root / "lib.mjs").read_text(), LIB)
+        hung = int(pids.read_text().split()[-1])
+        self.assertFalse(self.alive(hung), "the timed-out run's test process is killed")
+
+    def test_a_baseline_that_times_out_is_red_never_a_pass(self):
+        (self.root / "lib.test.mjs").write_text(TEST.replace('test("other", () => assert.ok(true));', 'test("other", () => { for (;;); });'))
+        status, out = self.run_gate([self.m("a + b", "a - b")], timeout=3)
+        self.assertEqual(status, 2, out)
+        self.assertIn("lib.test.mjs timed out unmutated", out)
         self.assertNotIn("CAUGHT", out)
 
     def test_a_target_that_moved_stops_the_gate_before_any_mutation(self):
