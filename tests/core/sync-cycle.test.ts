@@ -1797,7 +1797,7 @@ async function waitGone(group: number, why: string): Promise<void> {
   }
 }
 
-const recordOf = async (x: Machine): Promise<{ group?: number }> => JSON.parse(await readFile(join(x.state, RECORD), "utf8"));
+const recordOf = async (x: Machine): Promise<{ group?: number; boot?: number; startedAt?: number }> => JSON.parse(await readFile(join(x.state, RECORD), "utf8"));
 
 test("a live update records its process group as it starts, and clears the record when it finishes", async () => {
   // A limit far longer than the filter: this update completes.
@@ -1806,6 +1806,11 @@ test("a live update records its process group as it starts, and clears the recor
   const group = await recordedGroup(b);
   assert.ok(Number.isInteger(group) && group >= 2, `${group} is a process group`);
   assert.ok(groupAlive(group), "the group is alive while the update runs");
+  const record = await recordOf(b);
+  // Within the tolerance the reader allows: uptime() counts whole seconds, so two
+  // readings of the boot instant differ by a second or so.
+  assert.ok(Math.abs((record.boot ?? 0) - bootInstant()) <= 5000, `the boot that group belongs to: ${record.boot}`);
+  assert.ok(Math.abs(Date.now() - (record.startedAt ?? 0)) < 20_000, `when it started: ${record.startedAt}`);
   const r = await cycling;
   assert.equal(r.outcome, "synced", r.reason ?? "");
   assert.ok(r.liveUpdated);
@@ -1922,7 +1927,7 @@ test("a record naming a process group that is gone is repaired like any other, a
   await new Promise((done) => ended.on("exit", done));
   const group = ended.pid ?? 0;
   await waitGone(group, "the helper process never exited");
-  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group }));
+  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group, boot: bootInstant(), startedAt: Date.now() }));
   await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });
   const after = await runCycle({ ...slow, liveUpdateTimeoutMs: undefined });
   assert.equal(after.outcome, "synced", after.reason ?? "");

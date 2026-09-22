@@ -434,7 +434,7 @@ REBOOT = "group recorded before a reboot"; HUNG = "longest limit a live update g
 mutate(F_RC, "  if (record.boot === undefined || Math.abs(bootInstant() - record.boot) > BOOT_TOLERANCE_MS) return null;\n", "", C, pattern=REBOOT)
 mutate(F_RC, "const BOOT_TOLERANCE_MS = 5000;", "const BOOT_TOLERANCE_MS = 604_800_000;", C, pattern=REBOOT)
 mutate(F_RC, '  const record: Record_ = group === undefined ? { from, to } : { from, to, group, boot: bootInstant(), startedAt: Date.now() };',
-       "  const record: Record_ = group === undefined ? { from, to } : { from, to, group };", C, pattern=WAITS)
+       "  const record: Record_ = group === undefined ? { from, to } : { from, to, group };", C, pattern="records its process group")
 mutate(F_RC, '  if (process.platform === "win32") return false;\n', "", RC, pattern="no process groups the check answers gone")
 mutate(F_RC, "  return { group: record.group, runningMs: Math.max(0, Date.now() - (record.startedAt ?? Date.now())) };",
        "  return { group: record.group, runningMs: Date.now() - (record.startedAt ?? Date.now()) };", C, pattern=HUNG)
