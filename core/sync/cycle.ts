@@ -192,12 +192,14 @@ interface Ladder {
 
 const limitOf = (ladder: Ladder): number => ladder.base * 2 ** ladder.level;
 
-// Only a level this code writes reads as itself. A missing or unreadable file reads as
-// the first rung: the next timeout writes the file again, so a garbled one costs at most
+// Only a level this code writes reads as itself: one digit, no sign, no spaces and no
+// line break, and no rung past MAX_LEVEL (the character class is its rungs, so the two
+// move together). A missing or unreadable file reads as the first rung, and so does
+// anything else: the next timeout writes the file again, so a garbled one costs at most
 // one short attempt, and it never reads as more than was written.
 async function readLadder(stateDir: string, base: number): Promise<Ladder> {
   const text = await readFile(join(stateDir, LEVEL), "utf8").catch(() => "");
-  return { base, level: /^\d+$/.test(text) && Number(text) <= MAX_LEVEL ? Number(text) : 0 };
+  return { base, level: /^[0-6]$/.test(text) ? Number(text) : 0 };
 }
 
 async function writeLevel(stateDir: string, level: number): Promise<void> {

@@ -1725,7 +1725,7 @@ test("a refusal leaves the live update's limit where it was, and so does a failu
 
 test("a live update's limit that cannot be read is the base: a garbled record costs at most one short attempt", async () => {
   const { b, slow } = await behindSlowFilter("sleep 10; cat", 200);
-  for (const garbled of ["", "two\n", "7", "1e3"]) {
+  for (const garbled of ["", "two\n", "2\n", "7", "1e3"]) {
     await writeRel(b.state, "live-update-level", garbled);
     const r = await runCycle(slow);
     assert.equal(r.outcome, "unsynced", `${JSON.stringify(garbled)}: ${r.reason}`);

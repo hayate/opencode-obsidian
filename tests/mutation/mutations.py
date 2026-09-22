@@ -359,7 +359,13 @@ mutate(CY, "finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) 
        pattern="a repair gets the live update's current limit")
 mutate(CY, '["reset", "-q", "--keep", next], { cwd: dir, timeoutMs: limitOf(ladder) }', '["reset", "-q", "--keep", next], { cwd: dir, timeoutMs: ladder.base }', C, runs=5, pattern=LADDER)
 mutate(CY, "      if (!(err instanceof RepairTimedOut)) throw err;\n", "      throw err;\n", C, runs=5, pattern=f"{LADDER}|repair that times out stops")
-mutate(CY, "/^\\d+$/.test(text) && Number(text) <= MAX_LEVEL ? Number(text) : 0", "Number(text) || 0", C, pattern="cannot be read is the base")
+mutate(CY, "/^[0-6]$/.test(text) ? Number(text) : 0", "Number(text) || 0", C, pattern="cannot be read is the base")
+mutate(CY, "/^[0-6]$/.test(text) ? Number(text) : 0", "/^[0-6]$/.test(text.trim()) ? Number(text.trim()) : 0", C, pattern="cannot be read is the base")
+mutate(CY, "/^[0-6]$/.test(text)", "/^[0-9]$/.test(text)", C, pattern="cannot be read is the base")
+# The repair that timed out stops the cycle before its snapshot: without this return, the
+# half-repaired vault would be snapshotted and pushed.
+mutate(CY, "      await timedOut(input.stateDir, ladder, result);\n      return result;", "      await timedOut(input.stateDir, ladder, result);", C, runs=5,
+       pattern="repair that times out stops")
 mutate(F_RC, "err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result) : err", "err", RC, pattern="a repair that times out saves")
 mutate("core/session.ts", "  if (!r.timedOut.ceiling) return", "  if (true) return", SE, pattern="statusFromCycle gives a live update that timed out")
 mutate("core/session.ts", "  if (ms % 60_000 === 0) return `${ms / 60_000} min`;\n", "", SE, pattern="statusFromCycle gives a live update that timed out")
