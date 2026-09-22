@@ -22,6 +22,8 @@ test("gitOk throws a GitError carrying the result on a non-zero exit", async () 
     assert.notEqual(err.result.code, 0);
     assert.equal(err.result.timedOut, false);
     assert.deepEqual(err.args, ["rev-parse", "HEAD"]);
+    // An ordinary failure keeps git's own words; only a leftover lock is rephrased.
+    assert.match(err.message, /^git rev-parse HEAD exited \d+: fatal: /);
     return true;
   });
 });
@@ -129,13 +131,40 @@ test("the index.lock message is not retried when no index.lock exists", async ()
 
 const exists = (path: string): Promise<boolean> => stat(path).then(() => true, () => false);
 
-test("a command killed on timeout is never retried, and the index.lock it left is removed", async () => {
+test("an add killed on its timeout has the index.lock it left removed", async () => {
   const dir = await tempDir();
   await initRepo(dir);
   await fakeFilter(dir, "exec sleep 10");
   await writeRel(dir, "a.md", "a\n");
   const r = await git(["add", "a.md"], { cwd: dir, timeoutMs: 500 });
-  assert.equal(r.timedOut, true, "a retry would have returned a later, non-timed-out attempt");
+  assert.equal(r.timedOut, true);
+  assert.equal(await exists(join(dir, ".git", "index.lock")), false);
+  assert.match(r.stderr, /removed .*index\.lock/);
+});
+
+test("a commit killed on its timeout has the index.lock it left removed", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  await commitFile(dir, "a.md", "a\n", "a");
+  await fakeFilter(dir, "exec sleep 10");
+  await writeRel(dir, "a.md", "changed\n");
+  // -a stages the change under the index lock, through the hanging clean filter.
+  const r = await git(["commit", "-a", "-q", "-m", "m"], { cwd: dir, timeoutMs: 500 });
+  assert.equal(r.timedOut, true);
+  assert.equal(await exists(join(dir, ".git", "index.lock")), false);
+  assert.match(r.stderr, /removed .*index\.lock/);
+});
+
+test("a checkout killed on its timeout has the index.lock it left removed", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  await commitFile(dir, "a.md", "one\n", "one");
+  await commitFile(dir, "a.md", "two\n", "two");
+  // The smudge filter hangs while checkout writes a.md under the index lock.
+  await gitOk(["config", "filter.slow.smudge", "sleep 10; cat"], { cwd: dir });
+  await writeRel(dir, ".gitattributes", "*.md filter=slow\n");
+  const r = await git(["checkout", "-q", "-f", "--detach", "HEAD~1"], { cwd: dir, timeoutMs: 500 });
+  assert.equal(r.timedOut, true);
   assert.equal(await exists(join(dir, ".git", "index.lock")), false);
   assert.match(r.stderr, /removed .*index\.lock/);
 });
