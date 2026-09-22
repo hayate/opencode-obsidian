@@ -381,25 +381,34 @@ mutate(CY, "await timedOut(input.stateDir, ladder, result, err.path);", "await t
        pattern="never finishes climbs|slower than the base limit")
 mutate("core/session.ts", '  const note = r.timedOut.note === null ? "" : ` while it was rewriting ${quoted(r.timedOut.note)}`;',
        '  const note = "";', SE, pattern="statusFromCycle gives a live update that timed out")
-mutate("core/session.ts", "  const also = said.startsWith(TIMED_OUT) ? said.slice(TIMED_OUT.length) : `; ${said}`;", '  const also = "";', SE,
-       pattern="statusFromCycle gives a live update that timed out")
+mutate("core/session.ts", "  const rest = (lead: string): string => (said.startsWith(lead) ? said.slice(lead.length) : `; ${said}`);", '  const rest = (lead: string): string => "";', SE,
+       pattern="statusFromCycle gives a live update that timed out|statusFromCycle waits at warn for an update")
 # Fix round 1, Important 1: an update outlives the session that started it (git is detached,
 # and its kill timer dies with the session). The cycle waits for a recorded group that is
 # alive, rather than setting its notes back and pushing them, and a normal exit takes the
 # groups this process started with it.
 WAITS = "waits for a record's live process group"
-mutate(F_RC, "  return groupAlive(record.group) ? record.group : null;", "  return null;", C, runs=5, pattern=WAITS)
-mutate(CY, "      result.reason = `an earlier vault update is still running (process group ${running}); sync waits for it. If it is hung, end that process.`;\n      return result;",
-       "      result.reason = `an earlier vault update is still running (process group ${running}); sync waits for it. If it is hung, end that process.`;", C, runs=5, pattern=WAITS)
+mutate(F_RC, "  if (!groupAlive(record.group)) return null;\n", "", C, runs=5, pattern="process group that is gone is repaired")
+mutate(CY, "      result.waiting = { ...running, hung: running.runningMs > limitOf({ ...ladder, level: MAX_LEVEL }) };\n      return result;",
+       "      result.waiting = { ...running, hung: running.runningMs > limitOf({ ...ladder, level: MAX_LEVEL }) };", C, runs=5, pattern=WAITS)
 mutate(CY, "    onSpawn: (group) => recordIntent(input.stateDir, live, next, group),\n", "", C, pattern="records its process group")
 mutate("core/git.ts", '  if (started.size === 0) process.on("exit", killStarted);\n', "", G, pattern="session that exits normally takes the git")
 mutate("core/git.ts", "    started.delete(pid);\n", "", G, pattern="session that exits normally takes the git")
 # The wait comes before the blocked-cycle bookkeeping, so a cycle that only waited leaves
 # the streak where it was, as a busy one does; and a group of 0 or 1 is never a group.
-WAIT_BLOCK = """    const running = await runningUpdate(input.stateDir);
+WAIT_BLOCK = """    // Spec 5.4 step 5: an update whose session died keeps running, in the process group
+    // git.ts recorded with the intent (the kill timer died with that session). Repairing
+    // or snapshotting now would set its notes back under it and push the old versions as
+    // this machine's change, so this cycle does nothing at all: it repairs nothing,
+    // snapshots nothing, pushes nothing, and, like a cycle that found the lock busy, it
+    // leaves the blocked-cycle streak alone.
+    const running = await runningUpdate(input.stateDir);
     if (running !== null) {
       result.outcome = "unsynced";
-      result.reason = `an earlier vault update is still running (process group ${running}); sync waits for it. If it is hung, end that process.`;
+      result.reason = STILL_RUNNING;
+      // Past the longest limit a live update gets, it is not slow but hung, and the status
+      // escalates to the notify the ladder uses at its own ceiling.
+      result.waiting = { ...running, hung: running.runningMs > limitOf({ ...ladder, level: MAX_LEVEL }) };
       return result;
     }
 """
