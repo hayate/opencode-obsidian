@@ -174,18 +174,46 @@ async function folderFor(path: string): Promise<boolean> {
   }
 }
 
-// Clears the path for the note: a folder the update made where the note was, which
-// the removals before have emptied, goes; one that still holds anything is someone's,
-// and false leaves it. Nothing there, or a file (which the rename replaces): true.
+// The folders of a subtree that holds nothing but folders, deepest first; null when
+// it holds anything else (a file, a symlink).
+async function onlyFolders(path: string): Promise<string[] | null> {
+  const folders: string[] = [];
+  for (const entry of await readdir(path, { withFileTypes: true })) {
+    const below = entry.isDirectory() ? await onlyFolders(join(path, entry.name)) : null;
+    if (below === null) return null;
+    folders.push(...below);
+  }
+  return [...folders, path];
+}
+
+// Clears the path for the note. Nothing there, or a file (which the rename replaces):
+// true. A folder whose whole subtree holds only folders goes, and the note comes back:
+// the old tree held a file here, so those folders appeared after the update began (the
+// update's, emptied by the removals before, or left by a repair that died before its
+// prune), and a path left empty would reach the snapshot as a deletion. They go deepest
+// first by rmdir alone, never a recursive removal: a file saved into them meanwhile
+// makes an rmdir fail, and the path is left as it is (false). A folder holding anything
+// else is someone's: false, and nothing in it is touched.
 async function roomFor(path: string): Promise<boolean> {
+  let info;
   try {
-    await rmdir(path);
-    return true;
+    info = await lstat(path);
   } catch (err) {
-    if (errno(err) === "ENOENT" || errno(err) === "ENOTDIR") return true;
-    if (errno(err) === "ENOTEMPTY" || errno(err) === "EEXIST") return false;
+    if (absent(err)) return true;
     throw err;
   }
+  if (!info.isDirectory()) return true;
+  const folders = await onlyFolders(path);
+  if (folders === null) return false;
+  for (const folder of folders) {
+    try {
+      await rmdir(folder);
+    } catch (err) {
+      if (errno(err) === "ENOTEMPTY" || errno(err) === "EEXIST") return false;
+      throw err;
+    }
+  }
+  return true;
 }
 
 // Whether two spellings name one entry on disk (same device and inode). Where the disk

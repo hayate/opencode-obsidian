@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { git, GitError, gitOk } from "../../core/git.ts";
@@ -324,6 +324,61 @@ test("a removal that finds nothing to remove leaves the folders around it alone,
   assert.notEqual(await finishInterrupted(state, dir), null);
   assert.equal((await stat(join(dir, "Inbox"))).isDirectory(), true, "the user's empty folder is still there");
   assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
+});
+
+// The update turned note x/p into x/p/q/c.txt, and was killed after writing it.
+const noteIntoDeepFolders = (): Promise<{ dir: string; from: string; to: string }> =>
+  history({ "x/p": "the note\n", "x/z.md": "old\n" }, { "x/p": null, "x/p/q/c.txt": "deep in the new folder\n", "x/z.md": "new\n" });
+
+for (const prints of [true, false]) {
+  test(`a note whose path holds only empty folders comes back: the empty tree goes (${prints ? "with" : "without"} fingerprints)`, async () => {
+    const { dir, from, to } = await noteIntoDeepFolders();
+    const state = await killUpdate(dir, from, to, { prints });
+    // Gone, its folders left: a repair that died between the unlink and the prune, or the user's deletion.
+    await unlink(join(dir, "x/p/q/c.txt"));
+    const done = await finishInterrupted(state, dir);
+    assert.deepEqual(done, prints ? { restored: ["x/p", "x/z.md"], kept: ["x/p/q/c.txt"], moved: false } : { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [], moved: false });
+    assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
+    assert.equal(await status(dir), "");
+    assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
+  });
+}
+
+test("a note whose path holds a user's file deeper down is kept, and everything of theirs in it stays as it was", async () => {
+  const { dir, from, to } = await noteIntoDeepFolders();
+  const state = await killUpdate(dir, from, to);
+  await writeFile(join(dir, "x/p/q/mine.txt"), "the user's note\n");
+  await mkdir(join(dir, "x/p/q/r"));
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/z.md"], kept: ["x/p"], moved: false });
+  assert.equal(await readFile(join(dir, "x/p/q/mine.txt"), "utf8"), "the user's note\n");
+  assert.equal((await stat(join(dir, "x/p/q/r"))).isDirectory(), true, "their empty folder beside it stays too");
+  assert.equal(await exists(join(dir, "x/p/q/c.txt")), false, "the update's own file goes");
+});
+
+test("a file saved into the empty tree while the repair clears it keeps the path: the tree goes by rmdir alone, never a recursive removal", async () => {
+  const { dir, from, to } = await noteIntoDeepFolders();
+  const state = await killUpdate(dir, from, to);
+  await unlink(join(dir, "x/p/q/c.txt"));
+  // Real git cannot time a save into the gap between reading the tree and removing
+  // it: the save lands as soon as the repair has read the deepest folder empty.
+  const fsp = createRequire(import.meta.url)("node:fs/promises") as typeof import("node:fs/promises");
+  const real = fsp.readdir;
+  const late = join(dir, "x/p/q/late.md");
+  fsp.readdir = (async (path: string, ...rest: unknown[]) => {
+    const names = await (real as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
+    if (path === join(dir, "x/p/q") && !(await exists(late))) await writeFile(late, "saved meanwhile\n");
+    return names;
+  }) as unknown as typeof real;
+  syncBuiltinESMExports();
+  let done;
+  try {
+    done = await finishInterrupted(state, dir);
+  } finally {
+    fsp.readdir = real;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(done, { restored: ["x/z.md"], kept: ["x/p/q/c.txt", "x/p"], moved: false });
+  assert.equal(await readFile(late, "utf8"), "saved meanwhile\n");
 });
 
 test("a repair stopped after the emptied folder went, before the note came back, gets the note back next time", async () => {
