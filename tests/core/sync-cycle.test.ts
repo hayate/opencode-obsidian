@@ -144,6 +144,40 @@ test("the autostash scenario: a conflicting edit keeps both versions, never paus
   for (const x of [a, b]) assert.doesNotMatch(await read(x, "x/HANDOFF.md"), /<<<<<<<|>>>>>>>/);
 });
 
+test("a note kept being edited after a clash, on the machine that met it, neither blocks the live update nor multiplies copies, and its edits arrive", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/HANDOFF.md", "A state\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  await writeRel(b.projects, "x/HANDOFF.md", "B edit 1\n");
+  const clash = await cycle(remote, b);
+  assert.equal(clash.conflicts.length, 1, JSON.stringify(clash.conflicts));
+  const copy = clash.conflicts[0]?.copy ?? "";
+  // B keeps editing the note; A keeps syncing, with changes of its own elsewhere.
+  for (let round = 2; round <= 4; round++) {
+    await writeRel(b.projects, "x/HANDOFF.md", `B edit ${round}\n`);
+    // Once, B's editor saves again between B's snapshot and its live update.
+    if (round === 3) await justBeforeLiveUpdate(b, "printf 'B edit 3, saved mid-cycle\\n' > x/HANDOFF.md");
+    await writeRel(a.projects, `x/a-${round}.md`, `a ${round}\n`);
+    const ra = await cycle(remote, a);
+    assert.equal(ra.outcome, "synced", ra.reason ?? "");
+    assert.deepEqual([ra.blockedBy, ra.conflicts], [[], []], `round ${round}, A`);
+    const rb = await cycle(remote, b);
+    assert.equal(rb.outcome, "synced", rb.reason ?? "");
+    assert.deepEqual([rb.blockedBy, rb.conflicts], [[], []], `round ${round}, B`);
+    assert.ok(rb.liveUpdated, `round ${round}: the live update ran`);
+    assert.equal(await read(b, `x/a-${round}.md`), `a ${round}\n`, "A's changes arrive");
+    if (round === 3) assert.equal(await read(b, "x/HANDOFF.md"), "B edit 3, saved mid-cycle\n", "the save that landed mid-cycle is kept");
+  }
+  const last = await cycle(remote, a);
+  assert.deepEqual([last.blockedBy, last.conflicts], [[], []]);
+  assert.equal(await read(a, "x/HANDOFF.md"), "B edit 4\n", "B's edits arrive");
+  assert.equal(await remoteFile(remote, "x/HANDOFF.md"), "B edit 4");
+  const copies = (names: string[]): string[] => names.filter((n) => n.includes(".conflict-"));
+  assert.deepEqual(copies(await remoteNames(remote)), [copy], "exactly one conflict copy");
+  for (const x of [a, b]) assert.deepEqual(copies((await readdir(join(x.projects, "x"))).map((n) => `x/${n}`)), [copy]);
+});
+
 test("a held-back file stays dirty and does not block unrelated remote changes", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
