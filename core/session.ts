@@ -14,6 +14,7 @@ import { normalizeOrigin, recordOrigin, resolveProject, type ProjectResolution }
 import { acquireLock } from "./lock.ts";
 import { branchKey, computeHeads, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
 import { runCycle, type CycleResult } from "./sync/cycle.ts";
+import type { Conflict } from "./sync/resolve.ts";
 import { remoteVisibility, type Visibility } from "./sync/privacy.ts";
 import { prepareProjects, syncConfig, type SyncConfig, type SyncState } from "./sync/state.ts";
 import { dayStamp } from "./time.ts";
@@ -109,12 +110,32 @@ async function resolveSafely(vault: Vault, sessionDir: string): Promise<ProjectR
   }
 }
 
+// One plain sentence per conflict: where each version is, and what to do.
+function conflictLine(c: Conflict): string {
+  const path = quoted(c.path);
+  const copy = c.copy === null ? "" : quoted(c.copy);
+  switch (c.kind) {
+    case "both-changed":
+      return `${path} changed on two machines: yours stays; the other version is saved as ${copy}. Merge what you need into the note, then delete the copy`;
+    case "deleted-here":
+      return `${path}, which you deleted, was changed on another machine: it stays deleted; that version is saved as ${copy}`;
+    case "deleted-there":
+      return `${path} was deleted on another machine; your version is kept`;
+    case "two-names":
+      return `a note is now both ${path} and ${quoted(c.other ?? "")}: this machine and another renamed it differently; both names are kept`;
+    case "file-folder":
+      return `${path} is a file on one machine and a folder on another: yours stays; the other is saved as ${copy}`;
+    case "type-differs":
+      return `${path} is a different kind of file on another machine (a symlink, or an executable): yours stays; the other is saved as ${copy}`;
+  }
+}
+
 // File names come from the vault, and status lines sit outside the payload's data
 // block: every one is quoted.
 export function statusFromCycle(r: CycleResult): StatusItem[] {
   const out: StatusItem[] = [];
   const files = (list: string[]): string => list.map((f) => quoted(f)).join(", ");
-  if (r.outcome === "paused") out.push({ level: "error", text: r.reason ?? "sync paused" });
+  if (r.outcome === "stopped") out.push({ level: "error", text: `sync stopped: ${r.reason ?? ""}` });
   if (r.outcome === "unsynced") out.push({ level: "warn", text: `unsynced: ${r.reason ?? "push did not happen"}` });
   if (r.outcome === "aborted") out.push({ level: "error", text: `sync aborted: ${r.reason ?? ""}` });
   if (r.outcome === "busy") out.push({ level: "info", text: "another session is syncing; this one will sync when idle" });
@@ -122,6 +143,11 @@ export function statusFromCycle(r: CycleResult): StatusItem[] {
   if (r.outcome === "synced" && r.reason) out.push({ level: "warn", text: r.reason });
   for (const h of r.heldBack) out.push({ level: "warn", text: `held back by the secret scan (${h.rules.join(", ")}): ${quoted(h.file)}` });
   for (const e of r.embedded) out.push({ level: "warn", text: `not synced: ${quoted(e)} is a git repository inside Projects/ (move it out, or remove its .git)` });
+  // Spec 5.4 step 3: a conflict never pauses sync; each one gets a line saying where
+  // both versions are (at most 10 lines, then a count).
+  for (const c of r.conflicts.slice(0, 10)) out.push({ level: "warn", text: conflictLine(c) });
+  if (r.conflicts.length > 10) out.push({ level: "warn", text: `and ${r.conflicts.length - 10} more notes changed on two machines, each with its copy beside it` });
+  for (const n of r.notices) out.push({ level: "info", text: n });
   if (r.caseCollisions.length) {
     out.push({
       level: "warn",
@@ -267,7 +293,7 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
     }
     out.push(...statusFromSync(state));
     if (state.kind === "ready" && cfg.remote) {
-      out.push(...statusFromCycle(await runCycle({ projectsDir: vault.projectsDir, remote: cfg.remote, branch: state.branch, stateDir, machine })));
+      out.push(...statusFromCycle(await runCycle({ projectsDir: vault.projectsDir, remote: cfg.remote, branch: state.branch, stateDir, machine, timezone: shared.timezone })));
     }
     // The top-level read above ran before Projects/ existed on a fresh machine,
     // so it could only ever see this machine's own zone. Now that Projects/ is

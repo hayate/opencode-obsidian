@@ -1,13 +1,18 @@
 // Spec 5.3-5.4: one sync cycle. The live repo (Projects/) only ever gets a
-// snapshot commit (changes no file) and a `reset --keep` (all-or-nothing). All
-// fetch/rebase/push happens in a private state clone nobody else touches, so a
-// conflict or a half-applied rebase is never visible in the vault.
-import { mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
+// snapshot commit (changes no file) and a `reset --keep` (all-or-nothing). Fetch,
+// merge and push happen in a private bare state clone: trees are merged in git's
+// object store, so no conflict marker and no case folding ever reach a worktree,
+// and a conflict never pauses sync (both versions are kept, resolve.ts).
+import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock, type LockHandle } from "../lock.ts";
-import { redactUrlCredentials, scanStaged } from "../secrets.ts";
+import { redactUrlCredentials, scanRange, scanStaged } from "../secrets.ts";
 import { quoted, writeAtomic } from "../store.ts";
+import { ensureStateClone } from "./clone.ts";
+import { conflictStamp } from "./copies.ts";
+import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, type Finished } from "./recovery.ts";
+import { mergeAndResolve, type Conflict } from "./resolve.ts";
 import { identityProblem } from "./state.ts";
 
 export interface CycleInput {
@@ -16,12 +21,19 @@ export interface CycleInput {
   branch: string;
   stateDir: string;
   machine: string;
+  // The vault timezone, for the conflict time in copy names.
+  timezone: string;
   quietMs?: number;
   lockWaitMs?: number;
+  // The live update's own timeout (git.ts LOCAL_TIMEOUT_MS when unset).
+  liveUpdateTimeoutMs?: number;
+  // remember_sync's "adopt the rewritten remote" (spec 5.4 step 3).
+  adoptRewrite?: boolean;
 }
 
 export interface CycleResult {
-  outcome: "synced" | "busy" | "aborted" | "paused" | "unsynced";
+  // stopped: sync cannot go on until the user acts (the reason says how).
+  outcome: "synced" | "busy" | "aborted" | "stopped" | "unsynced";
   reason: string | null;
   committed: string | null;
   heldBack: Array<{ file: string; rules: string[] }>;
@@ -30,12 +42,15 @@ export interface CycleResult {
   liveUpdated: boolean;
   blockedBy: string[];
   blockedCycles: number;
-  conflicts: string[];
+  conflicts: Conflict[];
   embedded: string[];
   caseCollisions: string[];
+  // Things the user should know that did not stop the cycle.
+  notices: string[];
 }
 
-export const LAST_INTEGRATED = "refs/sro/last-integrated";
+// The remote head this machine last integrated with (spec 5.3).
+export const REMOTE_SEEN = "refs/sro/remote-seen";
 const INTEGRATED = "refs/sro/integrated";
 const NO_SIGN = ["-c", "commit.gpgsign=false"];
 const MAX_PUSH_ATTEMPTS = 3;
@@ -160,12 +175,20 @@ async function rev(cwd: string, ref: string): Promise<string | null> {
   return r.code === 0 ? r.stdout.trim() : null;
 }
 
-async function isAncestor(cwd: string, a: string, b: string): Promise<boolean> {
-  return (await git(["merge-base", "--is-ancestor", a, b], { cwd })).code === 0;
-}
+type Seen = { kind: "absent" } | { kind: "seen"; commit: string } | { kind: "unreadable" } | { kind: "unknown" };
 
-async function exists(path: string): Promise<boolean> {
-  return (await stampOf(path)) !== null;
+// refs/sro/remote-seen, three ways (verified, git 2.50.1): show-ref --exists says
+// present (0) or absent (2), and a present ref must name a commit. show-ref --verify
+// and rev-parse read a ref file git cannot parse as absent, which would skip the
+// rewrite check and merge or push back what a rewrite dropped.
+async function remoteSeen(dir: string): Promise<Seen> {
+  const exists = await git(["show-ref", "--exists", REMOTE_SEEN], { cwd: dir });
+  if (exists.timedOut) return { kind: "unknown" };
+  if (exists.code === 2) return { kind: "absent" };
+  if (exists.code !== 0) return { kind: "unreadable" };
+  const r = await git(["rev-parse", "-q", "--verify", `${REMOTE_SEEN}^{commit}`], { cwd: dir });
+  if (r.timedOut) return { kind: "unknown" };
+  return r.code === 0 ? { kind: "seen", commit: r.stdout.trim() } : { kind: "unreadable" };
 }
 
 function emptyResult(): CycleResult {
@@ -182,6 +205,7 @@ function emptyResult(): CycleResult {
     conflicts: [],
     embedded: [],
     caseCollisions: [],
+    notices: [],
   };
 }
 
@@ -249,43 +273,18 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
   return { ok: true, pushAllowed: (await changedSince(dir, before)).length === 0 };
 }
 
-// Nobody else uses the clone and the sync lock is held, so any lock file in it is
-// a leftover: a git command killed on its timeout (spec 5.6).
-async function leftoverLock(gitDir: string): Promise<boolean> {
-  const names = [...(await readdir(gitDir)), ...(await readdir(join(gitDir, "refs"), { recursive: true }))];
-  return names.some((name) => name.endsWith(".lock"));
-}
+type Ancestry = "yes" | "no" | "unknown";
 
-async function ensureStateClone(input: CycleInput): Promise<string> {
-  const clone = join(input.stateDir, "sync");
-  const gitDir = join(clone, ".git");
-  // The clone is disposable: a crash mid-rebase (either backend) or a leftover
-  // lock means rebuild it.
-  if (
-    (await exists(gitDir)) &&
-    ((await exists(join(gitDir, "rebase-merge"))) || (await exists(join(gitDir, "rebase-apply"))) || (await leftoverLock(gitDir)))
-  ) {
-    await rm(clone, { recursive: true, force: true });
-  }
-  if (!(await exists(join(clone, ".git")))) {
-    await rm(clone, { recursive: true, force: true });
-    await mkdir(input.stateDir, { recursive: true });
-    await gitOk(["clone", "-q", "--no-checkout", input.projectsDir, clone], { cwd: input.stateDir });
-    await gitOk(["remote", "rename", "origin", "live"], { cwd: clone });
-    await gitOk(["remote", "add", "origin", input.remote], { cwd: clone });
-  }
-  // Re-pointed every cycle: moving the vault or changing the remote cannot strand it.
-  await gitOk(["remote", "set-url", "live", input.projectsDir], { cwd: clone });
-  await gitOk(["remote", "set-url", "origin", input.remote], { cwd: clone });
-  for (const key of ["user.name", "user.email"]) {
-    await gitOk(["config", key, await gitOk(["config", key], { cwd: input.projectsDir })], { cwd: clone });
-  }
-  return clone;
+// merge-base --is-ancestor: 0 is yes, 1 is no, anything else (a missing object, a
+// timeout) is "could not tell", which stops the cycle instead of reading as "no".
+async function ancestry(cwd: string, a: string, b: string): Promise<Ancestry> {
+  const r = await git(["merge-base", "--is-ancestor", a, b], { cwd });
+  if (r.timedOut) return "unknown";
+  return r.code === 0 ? "yes" : r.code === 1 ? "no" : "unknown";
 }
 
 // A status line, not a transcript: at most the first 10 names, quoted and
-// capped like any other, then a count of what was left out. The full list
-// (never capped) is still reported separately in the result.
+// capped like any other, then a count of what was left out.
 function joinNames(names: string[], max = 10): string {
   const shown = names.slice(0, max).map((n) => quoted(n));
   if (names.length > max) shown.push(`and ${names.length - max} more`);
@@ -303,42 +302,111 @@ function firstLines(stderr: string, count = 3): string {
 }
 
 type Integration =
-  | { kind: "ok"; next: string; needsPush: boolean }
-  | { kind: "conflict"; files: string[] }
+  | { kind: "ok"; next: string; needsPush: boolean; conflicts: Conflict[] }
+  | { kind: "stopped"; reason: string }
   | { kind: "unsynced"; reason: string };
 
-async function integrate(clone: string, input: CycleInput, live: string, last: string | null): Promise<Integration> {
+async function changedBetween(clone: string, from: string, to: string): Promise<string[]> {
+  return zList(clone, ["diff", "--name-only", "--no-renames", from, to]);
+}
+
+// `sync(<machine>): <n> files [<projects>]` for a commit built in the state clone.
+async function mergeMessage(clone: string, machine: string, from: string, tree: string): Promise<string> {
+  const files = await changedBetween(clone, from, tree);
+  const projects = [...new Set(files.map((f) => f.split("/")[0]))].sort();
+  return `sync(${machine}): ${files.length} file${files.length === 1 ? "" : "s"} [${projects.join(", ")}]`;
+}
+
+// Spec 5.4 step 3: what a push would add to the remote goes through the step-2
+// scan, except objects the remote's tree already holds (a copy of a remote version
+// is inside the trusted remote already, and would otherwise block every cycle).
+async function outboundHits(clone: string, from: string, to: string): Promise<string[]> {
+  const hits = await scanRange(clone, from, to);
+  if (!hits.size) return [];
+  const remoteObjects = new Set(
+    (await zList(clone, ["ls-tree", "-r", from])).map((line) => line.slice(0, line.indexOf("\t")).split(" ")[2]),
+  );
+  const flagged: string[] = [];
+  for (const file of hits.keys()) {
+    const oid = (await git(["rev-parse", "-q", "--verify", `${to}:${file}`], { cwd: clone })).stdout.trim();
+    if (!remoteObjects.has(oid)) flagged.push(file);
+  }
+  return flagged.sort();
+}
+
+async function outbound(clone: string, from: string, to: string, conflicts: Conflict[]): Promise<Integration> {
+  const flagged = await outboundHits(clone, from, to);
+  if (flagged.length) {
+    return {
+      kind: "stopped",
+      reason: `the secret scan flags what this sync would send in ${joinNames(flagged)}: nothing was pushed (remove the secret, then sync again)`,
+    };
+  }
+  return { kind: "ok", next: to, needsPush: true, conflicts };
+}
+
+async function integrate(clone: string, input: CycleInput, live: string): Promise<Integration> {
   const b = input.branch;
+  // Stray temporary index files from a killed cycle (the sync lock is held).
+  for (const name of await readdir(clone)) if (name.startsWith("sro-index-")) await rm(join(clone, name), { force: true });
   await gitOk(["fetch", "-q", "live", `+refs/heads/${b}:refs/remotes/live/${b}`], { cwd: clone });
+  // remote-seen lives in the live repo, which keeps its commit reachable; a rebuilt
+  // clone has it too, since a local clone links the whole object store.
+  const seen = await remoteSeen(input.projectsDir);
+  if (seen.kind === "unknown") return { kind: "unsynced", reason: `reading ${REMOTE_SEEN} timed out` };
+  if (seen.kind === "unreadable") {
+    return {
+      kind: "stopped",
+      reason: `${REMOTE_SEEN} in Projects/ does not name a commit git can read: sync stopped, so a rewritten remote cannot go unnoticed. If the remote's history was not rewritten, delete it (git update-ref -d ${REMOTE_SEEN}) and sync again.`,
+    };
+  }
   const fetched = await git(["fetch", "-q", "origin", `+refs/heads/${b}:refs/remotes/origin/${b}`], {
     cwd: clone,
     timeoutMs: NETWORK_TIMEOUT_MS,
   });
-  if (fetched.code !== 0) {
+  if (fetched.code !== 0 || fetched.timedOut) {
     const detail = firstLines(fetched.stderr) || (fetched.timedOut ? "timed out" : `git exited ${fetched.code}`);
     return { kind: "unsynced", reason: `fetch failed: ${detail}` };
   }
-  const upstream = `refs/remotes/origin/${b}`;
-  const upstreamSha = await rev(clone, upstream);
-  if (upstreamSha === null) return { kind: "unsynced", reason: `remote has no branch ${b}` };
-  if (await isAncestor(clone, live, upstream)) return { kind: "ok", next: upstreamSha, needsPush: false };
+  const upstream = await rev(clone, `refs/remotes/origin/${b}`);
+  if (upstream === null) return { kind: "unsynced", reason: `remote has no branch ${b}` };
+  const when = conflictStamp(new Date(), input.timezone);
 
-  // Replay only what the remote has not seen: commits after last-integrated.
-  const base = last && (await isAncestor(clone, last, live)) ? last : await gitOk(["merge-base", live, upstream], { cwd: clone });
-  await gitOk(["checkout", "-q", "-f", "--detach", live], { cwd: clone });
-  await gitOk(["clean", "-q", "-f", "-d", "-x"], { cwd: clone });
-  const rebased = await git([...NO_SIGN, "rebase", "-q", "--onto", upstream, base], { cwd: clone });
-  if (rebased.code !== 0) {
-    const unmerged = await zList(clone, ["diff", "--name-only", "--diff-filter=U"]);
-    await git(["rebase", "--abort"], { cwd: clone });
-    if (unmerged.length) return { kind: "conflict", files: unmerged };
-    // No conflict (a hook refused, a timeout, a broken clone): nothing for the user
-    // to resolve, so it is not a pause. The next cycle tries again.
-    const detail = firstLines(rebased.stderr) || (rebased.timedOut ? "timed out" : `git exited ${rebased.code}`);
-    return { kind: "unsynced", reason: `rebase failed: ${detail}` };
+  if (seen.kind === "seen") {
+    const kept = await ancestry(clone, seen.commit, upstream);
+    if (kept === "unknown") return { kind: "unsynced", reason: "could not tell whether the remote's history was rewritten" };
+    if (kept === "no") {
+      if (!input.adoptRewrite) {
+        return {
+          kind: "stopped",
+          reason:
+            "the remote's history was rewritten (a force-push): sync stopped, so nothing the rewrite dropped is deleted here or pushed back. If the rewrite was intended, run remember_sync to adopt the rewritten remote.",
+        };
+      }
+      // Adopt: carry over only this machine's unsent changes, with the single parent
+      // upstream, so none of the dropped history is published again.
+      const base = await gitOk(["merge-base", seen.commit, live], { cwd: clone });
+      const merged = await mergeAndResolve(clone, upstream, live, { mergeBase: base, when });
+      if (merged.kind === "stop") return { kind: "stopped", reason: `${merged.reason}: ${joinNames(merged.paths)}` };
+      const message = await mergeMessage(clone, input.machine, upstream, merged.tree);
+      const next = await gitOk([...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-m", message], { cwd: clone });
+      return outbound(clone, upstream, next, merged.conflicts);
+    }
   }
-  const next = (await rev(clone, "HEAD")) ?? upstreamSha;
-  return { kind: "ok", next, needsPush: next !== upstreamSha };
+
+  const sent = await ancestry(clone, live, upstream);
+  if (sent === "unknown") return { kind: "unsynced", reason: "could not compare the live snapshot with the remote" };
+  if (sent === "yes") return { kind: "ok", next: upstream, needsPush: false, conflicts: [] };
+  const ahead = await ancestry(clone, upstream, live);
+  if (ahead === "unknown") return { kind: "unsynced", reason: "could not compare the remote with the live snapshot" };
+  if (ahead === "yes") return outbound(clone, upstream, live, []);
+
+  const merged = await mergeAndResolve(clone, upstream, live, { when });
+  if (merged.kind === "stop") return { kind: "stopped", reason: `${merged.reason}: ${joinNames(merged.paths)}` };
+  // Two parents, remote first: ancestry records that live is on the remote.
+  const message = await mergeMessage(clone, input.machine, upstream, merged.tree);
+  const next = await gitOk([...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-p", live, "-m", message], { cwd: clone });
+  return outbound(clone, upstream, next, merged.conflicts);
 }
 
 type Push = { kind: "pushed" } | { kind: "raced"; detail: string } | { kind: "failed"; reason: string };
@@ -356,6 +424,59 @@ async function push(clone: string, input: CycleInput, sha: string): Promise<Push
   // (a pre-receive hook, push protection): no retry changes that.
   if (/^!\t.*\[rejected\]/m.test(r.stdout)) return { kind: "raced", detail };
   return { kind: "failed", reason: `push failed: ${detail}` };
+}
+
+// Spec 5.4 step 5: the remote head now known, into the live repo's objects before
+// anything refers to it; then remote-seen; then the all-or-nothing reset.
+async function updateLive(clone: string, input: CycleInput, live: string, next: string, streak: number, result: CycleResult): Promise<void> {
+  const dir = input.projectsDir;
+  await gitOk(["update-ref", INTEGRATED, next], { cwd: clone });
+  await gitOk(["fetch", "-q", clone, `+${INTEGRATED}:${INTEGRATED}`], { cwd: dir });
+  await gitOk(["update-ref", REMOTE_SEEN, next], { cwd: dir });
+  if (next === live) {
+    result.liveUpdated = true;
+    return;
+  }
+  await recordIntent(input.stateDir, live, next);
+  const reset = await git(["reset", "-q", "--keep", next], { cwd: dir, timeoutMs: input.liveUpdateTimeoutMs });
+  if (reset.code === 0 && !reset.timedOut) {
+    await clearInterrupted(input.stateDir);
+    result.liveUpdated = true;
+    await gitOk(["update-ref", `refs/remotes/origin/${input.branch}`, next], { cwd: dir });
+    return;
+  }
+  if (reset.timedOut) {
+    // Not the user's block, and never counted toward the escalation: the next
+    // cycle finishes it before its snapshot (recovery.ts).
+    await recordInterrupted(input.stateDir, dir, live, next);
+    result.outcome = "unsynced";
+    result.reason = "updating the vault timed out; the next sync finishes it";
+    return;
+  }
+  // git's check before it writes anything (verified, git 2.50.1): a local change, or
+  // an untracked file in the way, refuses the whole update and nothing changed.
+  const blocked = [...reset.stderr.matchAll(/Entry '(.+)' not uptodate|Untracked working tree file '(.+)' would be overwritten/g)].map(
+    (m) => m[1] ?? m[2] ?? "",
+  );
+  if (!blocked.length) {
+    // Any other error (a smudge filter that fails) can stop it partway: the intent
+    // stays, and the next cycle finishes it before its snapshot.
+    result.outcome = "unsynced";
+    result.reason = `updating the vault failed (${firstLines(reset.stderr) || `git exited ${reset.code}`}); the next sync finishes it`;
+    return;
+  }
+  await clearInterrupted(input.stateDir);
+  result.blockedBy = blocked;
+  result.blockedCycles = streak + 1;
+  await writeBlocked(input.stateDir, result.blockedCycles);
+}
+
+function describeFinished(done: Finished): string {
+  if (done.moved) return "an interrupted vault update was left as it was: the vault's history moved since";
+  const parts = ["finished an interrupted vault update"];
+  if (done.restored.length) parts.push(`${done.restored.length} file${done.restored.length === 1 ? "" : "s"} set back to update again`);
+  if (done.kept.length) parts.push(`your edits since kept in ${joinNames(done.kept)}`);
+  return parts.join("; ");
 }
 
 // Never throws: every failure, the lock's own included, is an outcome.
@@ -378,6 +499,9 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     // blocked again; a busy cycle never ran and leaves it alone.
     const streak = await readBlocked(input.stateDir);
     await writeBlocked(input.stateDir, 0);
+    // An interrupted update is finished before anything is snapshotted.
+    const finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: input.liveUpdateTimeoutMs });
+    if (finished && (finished.moved || finished.restored.length || finished.kept.length)) result.notices.push(describeFinished(finished));
     const snap = await snapshot(input, result);
     if (!snap.ok || !(await stillHeld())) return result;
     if (!snap.pushAllowed) {
@@ -395,16 +519,14 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     }
 
     const live = (await rev(dir, "HEAD")) ?? "";
-    const last = await rev(dir, LAST_INTEGRATED);
-    const clone = await ensureStateClone(input);
+    const clone = await ensureStateClone(input.stateDir, dir, input.remote);
     let next = "";
     for (let attempt = 1; ; attempt++) {
       if (!(await stillHeld())) return result;
-      const integration = await integrate(clone, input, live, last);
-      if (integration.kind === "conflict") {
-        result.outcome = "paused";
-        result.conflicts = integration.files;
-        result.reason = `sync paused: your local changes conflict with the remote in ${joinNames(integration.files)}`;
+      const integration = await integrate(clone, input, live);
+      if (integration.kind === "stopped") {
+        result.outcome = "stopped";
+        result.reason = integration.reason;
         return result;
       }
       if (integration.kind === "unsynced") {
@@ -413,6 +535,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
         return result;
       }
       next = integration.next;
+      result.conflicts = integration.conflicts;
       if (!integration.needsPush) break;
       const pushed = await push(clone, input, next);
       if (pushed.kind === "pushed") {
@@ -431,28 +554,8 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       }
     }
 
-    // Spec 5.4 step 4: our snapshot is confirmed upstream now (pushed, or already
-    // there), so record it before the step-5 lock check. If step 5 never finishes
-    // (the lock lost here, the fetch/reset below failing, or the process exiting),
-    // the next cycle must not replay a snapshot that is already on the remote.
-    await gitOk(["update-ref", LAST_INTEGRATED, live], { cwd: dir });
-
     if (!(await stillHeld())) return result;
-    await gitOk(["update-ref", INTEGRATED, next], { cwd: clone });
-    await gitOk(["fetch", "-q", clone, `+${INTEGRATED}:${INTEGRATED}`], { cwd: dir });
-    const reset = await git(["reset", "-q", "--keep", next], { cwd: dir });
-    if (reset.code === 0) {
-      result.liveUpdated = true;
-      await gitOk(["update-ref", LAST_INTEGRATED, next], { cwd: dir });
-      await gitOk(["update-ref", `refs/remotes/origin/${input.branch}`, next], { cwd: dir });
-    } else {
-      const blocked = [...reset.stderr.matchAll(/Entry '(.+)' not uptodate/g)].map((m) => m[1] ?? "");
-      result.blockedBy = blocked.length ? blocked : [`(reset --keep refused: ${reset.stderr.trim().split("\n")[0]})`];
-      result.blockedCycles = streak + 1;
-      await writeBlocked(input.stateDir, result.blockedCycles);
-      // Our snapshot is on the remote now; never replay it again.
-      await gitOk(["update-ref", LAST_INTEGRATED, live], { cwd: dir });
-    }
+    await updateLive(clone, input, live, next, streak, result);
     return result;
   } catch (err) {
     result.outcome = "aborted";

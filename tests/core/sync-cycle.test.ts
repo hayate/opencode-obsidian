@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { changedSince, LAST_INTEGRATED, runCycle, type CycleResult } from "../../core/sync/cycle.ts";
+import { changedSince, REMOTE_SEEN, runCycle, type CycleResult } from "../../core/sync/cycle.ts";
 import { prepareProjects, REQUIRED_IGNORES } from "../../core/sync/state.ts";
 import { acquireLock } from "../../core/lock.ts";
 import { git, gitOk } from "../../core/git.ts";
@@ -53,10 +53,7 @@ async function machineFor(remote: string): Promise<Machine> {
 }
 
 // A remote whose tree only a case-sensitive machine could have committed. It
-// always carries the required ignores, like any remote a plugin bootstrapped:
-// otherwise the fresh clone below would have to write and commit its own
-// before the first cycle, forcing the checkout+rebase path in the state clone
-// (a known wedge on a case-colliding tree; see the two tests below).
+// always carries the required ignores, like any remote a plugin bootstrapped.
 async function remoteWithTree(files: Record<string, string>): Promise<string> {
   const remote = join(await tempDir("sro-remote-"), "projects.git");
   await gitOk(["init", "-q", "--bare", "-b", "main", remote], { cwd: await tempDir() });
@@ -81,7 +78,7 @@ async function remoteNames(remote: string): Promise<string[]> {
 }
 
 function cycle(remote: string, x: Machine, quietMs = 0): Promise<CycleResult> {
-  return runCycle({ projectsDir: x.projects, remote, branch: "main", stateDir: x.state, machine: x.name, quietMs });
+  return runCycle({ timezone: TZ, projectsDir: x.projects, remote, branch: "main", stateDir: x.state, machine: x.name, quietMs });
 }
 
 async function remoteFile(remote: string, path: string): Promise<string> {
@@ -124,19 +121,26 @@ test("Obsidian edits, new files, moves and deletions are all committed (D9)", as
   assert.ok(await absent(b, "x/plans/old.md"));
 });
 
-test("the autostash scenario: a conflicting edit pauses, leaves no markers, publishes nothing", async () => {
+test("the autostash scenario: a conflicting edit keeps both versions, never pauses, leaves no markers", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
   await writeRel(a.projects, "x/HANDOFF.md", "A state\n");
   await cycle(remote, a);
   await writeRel(b.projects, "x/HANDOFF.md", "B uncommitted\n");
   const rb = await cycle(remote, b);
-  assert.equal(rb.outcome, "paused");
-  assert.deepEqual(rb.conflicts, ["x/HANDOFF.md"]);
-  assert.equal(await read(b, "x/HANDOFF.md"), "B uncommitted\n");
-  assert.equal(await remoteFile(remote, "x/HANDOFF.md"), "A state");
-  assert.ok(await absent(b, ".git/rebase-merge"));
-  assert.doesNotMatch(await read(b, "x/HANDOFF.md"), /<<<<<<<|>>>>>>>/);
+  assert.equal(rb.outcome, "synced", rb.reason ?? "");
+  assert.equal(rb.conflicts.length, 1);
+  assert.equal(rb.conflicts[0]?.kind, "both-changed");
+  const copy = rb.conflicts[0]?.copy ?? "";
+  assert.match(copy, /^x\/HANDOFF\.conflict-\d{4}-\d\d-\d\d-\d{4}-[0-9a-f]{6}\.md$/);
+  assert.equal(await read(b, "x/HANDOFF.md"), "B uncommitted\n", "this machine's version stays at the path");
+  assert.equal(await read(b, copy), "A state\n");
+  assert.equal(await remoteFile(remote, "x/HANDOFF.md"), "B uncommitted");
+  assert.equal(await remoteFile(remote, copy), "A state");
+  await cycle(remote, a);
+  assert.equal(await read(a, "x/HANDOFF.md"), "B uncommitted\n", "the machines converge");
+  assert.equal(await read(a, copy), "A state\n");
+  for (const x of [a, b]) assert.doesNotMatch(await read(x, "x/HANDOFF.md"), /<<<<<<<|>>>>>>>/);
 });
 
 test("a held-back file stays dirty and does not block unrelated remote changes", async () => {
@@ -333,47 +337,84 @@ test("a partly-upstream snapshot is never replayed after a refused live update",
   const first = await cycle(remote, b);
   assert.ok(first.pushed);
   assert.deepEqual(first.blockedBy, ["x/t.md"]);
-  assert.equal(await gitOk(["rev-parse", LAST_INTEGRATED], { cwd: b.projects }), first.committed);
+  assert.equal(
+    await gitOk(["rev-parse", REMOTE_SEEN], { cwd: b.projects }),
+    await gitOk(["rev-parse", "main"], { cwd: remote }),
+    "remote-seen follows the remote head even when the live update is refused",
+  );
 
   await cycle(remote, a); // A receives r1, then evolves it
   await writeRel(a.projects, "x/r.md", "r2\n");
   await cycle(remote, a);
   const second = await cycle(remote, b);
-  assert.notEqual(second.outcome, "paused", second.reason ?? "");
+  assert.equal(second.outcome, "synced", second.reason ?? "");
+  assert.deepEqual(second.conflicts, []);
   assert.equal(await remoteFile(remote, "x/r.md"), "r2");
 });
 
-test("last-integrated is set as soon as the push lands, so a step-5 failure never replays an already-pushed snapshot", async () => {
+// A ref cannot be both a file and a directory: this makes step 5's fetch into
+// refs/sro/integrated fail in the live repo, as if the process died (or the reply
+// to an accepted push was lost) between the push landing and the live update.
+async function failStepFive(x: Machine): Promise<() => Promise<void>> {
+  await gitOk(["update-ref", "refs/sro/integrated/block", "HEAD"], { cwd: x.projects });
+  return async () => {
+    await gitOk(["update-ref", "-d", "refs/sro/integrated/block"], { cwd: x.projects });
+  };
+}
+
+test("a state clone rebuilt after a refused live update still checks the remote against what this machine saw", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
+  await writeRel(b.projects, "x/t.md", `t0\ntoken ${TOKEN}\n`); // held back: blocks B's live update
+  await writeRel(a.projects, "x/t.md", "t-from-a\n");
+  await cycle(remote, a);
+  await writeRel(b.projects, "x/r.md", "r\n");
+  assert.deepEqual((await cycle(remote, b)).blockedBy, ["x/t.md"]);
+  // remote-seen now names a commit only the lost clone and the remote hold.
+  await rm(join(b.state, "sync.git"), { recursive: true, force: true });
+  await writeRel(b.projects, "x/r2.md", "r2\n");
+  const r = await cycle(remote, b);
+  assert.notEqual(r.outcome, "unsynced", r.reason ?? "");
+  assert.ok(r.pushed, r.reason ?? "");
+  assert.equal(await remoteFile(remote, "x/r2.md"), "r2");
+});
 
-  // A pushes first, so B's push below needs its own rebase: the commit that
-  // lands upstream differs from B's live HEAD. That is exactly the case
-  // spec 5.3's last-integrated ref exists for.
+test("a snapshot pushed before step 5 failed is never merged again: the remote's later edit stands", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  // A pushes first, so B's push is a merge commit, not B's own snapshot.
   await writeRel(a.projects, "x/other.md", "a0\n");
   await cycle(remote, a);
-
   await writeRel(b.projects, "x/shared.md", "b1\n");
-  const blockedAt = await gitOk(["rev-parse", "HEAD"], { cwd: b.projects });
-  // A ref cannot be both a file and a directory: this makes step 5's fetch into
-  // refs/sro/integrated fail in B's live repo, simulating the process dying (or
-  // the lock being lost) between the push landing and the reset --keep.
-  await gitOk(["update-ref", "refs/sro/integrated/block", blockedAt], { cwd: b.projects });
-
+  const unblock = await failStepFive(b);
   const first = await cycle(remote, b);
   assert.equal(first.outcome, "aborted", first.reason ?? "");
-  assert.equal(await gitOk(["rev-parse", LAST_INTEGRATED], { cwd: b.projects }), first.committed);
   assert.equal(await remoteFile(remote, "x/shared.md"), "b1"); // already upstream before the failure
-
-  await gitOk(["update-ref", "-d", "refs/sro/integrated/block"], { cwd: b.projects });
-
+  await unblock();
   await cycle(remote, a); // A receives B's already-pushed change
   await writeRel(a.projects, "x/shared.md", "a1\n"); // the same file, evolved further
   await cycle(remote, a);
-
   const second = await cycle(remote, b);
-  assert.notEqual(second.outcome, "paused", second.reason ?? "");
+  assert.equal(second.outcome, "synced", second.reason ?? "");
+  assert.deepEqual(second.conflicts, []);
   assert.equal(await remoteFile(remote, "x/shared.md"), "a1");
+});
+
+test("a note deleted after a push whose acknowledgement was lost stays deleted", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/other.md", "a0\n");
+  await cycle(remote, a);
+  await writeRel(b.projects, "x/note.md", "added on b\n");
+  const unblock = await failStepFive(b);
+  assert.equal((await cycle(remote, b)).outcome, "aborted");
+  assert.equal(await remoteFile(remote, "x/note.md"), "added on b"); // the push landed
+  await unblock();
+  await rm(join(b.projects, "x/note.md"));
+  const r = await cycle(remote, b);
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  assert.ok(!(await remoteNames(remote)).includes("x/note.md"), "a single-parent merge would bring it back");
+  assert.ok(await absent(b, "x/note.md"));
 });
 
 test("a push that loses a race (the remote moved after the fetch) is retried after integrating again", async () => {
@@ -384,14 +425,20 @@ test("a push that loses a race (the remote moved after the fetch) is retried aft
   const other = join(await tempDir(), "other");
   await gitOk(["clone", "-q", remote, other], { cwd: await tempDir() });
   await commitFile(other, "x/notes/other.md", "o\n", "another machine");
-  // The state clone checks out before it rebases, after the fetch: this hook
-  // pushes the other machine's commit there, once, so A's push is non-fast-forward.
+  // Right after the state clone's fetch updates the remote-tracking ref, this hook
+  // pushes the other machine's commit, once, so A's push is non-fast-forward.
   const once = join(a.state, "race-once");
   await writeFile(once, "");
-  const hook = join(a.state, "sync", ".git", "hooks", "post-checkout");
+  // A push updates the clone's remote-tracking ref itself; set it back so this
+  // cycle's fetch moves it (and fires the hook) before A pushes.
+  await gitOk(["update-ref", "refs/remotes/origin/main", "refs/remotes/origin/main~1"], { cwd: join(a.state, "sync.git") });
+  // Where git looks for the clone's hooks (core.hooksPath, which nothing else creates).
+  const hooks = await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "hooks"], { cwd: join(a.state, "sync.git") });
+  await mkdir(hooks, { recursive: true });
+  const hook = join(hooks, "reference-transaction");
   await writeFile(
     hook,
-    `#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\nif [ -f '${once}' ]; then rm -f '${once}'; git -C '${other}' push -q origin HEAD; fi\n`,
+    `#!/bin/sh\n[ "$1" = committed ] || exit 0\ngrep -q " refs/remotes/origin/" || exit 0\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\nif [ -f '${once}' ]; then rm -f '${once}'; git -C '${other}' push -q origin HEAD; fi\n`,
   );
   await chmod(hook, 0o755);
   await writeRel(a.projects, "x/notes/n.md", "n\n");
@@ -419,7 +466,7 @@ test("a push the remote refuses (a server-side hook, e.g. push protection) is re
 
 test("runCycle never throws: a Projects/ that does not exist is an aborted cycle", async () => {
   const base = await tempDir();
-  const r = await runCycle({ projectsDir: join(base, "missing"), remote: join(base, "r.git"), branch: "main", stateDir: join(base, "state"), machine: "a" });
+  const r = await runCycle({ timezone: TZ, projectsDir: join(base, "missing"), remote: join(base, "r.git"), branch: "main", stateDir: join(base, "state"), machine: "a" });
   assert.equal(r.outcome, "aborted");
   assert.ok(r.reason);
 });
@@ -503,22 +550,6 @@ test("missing identity with nothing to commit still gives the identity instructi
   }
 });
 
-test("a rebase that fails without a conflict is reported as unsynced with its error, not as a pause", async () => {
-  const { remote, m } = await setup(["a", "b"]);
-  const [a, b] = m as [Machine, Machine];
-  assert.equal((await cycle(remote, b)).outcome, "synced"); // builds B's state clone
-  const hook = join(b.state, "sync", ".git", "hooks", "pre-rebase");
-  await writeFile(hook, "#!/bin/sh\necho 'pre-rebase refuses' >&2\nexit 1\n");
-  await chmod(hook, 0o755);
-  await writeRel(a.projects, "x/notes/a.md", "a\n");
-  assert.ok((await cycle(remote, a)).pushed);
-  await writeRel(b.projects, "x/notes/b.md", "b\n");
-  const r = await cycle(remote, b);
-  assert.equal(r.outcome, "unsynced", r.reason ?? "");
-  assert.match(r.reason ?? "", /pre-rebase refuses/);
-  assert.deepEqual(r.conflicts, []);
-});
-
 test("conflicting file names are reported as spelled, never C-quoted", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
@@ -526,11 +557,13 @@ test("conflicting file names are reported as spelled, never C-quoted", async () 
   assert.ok((await cycle(remote, a)).pushed);
   await writeRel(b.projects, "x/日本.md", "from b\n");
   const r = await cycle(remote, b);
-  assert.equal(r.outcome, "paused", r.reason ?? "");
-  assert.deepEqual(r.conflicts, ["x/日本.md"]);
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  assert.equal(r.conflicts[0]?.path, "x/日本.md");
+  assert.match(r.conflicts[0]?.copy ?? "", /^x\/日本\.conflict-/);
+  assert.equal(await read(b, r.conflicts[0]?.copy ?? ""), "from a\n");
 });
 
-test("a conflicting file name holding a raw newline is quoted in the paused reason, so it can never break the status line", async () => {
+test("a conflicting file name holding a raw newline is kept exactly as spelled (the status line quotes it)", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
   const name = `x/two${"\n"}lines.md`;
@@ -538,15 +571,13 @@ test("a conflicting file name holding a raw newline is quoted in the paused reas
   assert.ok((await cycle(remote, a)).pushed);
   await writeRel(b.projects, name, "from b\n");
   const r = await cycle(remote, b);
-  assert.equal(r.outcome, "paused", r.reason ?? "");
-  // r.conflicts is data, kept exactly as spelled (see the test above); the
-  // reason is plugin status text, so the same name must appear quoted there.
-  assert.deepEqual(r.conflicts, [name]);
-  assert.match(r.reason ?? "", /"x\/two\\nlines\.md"/);
-  assert.doesNotMatch(r.reason ?? "", /\n/, r.reason ?? "");
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  assert.equal(r.conflicts[0]?.path, name);
+  assert.equal(await read(b, name), "from b\n");
+  assert.equal(await read(b, r.conflicts[0]?.copy ?? ""), "from a\n");
 });
 
-test("more than 10 conflicting files cap the paused reason to the first 10 names, then 'and N more'", async () => {
+test("twelve conflicting notes give twelve copies; the raw conflict list is never capped", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
   const names = Array.from({ length: 12 }, (_, i) => `x/conflict-${String(i + 1).padStart(2, "0")}.md`);
@@ -554,12 +585,9 @@ test("more than 10 conflicting files cap the paused reason to the first 10 names
   assert.ok((await cycle(remote, a)).pushed);
   for (const name of names) await writeRel(b.projects, name, "from b\n");
   const r = await cycle(remote, b);
-  assert.equal(r.outcome, "paused", r.reason ?? "");
-  assert.equal(r.conflicts.length, 12, "the raw conflict list is never capped, only the reason text");
-  const reason = r.reason ?? "";
-  for (const name of names.slice(0, 10)) assert.ok(reason.includes(name), `${name} missing from: ${reason}`);
-  for (const name of names.slice(10)) assert.ok(!reason.includes(name), `${name} should be dropped from: ${reason}`);
-  assert.match(reason, /and 2 more/, reason);
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  assert.equal(r.conflicts.length, 12);
+  assert.equal((await remoteNames(remote)).filter((n) => n.includes(".conflict-")).length, 12);
 });
 
 test("a busy lock returns busy without touching anything", async () => {
@@ -569,7 +597,7 @@ test("a busy lock returns busy without touching anything", async () => {
   const held = await acquireLock(lockDir);
   assert.ok(held);
   try {
-    const r = await runCycle({ projectsDir: a.projects, remote, branch: "main", stateDir: a.state, machine: "a", lockWaitMs: 100 });
+    const r = await runCycle({ timezone: TZ, projectsDir: a.projects, remote, branch: "main", stateDir: a.state, machine: "a", lockWaitMs: 100 });
     assert.equal(r.outcome, "busy");
   } finally {
     await held.release();
@@ -653,6 +681,23 @@ test("a gitlink an old client committed is removed even while its repository was
   assert.equal(await gitOk(["ls-tree", "main", "x/nested"], { cwd: remote }), "");
 });
 
+// A name git would read as pathspec magic (":!keep" excludes "keep"): without
+// :(literal) git rm refuses on every git version (2.47.3 and 2.50.1 verified), where
+// a glob-shaped name like t* only misbehaves on some.
+test("an embedded repository named like pathspec magic (:!keep) is untracked and the cycle goes on", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  const nested = join(a.projects, ":!keep");
+  await initRepo(nested);
+  await commitFile(nested, "inside.md", "i\n", "nested");
+  await writeRel(a.projects, "x/n.md", "n\n");
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  assert.deepEqual(r.embedded, [":!keep"]);
+  assert.equal(await remoteFile(remote, "x/n.md"), "n");
+  assert.equal(await remoteFile(remote, "x/t.md"), "t0");
+});
+
 test("an embedded repository named t* untracks only itself", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];
@@ -684,15 +729,68 @@ test("a file name ending in a space survives the -z listing", async () => {
   assert.equal(await remoteFile(remote, "x/zz-trailing "), "t");
 });
 
-test("a last-integrated ref that is not an ancestor falls back to the merge base", async () => {
+// The remote's history rewritten by hand (a force-push back to an earlier commit,
+// dropping everything after it).
+async function forcePushBack(remote: string, to: string): Promise<void> {
+  await gitOk(["update-ref", "refs/heads/main", to], { cwd: remote });
+}
+
+test("a rewritten remote stops the cycle: nothing is merged, deleted here, or pushed back", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];
-  const tree = await gitOk(["rev-parse", "HEAD^{tree}"], { cwd: a.projects });
-  const bogus = await gitOk(["commit-tree", tree, "-m", "unrelated"], { cwd: a.projects });
-  await gitOk(["update-ref", LAST_INTEGRATED, bogus], { cwd: a.projects });
-  await writeRel(a.projects, "x/after.md", "kept\n");
-  assert.equal((await cycle(remote, a)).outcome, "synced");
-  assert.equal(await remoteFile(remote, "x/after.md"), "kept");
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  await writeRel(a.projects, "x/dropped.md", "sent, then dropped by the rewrite\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  await forcePushBack(remote, before);
+  await writeRel(a.projects, "x/later.md", "written after the rewrite\n");
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "stopped", r.reason ?? "");
+  assert.match(r.reason ?? "", /rewritten.*adopt the rewritten remote/);
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed back");
+  assert.equal(await read(a, "x/dropped.md"), "sent, then dropped by the rewrite\n", "nothing deleted here");
+});
+
+test("a remote-seen that cannot be read stops the cycle instead of skipping the rewrite check", async () => {
+  for (const label of ["names a missing object", "names a tree, not a commit", "is a ref file git cannot parse"]) {
+    const { remote, m } = await setup(["a"]);
+    const [a] = m as [Machine];
+    const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+    await writeRel(a.projects, "x/dropped.md", "sent, then dropped by the rewrite\n");
+    assert.ok((await cycle(remote, a)).pushed);
+    const gitDir = await gitOk(["rev-parse", "--absolute-git-dir"], { cwd: a.projects });
+    const tree = await gitOk(["rev-parse", "HEAD^{tree}"], { cwd: a.projects });
+    const value = { "names a missing object": `${"1".repeat(40)}\n`, "names a tree, not a commit": `${tree}\n`, "is a ref file git cannot parse": "not a ref\n" }[label];
+    await writeFile(join(gitDir, "refs/sro/remote-seen"), value ?? "");
+    await forcePushBack(remote, before);
+    const r = await cycle(remote, a);
+    assert.equal(r.outcome, "stopped", `${label}: ${r.reason}`);
+    assert.match(r.reason ?? "", /remote-seen/);
+    assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, `${label}: nothing pushed back`);
+  }
+});
+
+test("adopting a rewritten remote carries over only the changes this machine had not sent", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  await writeRel(a.projects, "x/dropped.md", "sent, then dropped by the rewrite\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  const droppedCommit = await gitOk(["rev-parse", "main"], { cwd: remote });
+  await forcePushBack(remote, before);
+  await writeRel(a.projects, "x/later.md", "written after the rewrite\n");
+  assert.equal((await cycle(remote, a)).outcome, "stopped");
+  const r = await runCycle({ timezone: TZ, projectsDir: a.projects, remote, branch: "main", stateDir: a.state, machine: "a", quietMs: 0, adoptRewrite: true });
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  const names = await remoteNames(remote);
+  assert.ok(names.includes("x/later.md"), "the unsent change is carried over");
+  assert.ok(!names.includes("x/dropped.md"), "what was sent before the rewrite stays dropped");
+  assert.notEqual(
+    (await git(["merge-base", "--is-ancestor", droppedCommit, "main"], { cwd: remote })).code,
+    0,
+    "none of the dropped history is published again",
+  );
+  assert.ok(await absent(a, "x/dropped.md"), "the live repo follows the adopted remote");
+  assert.equal((await cycle(remote, a)).outcome, "synced", "and later cycles run normally");
 });
 
 test("a case-only directory rename reaches the remote (case-insensitive filesystems included)", async () => {
@@ -726,6 +824,22 @@ test("tracked directories differing only by case are never merged into one spell
   assert.deepEqual(await remoteNames(remote), [".gitignore", "x/Dir/a.md", "x/dir/b.md"]);
 });
 
+test("a case-colliding tree no longer wedges a machine that has its own changes to send", async () => {
+  const remote = await remoteWithTree({ "x/Note.md": "upper\n", "x/note.md": "lower\n" });
+  const a = await machineFor(remote);
+  assert.equal((await cycle(remote, a)).outcome, "synced");
+  const other = join(await tempDir(), "other");
+  await gitOk(["clone", "-q", remote, other], { cwd: await tempDir() });
+  await commitFile(other, "x/from-other.md", "o\n", "another machine");
+  await gitOk(["push", "-q", "origin", "HEAD"], { cwd: other });
+  await writeRel(a.projects, "x/mine.md", "m\n");
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  assert.ok(r.pushed);
+  const names = await remoteNames(remote);
+  for (const n of ["x/Note.md", "x/note.md", "x/from-other.md", "x/mine.md"]) assert.ok(names.includes(n), `${n}: ${names.join(", ")}`);
+});
+
 test("a case-only rename reaches the remote (case-insensitive filesystems included)", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];
@@ -748,27 +862,13 @@ test("a git repository cloned inside Projects/ is reported and never committed a
   assert.equal(await gitOk(["ls-tree", "main", "x/cloned"], { cwd: remote }), "");
 });
 
-test("a state clone left mid-rebase by a crash (either backend) is rebuilt", async () => {
-  const { remote, m } = await setup(["a"]);
-  const [a] = m as [Machine];
-  await writeRel(a.projects, "x/first.md", "1\n");
-  await cycle(remote, a);
-  for (const marker of ["rebase-apply", "rebase-merge"]) {
-    await mkdir(join(a.state, "sync", ".git", marker), { recursive: true });
-    await writeRel(a.projects, `x/${marker}.md`, "n\n");
-    const r = await cycle(remote, a);
-    assert.equal(r.outcome, "synced", r.reason ?? "");
-    assert.equal(await remoteFile(remote, `x/${marker}.md`), "n");
-  }
-});
-
 test("a lock file a killed command left in the state clone is rebuilt away", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];
   await writeRel(a.projects, "x/first.md", "1\n");
   await cycle(remote, a);
-  for (const leftover of ["index.lock", "HEAD.lock", "config.lock", "refs/remotes/live/main.lock"]) {
-    await writeRel(join(a.state, "sync", ".git"), leftover, "");
+  for (const leftover of ["HEAD.lock", "config.lock", "refs/remotes/live/main.lock"]) {
+    await writeRel(join(a.state, "sync.git"), leftover, "");
     const note = `x/${leftover.replaceAll("/", "-")}.md`;
     await writeRel(a.projects, note, "n\n");
     const r = await cycle(remote, a);
@@ -828,15 +928,134 @@ test("an aborted cycle breaks the blocked-cycle streak", async () => {
   assert.equal(await streak(a), "0");
 });
 
-test("a paused cycle breaks the blocked-cycle streak", async () => {
+test("a stopped cycle breaks the blocked-cycle streak", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  await writeRel(a.projects, "x/t.md", "t\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  await forcePushBack(remote, before);
+  await writeRel(a.state, "blocked-cycles", "2");
+  assert.equal((await cycle(remote, a)).outcome, "stopped");
+  assert.equal(await streak(a), "0");
+});
+
+test("what the remote already holds never blocks the outbound scan, even when copied", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  // An older client pushed a token-shaped note the scan would hold back here.
+  const other = join(await tempDir(), "other");
+  await gitOk(["clone", "-q", remote, other], { cwd: await tempDir() });
+  await commitFile(other, "x/t.md", `t0\ntoken ${TOKEN}\n`, "an older client");
+  await gitOk(["push", "-q", "origin", "HEAD"], { cwd: other });
+  await writeRel(a.projects, "x/t.md", "edited here\n");
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  assert.equal(r.conflicts[0]?.kind, "both-changed");
+  assert.equal(await remoteFile(remote, "x/t.md"), "edited here");
+});
+
+test("a secret that reached a local commit without the snapshot scan stops the cycle, never pushed", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  // Committed by hand in the live repo, so step 2's scan never saw it.
+  await commitFile(a.projects, "x/by-hand.md", `token ${TOKEN}\n`, "by hand");
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "stopped", r.reason ?? "");
+  assert.match(r.reason ?? "", /secret scan flags what this sync would send in "x\/by-hand\.md"/);
+  assert.ok(!(await remoteNames(remote)).includes("x/by-hand.md"));
+});
+
+test("a live update killed on its timeout is not the user's block, and the next cycle finishes it", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
   await writeRel(b.state, "blocked-cycles", "2");
   await writeRel(a.projects, "x/t.md", "from a\n");
-  assert.equal((await cycle(remote, a)).outcome, "synced");
-  await writeRel(b.projects, "x/t.md", "from b\n");
-  assert.equal((await cycle(remote, b)).outcome, "paused");
-  assert.equal(await streak(b), "0");
+  assert.ok((await cycle(remote, a)).pushed);
+  await gitOk(["config", "filter.slow.smudge", "sleep 10; cat"], { cwd: b.projects });
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "*.md filter=slow\n");
+  const slow = { timezone: TZ, projectsDir: b.projects, remote, branch: "main", stateDir: b.state, machine: "b", quietMs: 0, liveUpdateTimeoutMs: 500 };
+  const first = await runCycle(slow);
+  assert.equal(first.outcome, "unsynced", first.reason ?? "");
+  assert.match(first.reason ?? "", /updating the vault timed out/);
+  assert.deepEqual(first.blockedBy, []);
+  assert.equal(await streak(b), "0", "a timeout never counts toward the escalation");
+  await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });
+  const second = await runCycle({ ...slow, liveUpdateTimeoutMs: undefined });
+  assert.equal(second.outcome, "synced", second.reason ?? "");
+  assert.ok(second.liveUpdated);
+  assert.equal(await read(b, "x/t.md"), "from a\n");
+  assert.equal(await remoteFile(remote, "x/t.md"), "from a", "no half-written file was sent");
+});
+
+test("a live update that fails partway (a smudge filter fails) is finished by the next cycle, never sent as local edits", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/s.md", "s from a\n");
+  await writeRel(a.projects, "x/t.md", "t from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  // git writes x/s.md, unlinks x/t.md, then its smudge fails (verified, git 2.50.1).
+  for (const [key, value] of [["filter.bad.clean", "cat"], ["filter.bad.smudge", "false"], ["filter.bad.required", "true"]]) {
+    await gitOk(["config", key ?? "", value ?? ""], { cwd: b.projects });
+  }
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "x/t.md filter=bad\n");
+  const first = await cycle(remote, b);
+  assert.equal(first.outcome, "unsynced", first.reason ?? "");
+  assert.match(first.reason ?? "", /updating the vault failed/);
+  assert.deepEqual(first.blockedBy, []);
+  await gitOk(["config", "filter.bad.smudge", "cat"], { cwd: b.projects });
+  const second = await cycle(remote, b);
+  assert.equal(second.outcome, "synced", second.reason ?? "");
+  assert.equal(await read(b, "x/t.md"), "t from a\n");
+  assert.equal(await read(b, "x/s.md"), "s from a\n");
+  assert.equal(await remoteFile(remote, "x/t.md"), "t from a", "the note the failed update had unlinked is not deleted on the remote");
+  assert.deepEqual((await remoteNames(remote)).filter((n) => n.includes(".conflict-")), [], "nor moved to a conflict copy");
+});
+
+test("a held-back new note the remote also adds blocks the update by name, and nothing is recorded as interrupted", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(b.projects, "x/new.md", `token ${TOKEN}\n`); // held back: stays untracked
+  await writeRel(a.projects, "x/new.md", "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  const first = await cycle(remote, b);
+  assert.deepEqual(first.blockedBy, ["x/new.md"], first.reason ?? "");
+  const second = await cycle(remote, b);
+  assert.deepEqual(second.blockedBy, ["x/new.md"]);
+  assert.deepEqual(second.notices, [], "a refusal changed nothing, so there is nothing to finish");
+});
+
+test("a live update that finished leaves nothing to finish, even after a commit made by hand", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/t.md", "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  assert.ok((await cycle(remote, b)).liveUpdated);
+  await gitOk(["commit", "-q", "--allow-empty", "-m", "by hand"], { cwd: b.projects });
+  assert.deepEqual((await cycle(remote, b)).notices, []);
+});
+
+test("a repair that times out stops the cycle before its snapshot; the next cycle finishes it", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/t.md", "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  const pushedByA = await gitOk(["rev-parse", "main"], { cwd: remote });
+  await gitOk(["config", "filter.slow.smudge", "sleep 10; cat"], { cwd: b.projects });
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "*.md filter=slow\n");
+  const slow = { timezone: TZ, projectsDir: b.projects, remote, branch: "main", stateDir: b.state, machine: "b", quietMs: 0, liveUpdateTimeoutMs: 500 };
+  assert.match((await runCycle(slow)).reason ?? "", /updating the vault timed out/);
+  const started = Date.now();
+  const second = await runCycle(slow);
+  assert.equal(second.outcome, "aborted", second.reason ?? "");
+  assert.ok(Date.now() - started < 8000, "the repair has the live update's own timeout");
+  assert.equal(second.committed, null, "no snapshot while the update is unfinished");
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushedByA, "nothing pushed");
+  await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });
+  const third = await runCycle({ ...slow, liveUpdateTimeoutMs: undefined });
+  assert.equal(third.outcome, "synced", third.reason ?? "");
+  assert.equal(await read(b, "x/t.md"), "from a\n");
+  assert.equal(await remoteFile(remote, "x/t.md"), "from a");
 });
 
 test("a busy cycle, which never ran, leaves the blocked-cycle streak alone", async () => {
@@ -847,7 +1066,7 @@ test("a busy cycle, which never ran, leaves the blocked-cycle streak alone", asy
   const held = await acquireLock(lockDir);
   assert.ok(held);
   try {
-    const r = await runCycle({ projectsDir: a.projects, remote, branch: "main", stateDir: a.state, machine: "a", lockWaitMs: 100 });
+    const r = await runCycle({ timezone: TZ, projectsDir: a.projects, remote, branch: "main", stateDir: a.state, machine: "a", lockWaitMs: 100 });
     assert.equal(r.outcome, "busy");
   } finally {
     await held.release();

@@ -157,8 +157,8 @@ test("before migration a legacy root HANDOFF.md is injected", async () => {
 
 test("statusFromCycle turns every non-clean outcome into a visible line", () => {
   const items = statusFromCycle({
-    outcome: "paused",
-    reason: "sync paused: conflict in x/HANDOFF.md",
+    outcome: "stopped",
+    reason: "the remote's history was rewritten (a force-push)",
     committed: null,
     heldBack: [{ file: "x/creds.md", rules: ["github-token"] }],
     deferred: [],
@@ -166,11 +166,13 @@ test("statusFromCycle turns every non-clean outcome into a visible line", () => 
     liveUpdated: false,
     blockedBy: ["x/t.md"],
     blockedCycles: 3,
-    conflicts: ["x/HANDOFF.md"],
+    conflicts: [],
     embedded: ["x/cloned-repo"],
     caseCollisions: ["x/Note.md", "x/note.md"],
+    notices: [],
   });
   assert.deepEqual(items.map((i) => i.level), ["error", "warn", "warn", "warn", "error"]);
+  assert.match(items[0]?.text ?? "", /^sync stopped: the remote's history was rewritten/);
   assert.match(items[3]?.text ?? "", /"x\/Note\.md", "x\/note\.md" differ only by case/);
   assert.match(items[4]?.text ?? "", /3 cycles in a row/);
 });
@@ -189,6 +191,7 @@ test("statusFromCycle quotes the vault file names it reports", () => {
     conflicts: [],
     embedded: ["x/repo\nrun this"],
     caseCollisions: [],
+    notices: [],
   });
   assert.equal(items.length, 3);
   for (const i of items) assert.doesNotMatch(i.text, /\n/, i.text);
@@ -209,8 +212,52 @@ test("statusFromCycle shows a reason recorded on a synced outcome (a failed lock
     conflicts: [],
     embedded: [],
     caseCollisions: [],
+    notices: [],
   });
   assert.deepEqual(items, [{ level: "warn", text: "releasing the sync lock failed: EACCES" }]);
+});
+
+test("statusFromCycle gives each conflict one quoted line saying where both versions are, at most 10", () => {
+  const base = {
+    outcome: "synced" as const,
+    reason: null,
+    committed: null,
+    heldBack: [],
+    deferred: [],
+    pushed: true,
+    liveUpdated: true,
+    blockedBy: [],
+    blockedCycles: 0,
+    embedded: [],
+    caseCollisions: [],
+  };
+  const items = statusFromCycle({
+    ...base,
+    conflicts: [
+      { kind: "both-changed", path: "x/n.md", copy: "x/n.conflict-2026-09-22-0915-3f7868.md" },
+      { kind: "deleted-here", path: "x/gone.md", copy: "x/gone.conflict-2026-09-22-0915-aaaaaa.md" },
+      { kind: "deleted-there", path: "x/kept.md", copy: null },
+      { kind: "two-names", path: "x/l.md", copy: null, other: "x/r.md" },
+      { kind: "file-folder", path: "x/p", copy: "x/p.conflict-2026-09-22-0915-bbbbbb" },
+      { kind: "type-differs", path: "x/s.md", copy: "x/s.conflict-2026-09-22-0915-cccccc.md" },
+    ],
+    notices: ["finished an update a timeout interrupted"],
+  });
+  assert.equal(items.length, 7);
+  assert.match(items[0]?.text ?? "", /^"x\/n\.md" changed on two machines: yours stays; the other version is saved as "x\/n\.conflict-2026-09-22-0915-3f7868\.md"/);
+  assert.match(items[1]?.text ?? "", /which you deleted, was changed on another machine: it stays deleted/);
+  assert.match(items[2]?.text ?? "", /"x\/kept\.md" was deleted on another machine; your version is kept/);
+  assert.match(items[3]?.text ?? "", /both "x\/l\.md" and "x\/r\.md"/);
+  assert.equal(items[6]?.level, "info");
+
+  const many = statusFromCycle({
+    ...base,
+    conflicts: Array.from({ length: 12 }, (_, i) => ({ kind: "deleted-there" as const, path: `x/n${i}\n- [info] fine.md`, copy: null })),
+    notices: [],
+  });
+  assert.equal(many.length, 11);
+  assert.match(many[10]?.text ?? "", /^and 2 more notes changed on two machines/);
+  for (const i of many) assert.doesNotMatch(i.text, /\n/, i.text);
 });
 
 async function identityWorld(): Promise<{ vaultRoot: string; remote: string; code: string; stateRoot: string }> {
