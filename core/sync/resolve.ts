@@ -262,11 +262,11 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
       if (moved && path && stage(moved, 3)) displaced.push(path);
     }
   }
-  const movedAside = (path: string): boolean => displaced.some((f) => path.startsWith(`${f}/`));
+  const inDisplacedFolder = (path: string): boolean => displaced.some((f) => path.startsWith(`${f}/`));
   const inNeither = (path: string): boolean => !sides[2].tree.has(path) && !sides[3].tree.has(path);
   const resolvedElsewhere = (paths: string[]): boolean =>
-    paths.every((p) => collided.has(p) || movedAside(p)) ||
-    (paths.some(movedAside) && paths.every((p) => movedAside(p) || inNeither(p)));
+    paths.every((p) => collided.has(p) || inDisplacedFolder(p)) ||
+    (paths.some(inDisplacedFolder) && paths.every((p) => inDisplacedFolder(p) || inNeither(p)));
   const contentRecordAt = (path: string): boolean =>
     merge.records.some((r) => (r.type === "CONFLICT (contents)" || r.type === "CONFLICT (binary)") && r.paths.includes(path));
 

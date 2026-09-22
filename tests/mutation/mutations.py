@@ -203,9 +203,9 @@ mutate(CY, "finishInterrupted(input.stateDir, dir, { timeoutMs: input.liveUpdate
 mutate(F_R, '} else if (local && remote && record.type === "CONFLICT (rename/delete)" && contentRecordAt(path)) {', "} else if (false) {", R,
        pattern="onto a name this machine also uses|onto a name the other machine also added")
 mutate(F_R, 'record.type === "CONFLICT (rename/delete)" && contentRecordAt(path)) {', 'record.type === "CONFLICT (rename/delete)") {', R, pattern="onto a name both sides hold stops")
-mutate(F_R, "    paths.every((p) => collided.has(p) || movedAside(p)) ||\n    (paths.some(movedAside) && paths.every((p) => movedAside(p) || inNeither(p)));",
-       "    paths.every((p) => collided.has(p) || movedAside(p));", R, pattern="the folder the other machine renamed a note into")
-mutate(F_R, "(paths.some(movedAside) && paths.every(", "(paths.every(", R, pattern="a record naming only paths neither commit holds")
+mutate(F_R, "    paths.every((p) => collided.has(p) || inDisplacedFolder(p)) ||\n    (paths.some(inDisplacedFolder) && paths.every((p) => inDisplacedFolder(p) || inNeither(p)));",
+       "    paths.every((p) => collided.has(p) || inDisplacedFolder(p));", R, pattern="the folder the other machine renamed a note into")
+mutate(F_R, "(paths.some(inDisplacedFolder) && paths.every(", "(paths.every(", R, pattern="a record naming only paths neither commit holds")
 mutate(F_R, '        if (conflicts.some((c) => c.kind === "both-changed" && c.path === path)) break;\n', "", R, pattern="a binary file changed on both sides")
 mutate(F_R, "    for (const c of conflicts) if (c.other?.startsWith(`${path}/`)) c.other = moved(c.other);\n", "", R, pattern="with the folder replaced by a file here")
 mutate(F_R, "      !result.has(at) && record.paths.some((p) => isCopyOf(p, at) || movedWith(p, at));", "      !result.has(at) && record.paths.some((p) => isCopyOf(p, at));", R,
