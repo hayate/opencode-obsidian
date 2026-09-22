@@ -60,10 +60,13 @@ async function entries(dir: string): Promise<string[]> {
   }
 }
 
+// Finder's own file, written into any folder the user opens: litter, never content.
+export const isFinderLitter = (name: string): boolean => name === ".DS_Store";
+
 // Absent, or holding only Finder litter and empty directories, counts as empty.
-async function isEffectivelyEmpty(dir: string): Promise<boolean> {
+export async function isEffectivelyEmpty(dir: string): Promise<boolean> {
   for (const name of await entries(dir)) {
-    if (name === ".DS_Store") continue;
+    if (isFinderLitter(name)) continue;
     const path = join(dir, name);
     // lstat: a symlink is content, never a directory to walk (or clean) through.
     const info = await lstat(path);
@@ -75,7 +78,7 @@ async function isEffectivelyEmpty(dir: string): Promise<boolean> {
 async function clearLitter(dir: string): Promise<void> {
   for (const name of await entries(dir)) {
     const path = join(dir, name);
-    if (name === ".DS_Store") await rm(path, { force: true });
+    if (isFinderLitter(name)) await rm(path, { force: true });
     else {
       await clearLitter(path);
       await rmdir(path).catch(() => undefined);

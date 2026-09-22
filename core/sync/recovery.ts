@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { git, gitOk, literal } from "../git.ts";
 import { writeAtomic } from "../store.ts";
 import { fold } from "./copies.ts";
+import { isEffectivelyEmpty, isFinderLitter } from "./state.ts";
 
 const RECORD = "interrupted-update.json";
 
@@ -33,6 +34,17 @@ const errno = (err: unknown): string | undefined => (err as NodeJS.ErrnoExceptio
 // Nothing at the path. ENOTDIR too: a file where one of its folders would be
 // leaves nothing below it (a note the update turned into a folder, or back).
 const absent = (err: unknown): boolean => errno(err) === "ENOENT" || errno(err) === "ENOTDIR";
+
+// Nothing at all at the path (a folder there is something).
+async function missing(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return false;
+  } catch (err) {
+    if (absent(err)) return true;
+    throw err;
+  }
+}
 
 // What is at a path, by content: a file's bytes, a symlink's target, or nothing.
 // A folder is nothing here: its files answer for themselves, and a folder that goes
@@ -97,7 +109,8 @@ function units(changed: string[], old: Map<string, Entry>, twins: boolean): stri
       const unit = byName.get(fold(rel));
       if (unit !== undefined && !unit.includes(rel)) unit.push(rel);
     }
-    for (const unit of byName.values()) unit.sort();
+    // Index order (bytes, as git compares names): which old twin goes back depends on it.
+    for (const unit of byName.values()) unit.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
   }
   const restores = (unit: string[]): boolean => unit.some((rel) => old.has(rel));
   const all = [...byName.values()];
@@ -174,26 +187,35 @@ async function folderFor(path: string): Promise<boolean> {
   }
 }
 
-// The folders of a subtree that holds nothing but folders, deepest first; null when
-// it holds anything else (a file, a symlink).
-async function onlyFolders(path: string): Promise<string[] | null> {
-  const folders: string[] = [];
+// Takes apart a folder found effectively empty, deepest first: each piece of Finder
+// litter by a single-file unlink, each folder by rmdir, never a recursive removal.
+// Anything else found now (a note saved meanwhile) is left where it is, its folder's
+// rmdir fails, and so does this: false.
+async function clear(path: string): Promise<boolean> {
   for (const entry of await readdir(path, { withFileTypes: true })) {
-    const below = entry.isDirectory() ? await onlyFolders(join(path, entry.name)) : null;
-    if (below === null) return null;
-    folders.push(...below);
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) {
+      if (!(await clear(child))) return false;
+    } else if (isFinderLitter(entry.name)) {
+      await unlink(child);
+    }
   }
-  return [...folders, path];
+  try {
+    await rmdir(path);
+    return true;
+  } catch (err) {
+    if (errno(err) === "ENOTEMPTY" || errno(err) === "EEXIST") return false;
+    throw err;
+  }
 }
 
 // Clears the path for the note. Nothing there, or a file (which the rename replaces):
-// true. A folder whose whole subtree holds only folders goes, and the note comes back:
-// the old tree held a file here, so those folders appeared after the update began (the
-// update's, emptied by the removals before, or left by a repair that died before its
-// prune), and a path left empty would reach the snapshot as a deletion. They go deepest
-// first by rmdir alone, never a recursive removal: a file saved into them meanwhile
-// makes an rmdir fail, and the path is left as it is (false). A folder holding anything
-// else is someone's: false, and nothing in it is touched.
+// true. A folder whose whole subtree holds only folders and Finder litter (empty as
+// state.ts reads a folder) goes, and the note comes back: the old tree held a file
+// here, so those folders appeared after the update began (the update's, emptied by the
+// removals before, or left by a repair that died before its prune), and a path left
+// empty would reach the snapshot as a deletion. A folder holding anything else is
+// someone's: false, and nothing in it is touched.
 async function roomFor(path: string): Promise<boolean> {
   let info;
   try {
@@ -203,17 +225,7 @@ async function roomFor(path: string): Promise<boolean> {
     throw err;
   }
   if (!info.isDirectory()) return true;
-  const folders = await onlyFolders(path);
-  if (folders === null) return false;
-  for (const folder of folders) {
-    try {
-      await rmdir(folder);
-    } catch (err) {
-      if (errno(err) === "ENOTEMPTY" || errno(err) === "EEXIST") return false;
-      throw err;
-    }
-  }
-  return true;
+  return (await isEffectivelyEmpty(path)) && clear(path);
 }
 
 // Whether two spellings name one entry on disk (same device and inode). Where the disk
@@ -229,15 +241,35 @@ async function oneEntry(a: string, b: string): Promise<boolean> {
   }
 }
 
+// How git's own checkout of the old tree spells a path of it on this disk, component
+// by component. Git writes the entries in index order: a folder is made under the
+// first spelling that needs it, and a file is replaced by each later spelling (so the
+// last one's name and content stay; setBack picks that one). Checked against git's
+// clone of such trees on a disk that ignores case: two and three spellings of a
+// note, a folder spelled two ways, a folder and a note each spelled two ways. Where
+// case matters the spellings name separate entries, and respell renames none.
+function spellings(old: Map<string, Entry>): (rel: string) => string[] {
+  const first = new Map<string, string>();
+  for (const rel of old.keys()) {
+    const parts = rel.split("/");
+    for (let i = 1; i < parts.length; i++) {
+      const folder = fold(parts.slice(0, i).join("/"));
+      if (!first.has(folder)) first.set(folder, parts[i - 1] ?? "");
+    }
+  }
+  return (rel) => rel.split("/").map((part, i, parts) => (i < parts.length - 1 ? (first.get(fold(parts.slice(0, i + 1).join("/"))) ?? part) : part));
+}
+
 // A rename onto a case twin keeps the twin's spelling (APFS, verified), and a folder
-// git made for a case-only rename keeps git's: each component of rel, folders
-// included, takes the old tree's spelling back, walked from the vault root as the
-// cycle's snapshot reads spellings. Only an entry that is the wanted one under
-// another spelling is renamed: a different file (a stale core.ignorecase=true on a
-// disk where case matters) is never renamed over the one set back.
-async function respell(dir: string, rel: string): Promise<void> {
+// git made for a new spelling keeps it: each component of the path set back, folders
+// included, takes the spelling git's own checkout of the old tree gives it (`names`),
+// walked from the vault root as the cycle's snapshot reads spellings. Only an entry
+// that is the wanted one under another spelling is renamed: a different file (a stale
+// core.ignorecase=true on a disk where case matters) is never renamed over the one set
+// back, and where case matters nothing is.
+async function respell(dir: string, names: string[]): Promise<void> {
   let folder = dir;
-  for (const part of rel.split("/")) {
+  for (const part of names) {
     const wanted = join(folder, part);
     const twin = (await readdir(folder)).find((n) => n !== part && fold(n) === fold(part));
     if (twin !== undefined && (await oneEntry(join(folder, twin), wanted))) await rename(join(folder, twin), wanted);
@@ -267,11 +299,12 @@ async function setBack(
   untouched: () => Promise<boolean>,
   timeoutMs: number | undefined,
   left: Map<string, string | null>,
+  spell: (rel: string) => string[],
 ): Promise<boolean> {
-  // Case twins: the one twin the old version had (never a removal of the file
-  // another twin names). A tree that held several could not be on a disk that ignores
-  // case either; the first goes back.
-  const source = unit.find((rel) => old.has(rel));
+  // Case twins: a twin the old version had (never a removal of the file another twin
+  // names). Where the old tree held several, the last in index order, as git's own
+  // checkout of it leaves (see spellings).
+  const source = unit.findLast((rel) => old.has(rel));
   if (source === undefined) {
     await remove(dir, unit[0] ?? "");
     for (const rel of unit) left.set(rel, null);
@@ -305,7 +338,7 @@ async function setBack(
     if (!(await folderFor(dirname(target))) || !(await roomFor(target))) return false;
     await rename(built, target);
     for (const rel of unit) left.set(rel, print);
-    if (unit.length > 1) await respell(dir, source);
+    await respell(dir, spell(source));
     return true;
   } finally {
     await rm(scratch, { recursive: true, force: true });
@@ -402,6 +435,7 @@ export async function finishInterrupted(stateDir: string, dir: string, opts: Fin
     const prints = record.prints ?? {};
     const printed = (rel: string): boolean => Object.hasOwn(prints, rel);
     const twins = await ignoresCase(dir);
+    const spell = spellings(old);
     // What the repair has left at each path it set back.
     const left = new Map<string, string | null>();
     for (const unit of units(await changedPaths(dir, record.from, record.to), old, twins)) {
@@ -418,9 +452,17 @@ export async function finishInterrupted(stateDir: string, dir: string, opts: Fin
         }
         return true;
       };
+      // A path the update added that is gone now is what setting it back leaves, whoever
+      // removed it (a repair that died after its unlink, or the user), and the retried
+      // update writes it again: restored, whatever its fingerprint says.
+      const gone = async (): Promise<boolean> => {
+        if (unit.some((rel) => old.has(rel))) return false;
+        for (const rel of unit) if (!(await missing(join(dir, rel)))) return false;
+        return true;
+      };
       let back: boolean;
       try {
-        back = (await untouched()) && (await setBack(dir, unit, record.from, old, untouched, opts.timeoutMs, left));
+        back = (await gone()) || ((await untouched()) && (await setBack(dir, unit, record.from, old, untouched, opts.timeoutMs, left, spell)));
       } catch (err) {
         // What the repair left becomes the record's fingerprint there, so the next
         // run never takes its own work for an edit. A record that cannot be written

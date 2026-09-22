@@ -335,14 +335,24 @@ for (const prints of [true, false]) {
     const { dir, from, to } = await noteIntoDeepFolders();
     const state = await killUpdate(dir, from, to, { prints });
     // Gone, its folders left: a repair that died between the unlink and the prune, or the user's deletion.
+    // Either way absence is what the set-back leaves there: restored, whatever the fingerprint says.
     await unlink(join(dir, "x/p/q/c.txt"));
-    const done = await finishInterrupted(state, dir);
-    assert.deepEqual(done, prints ? { restored: ["x/p", "x/z.md"], kept: ["x/p/q/c.txt"], moved: false } : { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [], moved: false });
+    assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [], moved: false });
     assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
     assert.equal(await status(dir), "");
     assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
   });
 }
+
+test("Finder's .DS_Store in the empty tree at a note's path is litter, not content: the note comes back", async () => {
+  const { dir, from, to } = await noteIntoDeepFolders();
+  const state = await killUpdate(dir, from, to);
+  await unlink(join(dir, "x/p/q/c.txt"));
+  await writeFile(join(dir, "x/p/q/.DS_Store"), "finder");
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/q/c.txt", "x/p", "x/z.md"], kept: [], moved: false });
+  assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the note\n");
+  assert.equal(await status(dir), "");
+});
 
 test("a note whose path holds a user's file deeper down is kept, and everything of theirs in it stays as it was", async () => {
   const { dir, from, to } = await noteIntoDeepFolders();
@@ -377,7 +387,7 @@ test("a file saved into the empty tree while the repair clears it keeps the path
     fsp.readdir = real;
     syncBuiltinESMExports();
   }
-  assert.deepEqual(done, { restored: ["x/z.md"], kept: ["x/p/q/c.txt", "x/p"], moved: false });
+  assert.deepEqual(done, { restored: ["x/p/q/c.txt", "x/z.md"], kept: ["x/p"], moved: false });
   assert.equal(await readFile(late, "utf8"), "saved meanwhile\n");
 });
 
@@ -467,10 +477,22 @@ test("a case-only rename whose one file the user changed since is kept as the us
   assert.equal(await readFile(join(v.dir, "note.md"), "utf8"), "the user's edit\n");
 });
 
-// A vault at `before`, and a commit on top of it whose tree holds exactly `after`,
-// spelled as given: committed as a machine where case matters commits it, since git
-// on a disk that ignores case cannot stage a case-only rename by name. Null (and the
-// test skipped) where core.ignorecase is false.
+// A commit whose tree holds exactly `files`, spelled as given: committed as a machine
+// where case matters commits it, since git on a disk that ignores case cannot stage a
+// case-only rename, or two spellings of one name, by name.
+async function exactCommit(dir: string, files: Record<string, string>, parent?: string): Promise<string> {
+  const env = { GIT_INDEX_FILE: join(await tempDir(), "index") };
+  for (const [rel, content] of Object.entries(files)) {
+    const blob = await gitOk(["hash-object", "-w", "--stdin"], { cwd: dir, input: content });
+    await gitOk(["-c", "core.ignorecase=false", "update-index", "--add", "--cacheinfo", `100644,${blob},${rel}`], { cwd: dir, env });
+  }
+  const tree = await gitOk(["write-tree"], { cwd: dir, env });
+  return gitOk(["commit-tree", tree, ...(parent === undefined ? [] : ["-p", parent]), "-m", parent === undefined ? "old" : "new"], { cwd: dir });
+}
+
+// A vault at `before`, checked out by git itself, and a commit on top of it at `after`,
+// both trees holding exactly the paths given. Null (and the test skipped) where
+// core.ignorecase is false.
 async function caseHistory(
   t: TestContext,
   before: Record<string, string>,
@@ -482,17 +504,29 @@ async function caseHistory(
     t.skip("core.ignorecase is false here: the disk holds the two spellings as two entries");
     return null;
   }
-  for (const [rel, content] of Object.entries(before)) await writeRel(dir, rel, content);
-  await gitOk(["add", "-A"], { cwd: dir });
-  await gitOk(["commit", "-q", "-m", "old"], { cwd: dir });
-  const from = await head(dir);
-  const env = { GIT_INDEX_FILE: join(await tempDir(), "index") };
-  for (const [rel, content] of Object.entries(after)) {
-    const blob = await gitOk(["hash-object", "-w", "--stdin"], { cwd: dir, input: content });
-    await gitOk(["-c", "core.ignorecase=false", "update-index", "--add", "--cacheinfo", `100644,${blob},${rel}`], { cwd: dir, env });
-  }
-  const to = await gitOk(["commit-tree", await gitOk(["write-tree"], { cwd: dir, env }), "-p", from, "-m", "new"], { cwd: dir });
+  const from = await exactCommit(dir, before);
+  await gitOk(["reset", "-q", "--hard", from], { cwd: dir });
+  const to = await exactCommit(dir, after, from);
   return { dir, from, to };
+}
+
+// Every file under dir but .git, as spelled on disk, with its content.
+async function files(dir: string, rel = ""): Promise<string[]> {
+  const found: string[] = [];
+  for (const entry of await readdir(join(dir, rel), { withFileTypes: true })) {
+    const path = rel ? `${rel}/${entry.name}` : entry.name;
+    if (path === ".git") continue;
+    if (entry.isDirectory()) found.push(...(await files(dir, path)));
+    else found.push(`${path}: ${await readFile(join(dir, path), "utf8")}`);
+  }
+  return found.sort();
+}
+
+// The oracle: a second clone of the vault at its current commit, checked out by git itself.
+async function checkedOutByGit(dir: string): Promise<string> {
+  const clone = join(await tempDir(), "clone");
+  await gitOk(["clone", "-q", dir, clone], { cwd: dir });
+  return clone;
 }
 
 const folderSpellings = async (dir: string): Promise<string[]> => (await readdir(dir)).filter((name) => fold(name) === "x");
@@ -519,6 +553,42 @@ test("a note the update added beside its unchanged case twin is that one file he
   assert.equal(await readFile(join(v.dir, "Note.md"), "utf8"), "old note\n");
   assert.equal(await readFile(join(v.dir, "z.md"), "utf8"), "old\n");
   assert.equal(await status(v.dir), "");
+});
+
+for (const prints of [true, false]) {
+  test(`a note set back into a folder git made under a new spelling for another path gets the old folder's spelling (${prints ? "with" : "without"} fingerprints)`, async (t) => {
+    // The remote renamed folder X to x and X/p.md to x/q.md: two units, not twins.
+    const v = await caseHistory(t, { "X/p.md": "old note\n", "z.md": "old\n" }, { "x/q.md": "new q\n", "z.md": "new\n" });
+    if (!v) return;
+    const state = await killUpdate(v.dir, v.from, v.to, { prints });
+    assert.deepEqual(await folderSpellings(v.dir), ["x"], "the kill came after git had made the folder x, during x/q.md");
+    assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/q.md", "X/p.md", "z.md"], kept: [], moved: false });
+    assert.deepEqual(await folderSpellings(v.dir), ["X"]);
+    assert.equal(await readFile(join(v.dir, "X", "p.md"), "utf8"), "old note\n");
+    assert.equal(await status(v.dir), "");
+  });
+}
+
+test("where the old tree holds both spellings of a note, the repair gives back what git's own checkout of the old tree leaves", async (t) => {
+  const v = await caseHistory(t, { "Note.md": "upper\n", "note.md": "lower\n", "z.md": "old\n" }, { "Note.md": "upper\n", "note.md": "lower changed\n", "z.md": "new\n" });
+  if (!v) return;
+  const oracle = await checkedOutByGit(v.dir);
+  const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
+  assert.equal(await readFile(join(v.dir, "note.md"), "utf8"), "lower changed\n", "the kill came after git wrote note.md");
+  await finishInterrupted(state, v.dir);
+  assert.deepEqual(await files(v.dir), await files(oracle));
+  assert.equal(await status(v.dir), await status(oracle));
+});
+
+test("where the old tree spells a folder two ways, a note set back into it keeps the folder git's own checkout made", async (t) => {
+  const v = await caseHistory(t, { "X/a.md": "a\n", "x/b.md": "old b\n", "z.md": "old\n" }, { "X/a.md": "a\n", "x/b.md": "new b\n", "z.md": "new\n" });
+  if (!v) return;
+  const oracle = await checkedOutByGit(v.dir);
+  const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
+  assert.equal(await readFile(join(v.dir, "x/b.md"), "utf8"), "new b\n", "the kill came after git wrote x/b.md");
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["x/b.md", "z.md"], kept: [], moved: false });
+  assert.deepEqual(await files(v.dir), await files(oracle));
+  assert.equal(await status(v.dir), await status(oracle));
 });
 
 // Whether the disk the tests write to tells Note.md and note.md apart, asked of the
