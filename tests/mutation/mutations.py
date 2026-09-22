@@ -194,7 +194,13 @@ mutate(CY, "    await clearInterrupted(input.stateDir);\n    result.liveUpdated 
 mutate(CY, "  await clearInterrupted(input.stateDir);\n  result.blockedBy = blocked;", "  result.blockedBy = blocked;", C, pattern="held-back new note")
 mutate(CY, "  if (!blocked.length) {", "  if (false) {", C, pattern="fails partway")
 mutate(CY, "would be (?:overwritten|removed) by merge", "would be (?:removed) by merge", C, pattern="held-back new note")
-mutate(CY, "  await recordIntent(input.stateDir, live, next);\n  const reset = await git(", "  const reset = await git(", C, pattern="fails partway")
+mutate(CY, "    await recordIntent(input.stateDir, live, next);\n    result.outcome = \"unsynced\";", "    result.outcome = \"unsynced\";", C, pattern="fails partway")
+# The intent written before git is spawned: the group write repeats it as soon as git exists,
+# so only a session death in the instant between them, or a group write that fails, leaves the
+# vault changing with no record at all.
+mutate(CY, "  await recordIntent(input.stateDir, live, next);\n  const reset = await git(", "  const reset = await git(", C,
+       survives=("linux", "darwin"),
+       why="defence in depth behind the group write, which records the same intent as soon as git is spawned: what it alone covers is a session death inside that instant, or a group write that fails, neither of which a deterministic test can stage")
 mutate(CY, "finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) })", "finishInterrupted(input.stateDir, dir)", C, pattern="repair that times out stops")
 # The review fix rounds of Tasks 3, 5 and 6 (2026-09-22): each piece a round added, broken
 # alone, as its implementer checked it by hand.
@@ -387,3 +393,4 @@ mutate(CY, "      result.reason = `an earlier vault update is still running (pro
        "      result.reason = `an earlier vault update is still running (process group ${running}); sync waits for it. If it is hung, end that process.`;", C, runs=5, pattern=WAITS)
 mutate(CY, "    onSpawn: (group) => recordIntent(input.stateDir, live, next, group),\n", "", C, pattern="records its process group")
 mutate("core/git.ts", '  if (started.size === 0) process.on("exit", killStarted);\n', "", G, pattern="session that exits normally takes the git")
+mutate("core/git.ts", "    started.delete(pid);\n", "", G, pattern="session that exits normally takes the git")

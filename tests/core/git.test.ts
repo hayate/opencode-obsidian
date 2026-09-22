@@ -376,9 +376,8 @@ test("a session that exits normally takes the git it started with it, and instal
     assert.ok(Date.now() - started < 10_000, "the git the session started outlived it");
     await sleep(20);
   }
-  // The handler goes with the last child, so a host that runs no git keeps its listeners
-  // as they were.
-  const listeners = process.listenerCount("exit");
+  // The handler goes with the last child, so a host that runs no git of ours keeps its
+  // exit listeners as they were (none of its own here, measured).
   await gitOk(["--version"], { cwd: process.cwd() });
-  assert.equal(process.listenerCount("exit"), listeners, "no exit listener is left behind");
+  assert.equal(process.listenerCount("exit"), 0, "no exit listener is left behind");
 });

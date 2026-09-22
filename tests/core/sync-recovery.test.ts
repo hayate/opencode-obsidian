@@ -917,7 +917,10 @@ test("a record that cannot be read stops sync with a message that names the file
   const w = await interrupted();
   const [name = ""] = await readdir(w.state);
   const record = join(w.state, name);
-  for (const text of ["{ not json", JSON.stringify({ prints: {} }), JSON.stringify({ from: "HEAD", to: "main" })]) {
+  // A group of 0 or 1 is no update's: process.kill(-1, ...) reaches every process this
+  // user may signal, so such a record is read as unreadable like any other.
+  const groups = [0, 1, -7, 2.5, "2"].map((group) => JSON.stringify({ from: w.from, to: w.to, group }));
+  for (const text of ["{ not json", JSON.stringify({ prints: {} }), JSON.stringify({ from: "HEAD", to: "main" }), ...groups]) {
     await writeFile(record, text);
     await assert.rejects(finishInterrupted(w.state, w.dir), (err: Error) => {
       assert.ok(err.message.includes(record), err.message);

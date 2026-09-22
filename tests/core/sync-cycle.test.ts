@@ -1082,6 +1082,11 @@ test("a live update that fails partway (a smudge filter fails) is finished by th
   assert.equal(first.outcome, "unsynced", first.reason ?? "");
   assert.match(first.reason ?? "", /updating the vault failed/);
   assert.deepEqual(first.blockedBy, []);
+  assert.equal(
+    JSON.parse(await readFile(join(b.state, "interrupted-update.json"), "utf8")).group,
+    undefined,
+    "git has exited, so the record names no process group for the next cycle to wait for",
+  );
   await gitOk(["config", "filter.bad.smudge", "cat"], { cwd: b.projects });
   const second = await cycle(remote, b);
   assert.equal(second.outcome, "synced", second.reason ?? "");
