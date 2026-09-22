@@ -31,12 +31,38 @@ interface Entry {
 
 const errno = (err: unknown): string | undefined => (err as NodeJS.ErrnoException).code;
 
-// Nothing at the path. ENOTDIR too: a file where one of its folders would be
-// leaves nothing below it (a note the update turned into a folder, or back).
-const absent = (err: unknown): boolean => errno(err) === "ENOENT" || errno(err) === "ENOTDIR";
+// Nothing at the path. A file or a symlink where one of its folders would be is
+// onDisk's to find, before any path under it is read.
+const absent = (err: unknown): boolean => errno(err) === "ENOENT";
 
-// Nothing at all at the path (a folder there is something).
-async function missing(path: string): Promise<boolean> {
+// rel's path under root, or null when rel is not in the vault: the repair never goes
+// through a symlink. lstat reads a symlink as itself only as a path's last component
+// and follows it anywhere before, so each of rel's folders is lstat'ed from root
+// down, and one that is anything but a real folder (a symlink, even to a folder; a
+// file, where the update turned a note into a folder or back) puts rel outside the
+// vault. Judged, nothing is there; removed, nothing goes; set back, nothing is
+// written and rel is kept. Otherwise a symlink in a folder's place, the old tree's,
+// the update's or one the user made, would have the repair read, unlink or write a
+// file outside the vault. A folder that is absent holds nothing below it: rel is in
+// the vault, with nothing at it.
+async function onDisk(root: string, rel: string): Promise<string | null> {
+  let folder = root;
+  for (const part of rel.split("/").slice(0, -1)) {
+    folder = join(folder, part);
+    try {
+      if (!(await lstat(folder)).isDirectory()) return null;
+    } catch (err) {
+      if (absent(err)) break;
+      throw err;
+    }
+  }
+  return join(root, rel);
+}
+
+// Nothing at all at rel (a folder there is something).
+async function missing(dir: string, rel: string): Promise<boolean> {
+  const path = await onDisk(dir, rel);
+  if (path === null) return true;
   try {
     await lstat(path);
     return false;
@@ -56,10 +82,12 @@ async function isFolder(path: string): Promise<boolean> {
   }
 }
 
-// What is at a path, by content: a file's bytes, a symlink's target, or nothing.
-// A folder is nothing here: its files answer for themselves, and a folder that goes
-// once the removals have emptied it never makes the path read as edited.
-async function fingerprint(path: string): Promise<string | null> {
+// What is at rel under root, by content: a file's bytes, a symlink's target, or
+// nothing. A folder is nothing here: its files answer for themselves, and a folder
+// that goes once the removals have emptied it never makes the path read as edited.
+async function fingerprint(root: string, rel: string): Promise<string | null> {
+  const path = await onDisk(root, rel);
+  if (path === null) return null;
   try {
     const info = await lstat(path);
     if (info.isDirectory()) return null;
@@ -134,7 +162,8 @@ function units(changed: string[], old: Map<string, Entry>, twins: boolean): stri
 // else is someone's edit. hash-object --path applies the path's clean filter, as
 // git add does.
 async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[]): Promise<boolean> {
-  const path = join(dir, rel);
+  const path = await onDisk(dir, rel);
+  if (path === null) return true;
   let info;
   try {
     info = await lstat(path);
@@ -161,8 +190,10 @@ async function updatesWork(dir: string, rel: string, unit: string[], versions: E
 // nothing git records), never a reason to stop sync.
 async function prune(dir: string, folder: string): Promise<void> {
   for (let rel = folder; rel !== "."; rel = dirname(rel)) {
+    const path = await onDisk(dir, rel);
+    if (path === null) return;
     try {
-      await rmdir(join(dir, rel));
+      await rmdir(path);
     } catch {
       return;
     }
@@ -174,7 +205,8 @@ async function prune(dir: string, folder: string): Promise<void> {
 // with nothing at rel, the folders around it are as they were (an empty one may be
 // the user's).
 async function remove(dir: string, rel: string): Promise<void> {
-  const path = join(dir, rel);
+  const path = await onDisk(dir, rel);
+  if (path === null) return;
   try {
     if ((await lstat(path)).isDirectory()) return;
     await unlink(path);
@@ -183,18 +215,6 @@ async function remove(dir: string, rel: string): Promise<void> {
     throw err;
   }
   await prune(dir, dirname(rel));
-}
-
-// The folder a note goes back into. A file where it must be is someone's (the
-// update's own were removed first), so the note cannot come back: false.
-async function folderFor(path: string): Promise<boolean> {
-  try {
-    await mkdir(path, { recursive: true });
-    return true;
-  } catch (err) {
-    if (errno(err) === "EEXIST" || errno(err) === "ENOTDIR") return false;
-    throw err;
-  }
 }
 
 // Takes apart a folder found effectively empty, deepest first: each piece of Finder
@@ -349,10 +369,14 @@ async function setBack(
     );
     const built = join(tree, source);
     // The rename keeps the file (inode, mode, bytes), so this is what the path holds after.
-    const print = await fingerprint(built);
+    const print = await fingerprint(tree, source);
     if (!(await untouched())) return false;
-    const target = join(dir, source);
-    if (!(await folderFor(dirname(target))) || !(await roomFor(target))) return false;
+    // A folder of the note that is not a real folder (a symlink, a file) is someone's:
+    // the note cannot come back without writing through it or over it (onDisk).
+    const target = await onDisk(dir, source);
+    if (target === null) return false;
+    await mkdir(dirname(target), { recursive: true });
+    if (!(await roomFor(target))) return false;
     await rename(built, target);
     for (const rel of unit) left.set(rel, print);
     await respell(dir, spell(source));
@@ -371,7 +395,7 @@ export async function recordIntent(stateDir: string, from: string, to: string): 
 // Called after git() returned for the killed reset, so its process group is gone.
 export async function recordInterrupted(stateDir: string, dir: string, from: string, to: string): Promise<void> {
   const prints: [string, string | null][] = [];
-  for (const path of await changedPaths(dir, from, to)) prints.push([path, await fingerprint(join(dir, path))]);
+  for (const path of await changedPaths(dir, from, to)) prints.push([path, await fingerprint(dir, path)]);
   // fromEntries: a path named __proto__ is a key like any other.
   await writeAtomic(join(stateDir, RECORD), JSON.stringify({ from, to, prints: Object.fromEntries(prints) } satisfies Record_));
 }
@@ -464,7 +488,7 @@ export async function finishInterrupted(stateDir: string, dir: string, opts: Fin
       // is stale they are separate files, and each must be the update's to be set back.
       const untouched = async (): Promise<boolean> => {
         for (const rel of unit) {
-          const work = printed(rel) ? (await fingerprint(join(dir, rel))) === prints[rel] : await updatesWork(dir, rel, unit, versions);
+          const work = printed(rel) ? (await fingerprint(dir, rel)) === prints[rel] : await updatesWork(dir, rel, unit, versions);
           if (!work) return false;
         }
         return true;
@@ -474,7 +498,7 @@ export async function finishInterrupted(stateDir: string, dir: string, opts: Fin
       // update writes it again: restored, whatever its fingerprint says.
       const gone = async (): Promise<boolean> => {
         if (unit.some((rel) => old.has(rel))) return false;
-        for (const rel of unit) if (!(await missing(join(dir, rel)))) return false;
+        for (const rel of unit) if (!(await missing(dir, rel))) return false;
         return true;
       };
       let back: boolean;

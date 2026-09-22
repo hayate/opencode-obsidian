@@ -133,7 +133,7 @@ mutate("core/sync/clone.ts", '  for (const remote of ["live", "origin"]) {', "  
 mutate("core/sync/clone.ts", "    if (LEFTOVER.test(name)) await rm(join(stateDir, name), { recursive: true, force: true });", "", CL)
 mutate("core/sync/clone.ts", "  } finally {\n    await rm(tmp, { recursive: true, force: true });", "  } finally {\n    await Promise.resolve();", CL, pattern="git refuses the remote")
 # recovery.ts: only untouched paths are repaired.
-mutate("core/sync/recovery.ts", "printed(rel) ? (await fingerprint(join(dir, rel))) === prints[rel] :", "printed(rel) ? true :", RC,
+mutate("core/sync/recovery.ts", "printed(rel) ? (await fingerprint(dir, rel)) === prints[rel] :", "printed(rel) ? true :", RC,
        pattern="a path the user changed after the kill is kept")
 mutate("core/sync/recovery.ts", "  } else if (head !== record.from) {\n    done.moved = true;", "  } else if (false) {\n    done.moved = true;", RC)
 mutate("core/sync/recovery.ts", '    await remove(dir, unit[0] ?? "");\n', "", RC, pattern="already created is removed with the rest")
@@ -184,7 +184,7 @@ mutate(F_RC, "    if (absent(err)) return true;\n    throw err;\n  }\n  if (info
 mutate(F_RC, "unit.flatMap((rel) => [old.get(rel), target.get(rel)])", "unit.flatMap((rel) => [old.get(rel)])", RC, pattern="fingerprints were never taken")
 mutate(F_RC, ": await updatesWork(dir, rel, unit, versions);", ": true;", RC, pattern="fingerprints were never taken")
 mutate(F_RC, 'const head = await gitOk(["rev-parse", "-q", "--verify", "HEAD^{commit}"], { cwd: dir });', 'const head = (await git(["rev-parse", "-q", "--verify", "HEAD^{commit}"], { cwd: dir })).stdout.trim();', RC, pattern="HEAD that cannot be read")
-mutate(F_RC, "    if (!(await untouched())) return false;\n    const target = join(dir, source);", "    const target = join(dir, source);", RC, pattern="saves while a slow repair")
+mutate(F_RC, "    if (!(await untouched())) return false;\n    // A folder of the note", "    // A folder of the note", RC, pattern="saves while a slow repair")
 mutate(F_RC, "  return [...all.filter((unit) => !restores(unit)), ...all.filter(restores)];", "  return all;", RC, pattern="turned a note into a folder")
 mutate(F_RC, "  return (await isEffectivelyEmpty(path)) && clear(path);", "  return isEffectivelyEmpty(path);", RC, pattern="holds only empty folders comes back")
 mutate(F_RC, "const now = { ...prints, ...Object.fromEntries(left) };", "const now = { ...prints };", RC, pattern="the next run takes what it had set back")
@@ -220,9 +220,9 @@ mutate(F_R, "    const moved = (at: string): boolean => displacing.some((f) => m
 # an added path already gone, and a record that cannot be read or written.
 mutate(F_RC, "        `--attr-source=${from}`,\n", "", RC, pattern="filters the vault's committed")
 mutate(F_RC, "    if (info.isDirectory()) return null;\n    if (info.isSymbolicLink())", "    if (info.isSymbolicLink())", RC, pattern="turned a note into a folder, killed after making|turned into nested folders")
-mutate(F_RC, 'const absent = (err: unknown): boolean => errno(err) === "ENOENT" || errno(err) === "ENOTDIR";', 'const absent = (err: unknown): boolean => errno(err) === "ENOENT";', RC,
-       pattern="never started, turning a note into a folder|turned a folder into a note, killed after writing")
-mutate(F_RC, '    if (errno(err) === "EEXIST" || errno(err) === "ENOTDIR") return false;\n    throw err;', "    throw err;", RC, pattern="turned a folder into a note, killed after writing")
+mutate(F_RC, "      if (!(await lstat(folder)).isDirectory()) return null;\n", "      await lstat(folder);\n", RC,
+       pattern="never started, turning a note into a folder|turned a folder into a note, killed after writing|never gone through|never written or read through|re-pointed by the user")
+mutate(F_RC, "    const target = await onDisk(dir, source);", "    const target = join(dir, source);", RC, pattern="turned a folder into a note, killed after writing|re-pointed by the user")
 mutate(F_RC, "await writeAtomic(path, JSON.stringify({ ...record, prints: now } satisfies Record_)).catch(() => undefined);",
        "await writeAtomic(path, JSON.stringify({ ...record, prints: now } satisfies Record_));", RC, pattern="even when the record cannot be updated")
 mutate(F_RC, "    for (const rel of unit) left.set(rel, print);\n", "", RC, pattern="the next run takes what it had set back")
@@ -248,8 +248,8 @@ mutate(F_RC, "  let folder = dir;\n  for (const part of names) {", "  let folder
        pattern="a case-only rename of a folder the update had made|the first spelling never stops a repair")
 mutate(F_RC, "if (twin !== undefined && (await oneEntry(join(folder, twin), wanted))) await rename", "if (twin !== undefined) await rename", RC,
        pattern="never renames a different file over the note", **CASE_SENSITIVE)
-mutate(F_RC, "        for (const rel of unit) {\n          const work = printed(rel) ? (await fingerprint(join(dir, rel))) === prints[rel] : await updatesWork(dir, rel, unit, versions);\n          if (!work) return false;\n        }\n        return true;",
-       '        for (const rel of unit.filter(printed)) if ((await fingerprint(join(dir, rel))) !== prints[rel]) return false;\n        return unit.every(printed) || updatesWork(dir, unit[0] ?? "", unit, versions);', RC,
+mutate(F_RC, "        for (const rel of unit) {\n          const work = printed(rel) ? (await fingerprint(dir, rel)) === prints[rel] : await updatesWork(dir, rel, unit, versions);\n          if (!work) return false;\n        }\n        return true;",
+       '        for (const rel of unit.filter(printed)) if ((await fingerprint(dir, rel)) !== prints[rel]) return false;\n        return unit.every(printed) || updatesWork(dir, unit[0] ?? "", unit, versions);', RC,
        pattern="never sets an unchanged note back over the user's edit", **CASE_SENSITIVE)
 mutate(F_RC, "    if (!(await isFolder(wanted))) return;\n", "", RC, pattern="the first spelling never stops a repair|never goes through a symlink")
 mutate(F_RC, "    if (!(await isFolder(wanted))) return;\n", "    if (await missing(wanted)) return;\n", RC,
@@ -290,3 +290,18 @@ mutate(F_RC, ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, r
 mutate(F_R, "    if (!hasRule(record.type)) return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths);\n    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n",
        "    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n    if (!hasRule(record.type)) return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths);\n", R,
        pattern="even when a collision or a folder moved aside covers its paths")
+# The final fix wave (2026-09-22): the repair never goes through a symlink (onDisk lstats each
+# folder of a path from the vault root down), and each place that turns a path into a disk path
+# asks it, where a test can tell.
+mutate(F_RC, ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";', "      if (!(await lstat(folder)).isDirectory()) return null;"),
+       ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, stat, unlink } from "node:fs/promises";', "      if (!(await stat(folder)).isDirectory()) return null;"), RC,
+       pattern="never gone through|never written or read through|re-pointed by the user|swapped for a symlink between")
+mutate(F_RC, '  for (const part of rel.split("/").slice(0, -1)) {', '  for (const part of rel.split("/").slice(0, -2)) {', RC, pattern="never gone through|never written or read through|re-pointed by the user")
+mutate(F_RC, "      if (absent(err)) break;", "      if (absent(err)) return null;", RC, pattern="never written or read through")
+mutate(F_RC, "  const path = await onDisk(root, rel);\n  if (path === null) return null;\n", "  const path = join(root, rel);\n", RC, pattern="never written or read through|turned a folder into a note, killed after writing")
+mutate(F_RC, "async function missing(dir: string, rel: string): Promise<boolean> {\n  const path = await onDisk(dir, rel);\n  if (path === null) return true;\n",
+       "async function missing(dir: string, rel: string): Promise<boolean> {\n  const path = join(dir, rel);\n", RC, pattern="never started, turning a note into a folder")
+mutate(F_RC, "async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[]): Promise<boolean> {\n  const path = await onDisk(dir, rel);\n  if (path === null) return true;\n",
+       "async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[]): Promise<boolean> {\n  const path = join(dir, rel);\n", RC, pattern="replaced with a file, after an update that never ran")
+mutate(F_RC, "async function remove(dir: string, rel: string): Promise<void> {\n  const path = await onDisk(dir, rel);\n  if (path === null) return;\n",
+       "async function remove(dir: string, rel: string): Promise<void> {\n  const path = join(dir, rel);\n", RC, pattern="swapped for a symlink between")

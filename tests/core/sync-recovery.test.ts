@@ -1,8 +1,8 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdir, readdir, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readFile, readlink, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { git, GitError, gitOk } from "../../core/git.ts";
 import { fold } from "../../core/sync/copies.ts";
 import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted } from "../../core/sync/recovery.ts";
@@ -737,8 +737,150 @@ test("a repair's respelling walk never goes through a symlink the user put in a 
   await mkdir(join(outside, "SUB"));
   await rm(join(v.dir, "X"), { recursive: true });
   await symlink(outside, join(v.dir, "X"));
-  await finishInterrupted(state, v.dir);
+  // X/Sub/p.md is behind the user's symlink: not in the vault, so it is kept, and nothing is written through it.
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["z.md"], kept: ["X/Sub/p.md"], moved: false });
   assert.deepEqual(await readdir(outside), ["SUB"]);
+  assert.deepEqual(await readdir(join(outside, "SUB")), [], "nothing is written outside the vault");
+});
+
+test("a set-back two folders deep walks both real folders, each back to the old tree's spelling", async (t) => {
+  const v = await caseHistory(t, { "A/B/p.md": "old p\n", "z.md": "old\n" }, { "a/b/p.md": "new p\n", "z.md": "new\n" });
+  if (!v) return;
+  const state = await killUpdate(v.dir, v.from, v.to, { slow: "z.md" });
+  assert.deepEqual(await readdir(v.dir), [".git", "a"], "the kill came after git made a/b for a/b/p.md");
+  assert.deepEqual(await finishInterrupted(state, v.dir), { restored: ["A/B/p.md", "a/b/p.md", "z.md"], kept: [], moved: false });
+  assert.deepEqual(await files(v.dir), ["A/B/p.md: old p\n", "z.md: old\n"]);
+  assert.equal(await status(v.dir), "");
+});
+
+// The old tree tracks x/p as a symlink to a folder outside the vault; the target makes
+// x/p a real folder holding n.md. Only the intent is recorded, the vault untouched (a
+// process death before the reset, or a failure git printed before writing that is not
+// one of its refusals).
+for (const same of [true, false]) {
+  test(`a symlink the old tree has in a folder's place is never gone through: a file outside the vault is never removed (${same ? "the same bytes as" : "other bytes than"} the update's)`, async () => {
+    const outside = await tempDir("sro-outside-");
+    await writeFile(join(outside, "n.md"), same ? "the note\n" : "outside's own\n");
+    const dir = await tempDir();
+    await initRepo(dir);
+    await writeRel(dir, "x/z.md", "old\n");
+    await symlink(outside, join(dir, "x/p"));
+    await gitOk(["add", "-A"], { cwd: dir });
+    await gitOk(["commit", "-q", "-m", "old"], { cwd: dir });
+    const from = await head(dir);
+    await gitOk(["rm", "-q", "x/p"], { cwd: dir });
+    await writeRel(dir, "x/p/n.md", "the note\n");
+    await writeRel(dir, "x/z.md", "new\n");
+    await gitOk(["add", "-A"], { cwd: dir });
+    await gitOk(["commit", "-q", "-m", "new"], { cwd: dir });
+    const to = await head(dir);
+    await gitOk(["reset", "-q", "--hard", from], { cwd: dir });
+    const state = await tempDir();
+    await recordIntent(state, from, to); // and the update never ran
+    assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/p/n.md", "x/p", "x/z.md"], kept: [], moved: false });
+    assert.deepEqual(await readdir(outside), ["n.md"], "a file outside the vault is never removed");
+    assert.equal(await readFile(join(outside, "n.md"), "utf8"), same ? "the note\n" : "outside's own\n");
+    assert.equal(await status(dir), "");
+    // The retried update then runs as usual, and replaces the symlink itself.
+    assert.equal((await git(["reset", "-q", "--keep", to], { cwd: dir })).code, 0);
+    assert.equal(await readFile(join(dir, "x/p/n.md"), "utf8"), "the note\n");
+    assert.equal(await readFile(join(outside, "n.md"), "utf8"), same ? "the note\n" : "outside's own\n");
+  });
+}
+
+// The old tree holds folder x/p with n.md; the update (the remote's tree) makes x/p a
+// symlink to a folder outside the vault, and is killed after making it.
+async function symlinkUpdate(outsideHolds: boolean, prints: boolean, relative: boolean): Promise<{ dir: string; state: string; outside: string }> {
+  const dir = await tempDir();
+  const outside = await tempDir("sro-outside-");
+  if (outsideHolds) await writeFile(join(outside, "n.md"), "outside's own\n");
+  const { from, to } = await (async () => {
+    await initRepo(dir);
+    await writeRel(dir, "x/p/n.md", "the note\n");
+    await writeRel(dir, "x/z.md", "old\n");
+    await gitOk(["add", "-A"], { cwd: dir });
+    await gitOk(["commit", "-q", "-m", "old"], { cwd: dir });
+    const old = await head(dir);
+    await gitOk(["rm", "-q", "-r", "x/p"], { cwd: dir });
+    await symlink(relative ? join("..", "..", basename(outside)) : outside, join(dir, "x/p"));
+    await writeRel(dir, "x/z.md", "new\n");
+    await gitOk(["add", "-A"], { cwd: dir });
+    await gitOk(["commit", "-q", "-m", "new"], { cwd: dir });
+    const next = await head(dir);
+    await gitOk(["reset", "-q", "--hard", old], { cwd: dir });
+    return { from: old, to: next };
+  })();
+  const state = await killUpdate(dir, from, to, { prints });
+  assert.equal((await lstat(join(dir, "x/p"))).isSymbolicLink(), true, "the kill came after the update made the symlink");
+  return { dir, state, outside };
+}
+
+for (const outsideHolds of [false, true]) {
+  for (const prints of [true, false]) {
+    for (const relative of [false, true]) {
+      test(`a symlink the update made in a folder's place is never written or read through (outside ${outsideHolds ? "holds" : "lacks"} n.md, ${prints ? "with" : "without"} fingerprints, ${relative ? "relative" : "absolute"} link)`, async () => {
+        const w = await symlinkUpdate(outsideHolds, prints, relative);
+        assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/p", "x/p/n.md", "x/z.md"], kept: [], moved: false });
+        assert.equal(await readFile(join(w.dir, "x/p/n.md"), "utf8"), "the note\n", "the note is back in its real folder");
+        assert.equal(await status(w.dir), "");
+        assert.deepEqual(await readdir(w.outside), outsideHolds ? ["n.md"] : [], "nothing is written outside the vault");
+        if (outsideHolds) assert.equal(await readFile(join(w.outside, "n.md"), "utf8"), "outside's own\n");
+      });
+    }
+  }
+}
+
+test("a folder the user replaced with a file, after an update that never ran, keeps their file: the note it held is kept, and sync goes on", async () => {
+  const { dir, from, to } = await history({ "x/p/b.txt": "in the folder\n", "x/z.md": "old\n" }, { "x/p/b.txt": "changed in the folder\n", "x/z.md": "new\n" });
+  const state = await tempDir();
+  await recordIntent(state, from, to); // and the process died
+  await rm(join(dir, "x/p"), { recursive: true });
+  await writeFile(join(dir, "x/p"), "the user's file\n");
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/z.md"], kept: ["x/p/b.txt"], moved: false });
+  assert.equal(await readFile(join(dir, "x/p"), "utf8"), "the user's file\n");
+  assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
+});
+
+test("a folder swapped for a symlink between the repair's check and its removal: nothing outside the vault is removed", async () => {
+  const { dir, from, to } = await history({ "x/z.md": "old\n" }, { "x/p/n.txt": "brand new\n", "x/z.md": "new\n" });
+  const state = await killUpdate(dir, from, to);
+  assert.equal(await readFile(join(dir, "x/p/n.txt"), "utf8"), "brand new\n", "the kill came after the update wrote x/p/n.txt");
+  const outside = await tempDir("sro-outside-");
+  await writeFile(join(outside, "n.txt"), "brand new\n");
+  // Real git cannot time a swap into the gap between the repair's check and its
+  // unlink: folder x/p becomes a symlink to a folder outside the vault as soon as the
+  // repair has read the file there.
+  const fsp = createRequire(import.meta.url)("node:fs/promises") as typeof import("node:fs/promises");
+  const real = fsp.readFile;
+  const target = join(dir, "x/p/n.txt");
+  fsp.readFile = (async (path: unknown, ...rest: unknown[]) => {
+    const content = await (real as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
+    if (path === target && (await lstat(join(dir, "x/p"))).isDirectory()) {
+      await rm(join(dir, "x/p"), { recursive: true });
+      await symlink(outside, join(dir, "x/p"));
+    }
+    return content;
+  }) as unknown as typeof real;
+  syncBuiltinESMExports();
+  let done;
+  try {
+    done = await finishInterrupted(state, dir);
+  } finally {
+    fsp.readFile = real;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(await readdir(outside), ["n.txt"], "nothing outside the vault is removed");
+  assert.deepEqual(done, { restored: ["x/p/n.txt", "x/z.md"], kept: [], moved: false });
+});
+
+test("a symlink the update made, re-pointed by the user after the kill, is theirs: the note behind it is kept, and nothing is written through it", async () => {
+  const w = await symlinkUpdate(false, true, false);
+  const other = await tempDir("sro-other-");
+  await unlink(join(w.dir, "x/p"));
+  await symlink(other, join(w.dir, "x/p"));
+  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/z.md"], kept: ["x/p", "x/p/n.md"], moved: false });
+  assert.deepEqual(await readdir(other), [], "nothing is written outside the vault");
+  assert.equal(await readlink(join(w.dir, "x/p")), other);
 });
 
 test("a path named like an object's own property (constructor) is judged as any other", async () => {
