@@ -17,8 +17,8 @@ def mutate(path, old, new, test, runs=1, network=False, pattern=None, survives=(
 # rename, so nothing there can catch these (they are caught on macOS).
 CASE = dict(survives=("linux",), why="case handling runs only on a case-insensitive filesystem")
 # The mirror: a guard that matters only where the disk tells Note.md and note.md apart (a
-# stale core.ignorecase=true, or two folder spellings as two folders). Its tests run only
-# there, and macOS's default disk ignores case (they are caught on Linux).
+# stale core.ignorecase=true). Its tests run only there, and macOS's default disk ignores
+# case (they are caught on Linux).
 CASE_SENSITIVE = dict(survives=("darwin",), why="its tests run only on a disk that tells case apart")
 L = "tests/core/lock.test.ts"; C = "tests/core/sync-cycle.test.ts"; S = "tests/core/sync-state.test.ts"
 G = "tests/core/git.test.ts"; SE = "tests/core/session.test.ts"; SEC = "tests/core/secrets.test.ts"; M = "tests/core/migrate.test.ts"
@@ -150,7 +150,7 @@ mutate("core/sync/cycle.ts", "  if (reset.timedOut) {\n    // Not the user's blo
 mutate("core/sync/cycle.ts", "    const finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: input.liveUpdateTimeoutMs });", "    const finished = null as Finished | null;", C)
 CY = "core/sync/cycle.ts"; K = "core/sync/clone.ts"; F_R = "core/sync/resolve.ts"; F_RC = "core/sync/recovery.ts"; P = "remote-seen that cannot be read"
 # resolve
-mutate("core/sync/copies.ts", "(?:-\\d+)?$/;", "(?:-\\d+)?/;", CP)
+mutate("core/sync/copies.ts", "[0-9a-f]{6}(?:-\\d+)?$/;", "[0-9a-f]{6}(?:-\\d+)?/;", CP, pattern="a copy of a conflict copy is recognised")
 mutate(F_R, "if (moved && path && stage(moved, 3)) displaced.push(path);", "if (false) displaced.push(path);", R, pattern="whole remote folder moves aside")
 mutate(F_R, "if (remote && !same(remote, local)) {", "if (remote && local && !same(remote, local)) {", R, pattern="mirrored collision")
 mutate(F_R, "      case COLLISION: {", "      case \"never\": {", R, pattern="keeps all three versions")
@@ -251,8 +251,9 @@ mutate(F_RC, "if (twin !== undefined && (await oneEntry(join(folder, twin), want
 mutate(F_RC, "        for (const rel of unit) {\n          const work = printed(rel) ? (await fingerprint(join(dir, rel))) === prints[rel] : await updatesWork(dir, rel, unit, versions);\n          if (!work) return false;\n        }\n        return true;",
        '        for (const rel of unit.filter(printed)) if ((await fingerprint(join(dir, rel))) !== prints[rel]) return false;\n        return unit.every(printed) || updatesWork(dir, unit[0] ?? "", unit, versions);', RC,
        pattern="never sets an unchanged note back over the user's edit", **CASE_SENSITIVE)
-mutate(F_RC, "    if (!(await isFolder(wanted))) return;\n", "", RC, pattern="the first spelling never stops a repair", **CASE_SENSITIVE)
-mutate(F_RC, "    if (!(await isFolder(wanted))) return;\n", "    if (await missing(wanted)) return;\n", RC, pattern="a file the user saved in place of the first spelling", **CASE_SENSITIVE)
+mutate(F_RC, "    if (!(await isFolder(wanted))) return;\n", "", RC, pattern="the first spelling never stops a repair|never goes through a symlink")
+mutate(F_RC, "    if (!(await isFolder(wanted))) return;\n", "    if (await missing(wanted)) return;\n", RC,
+       pattern="a file the user saved in place of the first spelling|never goes through a symlink")
 # cycle.ts and session.ts: every unsent commit scanned, git's refusals by name, a conflict
 # reported once its copy is pushed, and the status wording.
 mutate(CY, "(?:not uptodate|would be overwritten by merge)", "(?:not uptodate)", C, pattern="an edit staged by hand")
@@ -275,3 +276,17 @@ mutate(CY, '  if (sent === "unknown") return { kind: "unsynced", reason: "could 
 mutate(CY, '  if (ahead === "unknown") return { kind: "unsynced", reason: "could not compare the remote with the live snapshot" };\n', "", C, pattern="an ancestry git cannot tell")
 mutate(CY, 'return r.code === 0 ? "yes" : r.code === 1 ? "no" : "unknown";', 'return r.code === 0 ? "yes" : "no";', C, pattern="an ancestry git cannot tell")
 mutate("core/session.ts", "; no version was lost, and any copy made sits beside its note", ", each with its copy beside it", SE, pattern="statusFromCycle gives each conflict")
+# Task 7's review (fix round 1): a candidate the first pass dropped, three guards now pinned
+# by tests of their own, and the type check's place before any skip.
+mutate(F_RC, '    if (errno(err) === "ENOTEMPTY" || errno(err) === "EEXIST") return false;', '    if (errno(err) === "ENOTEMPTY" || errno(err) === "EEXIST") return true;', RC,
+       pattern="saved into the empty tree")
+mutate(F_RC, "  await prune(dir, dirname(rel));\n", "", RC, pattern="in a folder it made goes")
+mutate(F_RC, "    if (absent(err)) return;\n    throw err;\n  }\n  await prune(dir, dirname(rel));", "    if (!absent(err)) throw err;\n  }\n  await prune(dir, dirname(rel));", RC,
+       pattern="gone just before the repair unlinks")
+mutate(F_RC, "    for (const rel of unit) left.set(rel, null);\n", "", RC, pattern="records a file it had removed as nothing")
+mutate(F_RC, ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";', "    return (await lstat(path)).isDirectory();"),
+       ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, stat, unlink } from "node:fs/promises";', "    return (await stat(path)).isDirectory();"), RC,
+       pattern="never goes through a symlink", **CASE)
+mutate(F_R, "    if (!hasRule(record.type)) return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths);\n    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n",
+       "    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n    if (!hasRule(record.type)) return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths);\n", R,
+       pattern="even when a collision or a folder moved aside covers its paths")

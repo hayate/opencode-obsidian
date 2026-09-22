@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { git, GitError, gitOk } from "../../core/git.ts";
@@ -324,6 +324,39 @@ test("a removal that finds nothing to remove leaves the folders around it alone,
   assert.notEqual(await finishInterrupted(state, dir), null);
   assert.equal((await stat(join(dir, "Inbox"))).isDirectory(), true, "the user's empty folder is still there");
   assert.equal(await finishInterrupted(state, dir), null, "the record is gone");
+});
+
+test("a file the update added in a folder it made goes, and the folder with it, as git's own removal takes the folders it empties", async () => {
+  const { dir, from, to } = await history({ "x/a.md": "old\n" }, { "n/new.txt": "brand new\n", "x/a.md": "new\n" });
+  const state = await killUpdate(dir, from, to);
+  assert.equal(await readFile(join(dir, "n/new.txt"), "utf8"), "brand new\n", "the kill came after the update wrote n/new.txt");
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["n/new.txt", "x/a.md"], kept: [], moved: false });
+  assert.equal(await exists(join(dir, "n")), false, "the folder the update made is gone");
+  assert.equal(await status(dir), "");
+});
+
+test("a file gone just before the repair unlinks it leaves the folders around it alone: only a removal that removed something prunes", async () => {
+  const { dir, from, to } = await history({ "x/a.md": "old\n" }, { "n/new.txt": "brand new\n", "x/a.md": "new\n" });
+  const state = await killUpdate(dir, from, to);
+  // Real git cannot time a deletion into the gap between the repair's check and its
+  // unlink: the file goes, and the unlink finds nothing, as the repair unlinks it.
+  const fsp = createRequire(import.meta.url)("node:fs/promises") as typeof import("node:fs/promises");
+  const real = fsp.unlink;
+  const target = join(dir, "n/new.txt");
+  fsp.unlink = (async (path: string) => {
+    await real(path);
+    if (path === target) throw Object.assign(new Error(`ENOENT: no such file or directory, unlink '${path}'`), { code: "ENOENT" });
+  }) as unknown as typeof real;
+  syncBuiltinESMExports();
+  let done;
+  try {
+    done = await finishInterrupted(state, dir);
+  } finally {
+    fsp.unlink = real;
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(done, { restored: ["n/new.txt", "x/a.md"], kept: [], moved: false });
+  assert.equal(await exists(join(dir, "n")), true, "the folder stays: the repair removed nothing from it");
 });
 
 // The update turned note x/p into x/p/q/c.txt, and was killed after writing it.
@@ -694,6 +727,20 @@ test("where case matters and the old tree spells a folder two ways, a file the u
   assert.equal(await status(v.dir), "D X/a.md\n?? X", "and it is all that differs from the old version");
 });
 
+test("a repair's respelling walk never goes through a symlink the user put in a folder's place: a folder outside the vault keeps its spelling", async (t) => {
+  const v = await caseHistory(t, { "X/Sub/p.md": "old p\n", "z.md": "old\n" }, { "X/Sub/p.md": "new p\n", "z.md": "new\n" });
+  if (!v) return;
+  const state = await tempDir();
+  await recordIntent(state, v.from, v.to); // and the process died
+  // The user replaces folder X with a symlink to a folder elsewhere, which holds SUB.
+  const outside = await tempDir();
+  await mkdir(join(outside, "SUB"));
+  await rm(join(v.dir, "X"), { recursive: true });
+  await symlink(outside, join(v.dir, "X"));
+  await finishInterrupted(state, v.dir);
+  assert.deepEqual(await readdir(outside), ["SUB"]);
+});
+
 test("a path named like an object's own property (constructor) is judged as any other", async () => {
   const w = await interrupted({ constructor: "from the update\n" }, { prints: false });
   assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["constructor", "x/a.md"], kept: [], moved: false });
@@ -764,4 +811,21 @@ test("a repair that stops reports its own error even when the record cannot be u
   assert.deepEqual(await finishInterrupted(r.state, r.dir), { restored: ["x/b.md"], kept: ["x/a.md"], moved: false });
   assert.equal(await readFile(join(r.dir, "x/a.md"), "utf8"), "old a\n");
   assert.equal(await readFile(join(r.dir, "x/b.md"), "utf8"), "old b\n");
+});
+
+test("a stopped repair records a file it had removed as nothing there, so a folder made at that path since is not taken for an edit of it", async () => {
+  const { dir, from, to } = await history({ "x/a.md": "old a\n", "x/b.md": "old b\n" }, { "x/0new.txt": "brand new\n", "x/a.md": "new a\n", "x/b.md": "new b\n" });
+  const state = await killUpdate(dir, from, to);
+  assert.equal(await readFile(join(dir, "x/0new.txt"), "utf8"), "brand new\n", "the kill came after the update wrote x/0new.txt");
+  // The repair removes x/0new.txt, sets x/a.md back, then stops on x/b.md, whose filter fails.
+  await gitOk(["config", "filter.fails.smudge", "exit 1"], { cwd: dir });
+  await gitOk(["config", "filter.fails.required", "true"], { cwd: dir });
+  await writeFile(join(dir, ".git", "info", "attributes"), "x/b.md filter=fails\n");
+  await assert.rejects(finishInterrupted(state, dir), GitError);
+  assert.equal(await exists(join(dir, "x/0new.txt")), false, "the repair had removed it");
+  await mkdir(join(dir, "x/0new.txt"));
+  await writeFile(join(dir, ".git", "info", "attributes"), "");
+  assert.deepEqual(await finishInterrupted(state, dir), { restored: ["x/0new.txt", "x/a.md", "x/b.md"], kept: [], moved: false });
+  assert.equal(await readFile(join(dir, "x/a.md"), "utf8"), "old a\n");
+  assert.equal(await readFile(join(dir, "x/b.md"), "utf8"), "old b\n");
 });
