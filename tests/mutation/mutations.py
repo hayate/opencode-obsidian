@@ -147,7 +147,7 @@ mutate("core/sync/cycle.ts", "  const { inCommits, inTree } = await outboundHits
        pattern="reached a local commit without the snapshot scan")
 mutate("core/sync/cycle.ts", "  await gitOk([\"update-ref\", REMOTE_SEEN, next], { cwd: dir });\n", "", C, pattern='a rewritten remote stops the cycle: nothing is merged')
 mutate("core/sync/cycle.ts", "  if (reset.timedOut) {\n    // Not the user's block", "  if (false) {\n    // Not the user's block", C, pattern="a live update killed on its timeout is not the user's block")
-mutate("core/sync/cycle.ts", "    const finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: input.liveUpdateTimeoutMs });", "    const finished = null as Finished | null;", C, pattern="a live update that fails partway|a live update killed on its timeout is not the user's block")
+mutate("core/sync/cycle.ts", "      finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) });", "      finished = null;", C, pattern="a live update that fails partway|a live update killed on its timeout is not the user's block")
 CY = "core/sync/cycle.ts"; K = "core/sync/clone.ts"; F_R = "core/sync/resolve.ts"; F_RC = "core/sync/recovery.ts"; P = "remote-seen that cannot be read"
 # resolve
 mutate("core/sync/copies.ts", "[0-9a-f]{6}(?:-\\d+)?$/;", "[0-9a-f]{6}(?:-\\d+)?/;", CP, pattern="a copy of a conflict copy is recognised")
@@ -195,7 +195,7 @@ mutate(CY, "  await clearInterrupted(input.stateDir);\n  result.blockedBy = bloc
 mutate(CY, "  if (!blocked.length) {", "  if (false) {", C, pattern="fails partway")
 mutate(CY, "would be (?:overwritten|removed) by merge", "would be (?:removed) by merge", C, pattern="held-back new note")
 mutate(CY, "  await recordIntent(input.stateDir, live, next);\n", "", C, pattern="fails partway")
-mutate(CY, "finishInterrupted(input.stateDir, dir, { timeoutMs: input.liveUpdateTimeoutMs })", "finishInterrupted(input.stateDir, dir)", C, pattern="repair that times out stops")
+mutate(CY, "finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) })", "finishInterrupted(input.stateDir, dir)", C, pattern="repair that times out stops")
 # The review fix rounds of Tasks 3, 5 and 6 (2026-09-22): each piece a round added, broken
 # alone, as its implementer checked it by hand.
 # resolve.ts: a rename onto a name both sides use, a folder move over paths neither commit
@@ -344,3 +344,22 @@ mutate(K, '  for (const key of ["user.name", "user.email"]) {\n    await gitOk([
 mutate(K, ('[...noHooks, "remote", "rename",', '[...noHooks, "remote", "add",'), ('["remote", "rename",', '["remote", "add",'), CL, pattern="global hook never runs",
        survives=("linux", "darwin"),
        why="defence in depth: a fresh bare clone holds only refs/heads and refs/tags, which neither remote command touches, so neither changes a ref or runs a hook (checked, git 2.50.1)")
+# The live update's adaptive limit (spec 5.4 step 5, 2026-09-23): each timeout of the live
+# update or its repair doubles the next limit up to 64 times the base, where the status
+# escalates to a notify; only a completed update sets it back. runs=5 where the catching test
+# needs an update to finish inside its limit, so no timing flake can pass for a catch.
+LADDER = "slower than the base limit"; CEILING = "never finishes climbs"; KEPT = "a refusal leaves the live update's limit"
+mutate(CY, "level: Math.min(ladder.level + 1, MAX_LEVEL) };", "level: Math.min(ladder.level, MAX_LEVEL) };", C, runs=5, pattern=LADDER)
+mutate(CY, "level: Math.min(ladder.level + 1, MAX_LEVEL) };", "level: ladder.level + 1 };", C, pattern=CEILING)
+mutate(CY, "ceiling: ladder.level === MAX_LEVEL };", "ceiling: false };", C, pattern=CEILING)
+mutate(CY, "    // The limit was enough: the next update starts again from the base.\n    await writeLevel(input.stateDir, 0);\n", "", C, runs=5, pattern=LADDER)
+mutate(CY, "  await clearInterrupted(input.stateDir);\n  result.blockedBy = blocked;", "  await clearInterrupted(input.stateDir);\n  await writeLevel(input.stateDir, 0);\n  result.blockedBy = blocked;", C, pattern=KEPT)
+mutate(CY, "  if (!blocked.length) {", "  if (!blocked.length) {\n    await writeLevel(input.stateDir, 0);", C, pattern=KEPT)
+mutate(CY, "finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) })", "finishInterrupted(input.stateDir, dir, { timeoutMs: ladder.base })", C, runs=5,
+       pattern="a repair gets the live update's current limit")
+mutate(CY, '["reset", "-q", "--keep", next], { cwd: dir, timeoutMs: limitOf(ladder) }', '["reset", "-q", "--keep", next], { cwd: dir, timeoutMs: ladder.base }', C, runs=5, pattern=LADDER)
+mutate(CY, "      if (!(err instanceof RepairTimedOut)) throw err;\n", "      throw err;\n", C, runs=5, pattern=f"{LADDER}|repair that times out stops")
+mutate(CY, "/^\\d+$/.test(text) && Number(text) <= MAX_LEVEL ? Number(text) : 0", "Number(text) || 0", C, pattern="cannot be read is the base")
+mutate(F_RC, "err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result) : err", "err", RC, pattern="a repair that times out saves")
+mutate("core/session.ts", "  if (!r.timedOut.ceiling) return", "  if (true) return", SE, pattern="statusFromCycle gives a live update that timed out")
+mutate("core/session.ts", "  if (ms % 60_000 === 0) return `${ms / 60_000} min`;\n", "", SE, pattern="statusFromCycle gives a live update that timed out")

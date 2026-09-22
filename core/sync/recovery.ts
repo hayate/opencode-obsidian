@@ -9,12 +9,19 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { git, gitOk, literal } from "../git.ts";
+import { git, GitError, gitOk, literal } from "../git.ts";
 import { writeAtomic } from "../store.ts";
 import { fold } from "./copies.ts";
 import { isEffectivelyEmpty, isFinderLitter } from "./state.ts";
 
 const RECORD = "interrupted-update.json";
+
+// The repair's own checkout ran past its limit (FinishOptions.timeoutMs): the one timeout
+// of the repair that the live update's limit governs, so the cycle takes it for a
+// timeout of the live update (cycle.ts doubles the next limit). Every other error of the
+// repair, a timeout of a git call with the default limit included, is a GitError or an
+// Error as before.
+export class RepairTimedOut extends GitError {}
 
 interface Record_ {
   from: string;
@@ -366,7 +373,9 @@ async function setBack(
         literal(source),
       ],
       { cwd: tree, env: { GIT_INDEX_FILE: join(scratch, "index") }, timeoutMs },
-    );
+    ).catch((err: unknown) => {
+      throw err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result) : err;
+    });
     const built = join(tree, source);
     // The rename keeps the file (inode, mode, bytes), so this is what the path holds after.
     const print = await fingerprint(tree, source);
@@ -419,8 +428,8 @@ export interface Finished {
 }
 
 export interface FinishOptions {
-  // A repair is a live update too: the live update's own timeout (git.ts
-  // LOCAL_TIMEOUT_MS when unset).
+  // A repair is a live update too: the live update's own limit (git.ts
+  // LOCAL_TIMEOUT_MS when unset). Its checkout run past it throws RepairTimedOut.
   timeoutMs?: number;
 }
 

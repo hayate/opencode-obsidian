@@ -5,13 +5,13 @@
 // and a conflict never pauses sync (both versions are kept, resolve.ts).
 import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
+import { git, gitOk, literal, LOCAL_TIMEOUT_MS, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock, type LockHandle } from "../lock.ts";
 import { EMPTY_TREE, redactUrlCredentials, scanRange, scanStaged, scanText } from "../secrets.ts";
 import { quoted, writeAtomic } from "../store.ts";
 import { ensureStateClone } from "./clone.ts";
 import { conflictStamp } from "./copies.ts";
-import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, type Finished } from "./recovery.ts";
+import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, RepairTimedOut, type Finished } from "./recovery.ts";
 import { mergeAndResolve, type Conflict } from "./resolve.ts";
 import { identityProblem } from "./state.ts";
 
@@ -25,7 +25,8 @@ export interface CycleInput {
   timezone: string;
   quietMs?: number;
   lockWaitMs?: number;
-  // The live update's own timeout (git.ts LOCAL_TIMEOUT_MS when unset).
+  // The live update's base limit, the first rung of its ladder (git.ts LOCAL_TIMEOUT_MS
+  // when unset; the tests' small one otherwise).
   liveUpdateTimeoutMs?: number;
   // remember_sync's "adopt the rewritten remote" (spec 5.4 step 3).
   adoptRewrite?: boolean;
@@ -47,6 +48,10 @@ export interface CycleResult {
   caseCollisions: string[];
   // Things the user should know that did not stop the cycle.
   notices: string[];
+  // Spec 5.4 step 5: the live update, or the repair of one, killed on its limit (the
+  // outcome is unsynced): the limit the next attempt gets, and whether this one already
+  // had the longest, which escalates the status to a notify. Null otherwise.
+  timedOut: { nextLimitMs: number; ceiling: boolean } | null;
 }
 
 // The remote head this machine last integrated with (spec 5.3).
@@ -166,6 +171,48 @@ async function writeBlocked(stateDir: string, count: number): Promise<void> {
   await writeAtomic(join(stateDir, "blocked-cycles"), String(count));
 }
 
+// Spec 5.4 step 5 (Andrea, 2026-09-22): the live update's limit adapts. An update that
+// needs longer than its limit (a large LFS smudge, a slow disk) is killed, and the next
+// cycle sets back what it wrote and runs it again from scratch: with a fixed limit it
+// would never finish. So each live update or repair killed on its limit doubles the
+// next attempt's, from the base (git.ts's local timeout) up to 64 times it: 30 s, then
+// 1, 2, 4, 8, 16 and 32 min. At the longest, sync keeps retrying with it and the status
+// escalates to a notify. Only a live update that completes sets it back to the base; a
+// refusal, a failure that is not a timeout, and a cycle that stops before step 5 leave
+// it. The ladder climbs one rung per cycle that times out, never with time: a cycle runs
+// when an OpenCode session starts (and, once the adapter wires it, when one goes idle,
+// D11), so no status promises when the retry comes.
+const LEVEL = "live-update-level";
+const MAX_LEVEL = 6;
+
+interface Ladder {
+  base: number;
+  level: number;
+}
+
+const limitOf = (ladder: Ladder): number => ladder.base * 2 ** ladder.level;
+
+// Only a level this code writes reads as itself. A missing or unreadable file reads as
+// the first rung: the next timeout writes the file again, so a garbled one costs at most
+// one short attempt, and it never reads as more than was written.
+async function readLadder(stateDir: string, base: number): Promise<Ladder> {
+  const text = await readFile(join(stateDir, LEVEL), "utf8").catch(() => "");
+  return { base, level: /^\d+$/.test(text) && Number(text) <= MAX_LEVEL ? Number(text) : 0 };
+}
+
+async function writeLevel(stateDir: string, level: number): Promise<void> {
+  await writeAtomic(join(stateDir, LEVEL), String(level));
+}
+
+// A live update or its repair killed on its limit: the next attempt gets the next rung.
+async function timedOut(stateDir: string, ladder: Ladder, result: CycleResult): Promise<void> {
+  const next = { ...ladder, level: Math.min(ladder.level + 1, MAX_LEVEL) };
+  await writeLevel(stateDir, next.level);
+  result.outcome = "unsynced";
+  result.reason = "updating the vault timed out";
+  result.timedOut = { nextLimitMs: limitOf(next), ceiling: ladder.level === MAX_LEVEL };
+}
+
 async function unstage(cwd: string, file: string): Promise<void> {
   await gitOk(["reset", "-q", "--", literal(file)], { cwd });
 }
@@ -206,6 +253,7 @@ function emptyResult(): CycleResult {
     embedded: [],
     caseCollisions: [],
     notices: [],
+    timedOut: null,
   };
 }
 
@@ -497,7 +545,7 @@ const REFUSED =
 
 // Spec 5.4 step 5: the remote head now known, into the live repo's objects before
 // anything refers to it; then remote-seen; then the all-or-nothing reset.
-async function updateLive(clone: string, input: CycleInput, live: string, next: string, streak: number, result: CycleResult): Promise<void> {
+async function updateLive(clone: string, input: CycleInput, live: string, next: string, streak: number, ladder: Ladder, result: CycleResult): Promise<void> {
   const dir = input.projectsDir;
   await gitOk(["update-ref", INTEGRATED, next], { cwd: clone });
   await gitOk(["fetch", "-q", clone, `+${INTEGRATED}:${INTEGRATED}`], { cwd: dir });
@@ -507,19 +555,20 @@ async function updateLive(clone: string, input: CycleInput, live: string, next: 
     return;
   }
   await recordIntent(input.stateDir, live, next);
-  const reset = await git(["reset", "-q", "--keep", next], { cwd: dir, timeoutMs: input.liveUpdateTimeoutMs });
+  const reset = await git(["reset", "-q", "--keep", next], { cwd: dir, timeoutMs: limitOf(ladder) });
   if (reset.code === 0 && !reset.timedOut) {
     await clearInterrupted(input.stateDir);
     result.liveUpdated = true;
     await gitOk(["update-ref", `refs/remotes/origin/${input.branch}`, next], { cwd: dir });
+    // The limit was enough: the next update starts again from the base.
+    await writeLevel(input.stateDir, 0);
     return;
   }
   if (reset.timedOut) {
     // Not the user's block, and never counted toward the escalation: the next
-    // cycle finishes it before its snapshot (recovery.ts).
+    // cycle finishes it before its snapshot (recovery.ts), with the next rung.
     await recordInterrupted(input.stateDir, dir, live, next);
-    result.outcome = "unsynced";
-    result.reason = "updating the vault timed out; the next sync finishes it";
+    await timedOut(input.stateDir, ladder, result);
     return;
   }
   // git's check before it writes anything refuses the whole update and nothing changed.
@@ -564,8 +613,18 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     // blocked again; a busy cycle never ran and leaves it alone.
     const streak = await readBlocked(input.stateDir);
     await writeBlocked(input.stateDir, 0);
+    // One limit for the whole cycle: the repair rewrites the same files through the
+    // same filters as the live update.
+    const ladder = await readLadder(input.stateDir, input.liveUpdateTimeoutMs ?? LOCAL_TIMEOUT_MS);
     // An interrupted update is finished before anything is snapshotted.
-    const finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: input.liveUpdateTimeoutMs });
+    let finished: Finished | null;
+    try {
+      finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) });
+    } catch (err) {
+      if (!(err instanceof RepairTimedOut)) throw err;
+      await timedOut(input.stateDir, ladder, result);
+      return result;
+    }
     if (finished && (finished.restored.length || finished.kept.length)) result.notices.push(describeFinished(finished));
     const snap = await snapshot(input, result);
     if (!snap.ok || !(await stillHeld())) return result;
@@ -624,7 +683,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     result.conflicts = conflicts;
 
     if (!(await stillHeld())) return result;
-    await updateLive(clone, input, live, next, streak, result);
+    await updateLive(clone, input, live, next, streak, ladder, result);
     return result;
   } catch (err) {
     result.outcome = "aborted";

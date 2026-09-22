@@ -136,13 +136,37 @@ function conflictLine(c: Conflict): string {
 // line passes, so no line can add lines of its own.
 const oneLine = (text: string): string => text.replace(/[\p{Cc}\p{Cf}\u2028\u2029]+/gu, " ");
 
+// A limit as the user reads it: in whole minutes or seconds where it is one (every
+// limit the live update gets outside the tests is), else in milliseconds.
+function duration(ms: number): string {
+  if (ms % 60_000 === 0) return `${ms / 60_000} min`;
+  if (ms % 1000 === 0) return `${ms / 1000} s`;
+  return `${ms} ms`;
+}
+
+// Spec 5.4 step 5: a live update, or the repair of one, killed on its limit gets twice
+// the time next, up to the longest limit; one killed even with that escalates to a
+// notify (the adapter notifies on errors), and sync keeps retrying with it. The reason
+// leads, so a problem recorded with it (a failed lock release) still shows. No line
+// says when the retry comes: a cycle runs when an OpenCode session starts.
+function unsynced(r: CycleResult): StatusItem {
+  const text = `unsynced: ${r.reason ?? "push did not happen"}`;
+  if (r.timedOut === null) return { level: "warn", text };
+  const limit = duration(r.timedOut.nextLimitMs);
+  if (!r.timedOut.ceiling) return { level: "warn", text: `${text}; the next sync finishes it, with its limit doubled to ${limit}` };
+  return {
+    level: "error",
+    text: `${text}, even with its longest limit (${limit}). The likely cause is a hung disk, or a smudge filter that never finishes (such as LFS or git-crypt); sync keeps retrying with that limit`,
+  };
+}
+
 // File names come from the vault, and status lines sit outside the payload's data
 // block: every one is quoted.
 export function statusFromCycle(r: CycleResult): StatusItem[] {
   const out: StatusItem[] = [];
   const files = (list: string[]): string => list.map((f) => quoted(f)).join(", ");
   if (r.outcome === "stopped") out.push({ level: "error", text: `sync stopped: ${r.reason ?? ""}` });
-  if (r.outcome === "unsynced") out.push({ level: "warn", text: `unsynced: ${r.reason ?? "push did not happen"}` });
+  if (r.outcome === "unsynced") out.push(unsynced(r));
   if (r.outcome === "aborted") out.push({ level: "error", text: `sync aborted: ${r.reason ?? ""}` });
   if (r.outcome === "busy") out.push({ level: "info", text: "another session is syncing; this one will sync when idle" });
   // runCycle records a problem that did not stop the sync (a failed lock release) here.

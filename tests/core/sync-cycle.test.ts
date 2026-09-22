@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { changedSince, REMOTE_SEEN, runCycle, type CycleResult } from "../../core/sync/cycle.ts";
+import { changedSince, REMOTE_SEEN, runCycle, type CycleInput, type CycleResult } from "../../core/sync/cycle.ts";
 import { statusFromCycle } from "../../core/session.ts";
 import { prepareProjects, REQUIRED_IGNORES } from "../../core/sync/state.ts";
 import { acquireLock } from "../../core/lock.ts";
@@ -1055,6 +1055,7 @@ test("a live update killed on its timeout is not the user's block, and the next 
   const first = await runCycle(slow);
   assert.equal(first.outcome, "unsynced", first.reason ?? "");
   assert.match(first.reason ?? "", /updating the vault timed out/);
+  assert.deepEqual(statusFromCycle(first), [{ level: "warn", text: "unsynced: updating the vault timed out; the next sync finishes it, with its limit doubled to 1 s" }]);
   assert.deepEqual(first.blockedBy, []);
   assert.equal(await streak(b), "0", "a timeout never counts toward the escalation");
   await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });
@@ -1211,7 +1212,10 @@ test("a repair that times out stops the cycle before its snapshot; the next cycl
   assert.match((await runCycle(slow)).reason ?? "", /updating the vault timed out/);
   const started = Date.now();
   const second = await runCycle(slow);
-  assert.equal(second.outcome, "aborted", second.reason ?? "");
+  // A timeout of the live update like any other: the next attempt gets twice the time.
+  assert.equal(second.outcome, "unsynced", second.reason ?? "");
+  assert.equal(second.reason, "updating the vault timed out");
+  assert.deepEqual(second.timedOut, { nextLimitMs: 2000, ceiling: false });
   assert.ok(Date.now() - started < 8000, "the repair has the live update's own timeout");
   assert.equal(second.committed, null, "no snapshot while the update is unfinished");
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushedByA, "nothing pushed");
@@ -1623,4 +1627,122 @@ test("an ancestry git cannot tell leaves the cycle unsynced, with nothing pushed
   const r = await cycle(remote, a);
   assert.ok(r.pushed, r.reason ?? "");
   assert.equal(await remoteFile(remote, "x/by-hand.md"), "h");
+});
+
+// Spec 5.4 step 5 (Andrea, 2026-09-22): the live update's limit adapts. Each live update
+// or repair killed on its limit doubles the next attempt's, from the base (git.ts's local
+// timeout, or liveUpdateTimeoutMs here) up to 64 times it; one killed even with that
+// escalates to a notify, and sync keeps retrying with it. Only a live update that
+// completes sets it back to the base.
+const rung = (x: Machine): Promise<string> => readFile(join(x.state, "live-update-level"), "utf8");
+
+// B, one note behind A, with every note's smudge filter running `smudge`; and the
+// cycle input for B with that base limit.
+async function behindSlowFilter(smudge: string, base: number): Promise<{ remote: string; a: Machine; b: Machine; slow: CycleInput }> {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/t.md", "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  await gitOk(["config", "filter.slow.smudge", smudge], { cwd: b.projects });
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "*.md filter=slow\n");
+  const slow = { timezone: TZ, projectsDir: b.projects, remote, branch: "main", stateDir: b.state, machine: "b", quietMs: 0, liveUpdateTimeoutMs: base };
+  return { remote, a, b, slow };
+}
+
+test("a live update slower than the base limit completes once its limit has doubled enough, and then the limit is back at the base", async () => {
+  // Longer than twice the base, shorter than four times it.
+  const { remote, b, slow } = await behindSlowFilter("sleep 0.7; cat", 300);
+  const first = await runCycle(slow);
+  assert.equal(first.outcome, "unsynced", first.reason ?? "");
+  assert.equal(first.reason, "updating the vault timed out");
+  assert.deepEqual(first.timedOut, { nextLimitMs: 600, ceiling: false });
+  assert.deepEqual(statusFromCycle(first), [{ level: "warn", text: "unsynced: updating the vault timed out; the next sync finishes it, with its limit doubled to 600 ms" }]);
+  assert.equal(await rung(b), "1");
+  // The repair rewrites the note through the same filter, with the same limit.
+  const second = await runCycle(slow);
+  assert.equal(second.outcome, "unsynced", second.reason ?? "");
+  assert.deepEqual(second.timedOut, { nextLimitMs: 1200, ceiling: false });
+  assert.equal(second.committed, null, "no snapshot while the update is unfinished");
+  assert.equal(await rung(b), "2");
+  const third = await runCycle(slow);
+  assert.equal(third.outcome, "synced", third.reason ?? "");
+  assert.ok(third.liveUpdated);
+  assert.equal(third.timedOut, null);
+  assert.deepEqual(third.notices, ["finished an interrupted vault update; 1 file set back to update again"]);
+  assert.equal(await rung(b), "0", "a completed update sets the limit back to the base");
+  assert.equal(await read(b, "x/t.md"), "from a\n");
+  assert.equal(await remoteFile(remote, "x/t.md"), "from a", "no half-written file was sent");
+  assert.deepEqual((await remoteNames(remote)).filter((n) => n.includes(".conflict-")), [], "and no conflict copy made");
+  assert.deepEqual(statusFromCycle(third), [{ level: "info", text: "finished an interrupted vault update; 1 file set back to update again" }]);
+});
+
+test("a live update that never finishes climbs to the longest limit, then escalates to a notify while sync keeps retrying with that limit", async () => {
+  const { remote, b, slow } = await behindSlowFilter("sleep 30; cat", 30);
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  const results: CycleResult[] = [];
+  for (let run = 1; run <= 8; run++) results.push(await runCycle(slow));
+  for (const r of results) assert.equal(r.outcome, "unsynced", r.reason ?? "");
+  assert.deepEqual(
+    results.map((r) => r.timedOut),
+    [60, 120, 240, 480, 960, 1920, 1920, 1920].map((nextLimitMs, i) => ({ nextLimitMs, ceiling: i >= 6 })),
+  );
+  assert.equal(await rung(b), "6", "the longest limit is the last rung");
+  const lines = results.map((r) => statusFromCycle(r));
+  for (const line of lines.slice(0, 6)) assert.equal(line[0]?.level, "warn", line[0]?.text);
+  const notify = {
+    level: "error",
+    text: "unsynced: updating the vault timed out, even with its longest limit (1920 ms). The likely cause is a hung disk, or a smudge filter that never finishes (such as LFS or git-crypt); sync keeps retrying with that limit",
+  };
+  assert.deepEqual(lines.slice(6), [[notify], [notify]], "the seventh timeout in a row, and each one after it");
+  for (const r of results) assert.deepEqual(r.blockedBy, []);
+  assert.equal(await streak(b), "0", "a timeout never counts toward the blocked-cycles escalation");
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
+});
+
+test("a refusal leaves the live update's limit where it was, and so does a failure that is not a timeout", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/t.md", "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  // Two timeouts in a row before these cycles.
+  await writeRel(b.state, "live-update-level", "2");
+  await writeRel(b.projects, "x/t.md", `t0\ntoken ${TOKEN}\n`); // held back: stays a local edit
+  const refused = await cycle(remote, b);
+  assert.deepEqual(refused.blockedBy, ["x/t.md"], refused.reason ?? "");
+  assert.equal(refused.timedOut, null);
+  assert.equal(await rung(b), "2", "a refusal");
+  await gitOk(["checkout", "--", "x/t.md"], { cwd: b.projects });
+  for (const [key, value] of [["filter.bad.clean", "cat"], ["filter.bad.smudge", "false"], ["filter.bad.required", "true"]]) {
+    await gitOk(["config", key ?? "", value ?? ""], { cwd: b.projects });
+  }
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "x/t.md filter=bad\n");
+  const failed = await cycle(remote, b);
+  assert.equal(failed.outcome, "unsynced", failed.reason ?? "");
+  assert.match(failed.reason ?? "", /updating the vault failed/);
+  assert.equal(failed.timedOut, null);
+  assert.equal(await rung(b), "2", "a failure that is not a timeout");
+});
+
+test("a live update's limit that cannot be read is the base: a garbled record costs at most one short attempt", async () => {
+  const { b, slow } = await behindSlowFilter("sleep 10; cat", 200);
+  for (const garbled of ["", "two\n", "7", "1e3"]) {
+    await writeRel(b.state, "live-update-level", garbled);
+    const r = await runCycle(slow);
+    assert.equal(r.outcome, "unsynced", `${JSON.stringify(garbled)}: ${r.reason}`);
+    assert.deepEqual(r.timedOut, { nextLimitMs: 400, ceiling: false }, `${JSON.stringify(garbled)}: timed out with the base`);
+    assert.equal(await rung(b), "1", JSON.stringify(garbled));
+  }
+});
+
+test("a repair gets the live update's current limit: one that needs longer than the base, but not longer than the doubled limit, finishes the update", async () => {
+  // Longer than the base, shorter than twice it.
+  const { remote, b, slow } = await behindSlowFilter("sleep 0.6; cat", 500);
+  const first = await runCycle(slow);
+  assert.deepEqual(first.timedOut, { nextLimitMs: 1000, ceiling: false }, first.reason ?? "");
+  const second = await runCycle(slow);
+  assert.equal(second.outcome, "synced", second.reason ?? "");
+  assert.deepEqual(second.notices, ["finished an interrupted vault update; 1 file set back to update again"], "the repair set the note back");
+  assert.ok(second.liveUpdated);
+  assert.equal(await read(b, "x/t.md"), "from a\n");
+  assert.equal(await remoteFile(remote, "x/t.md"), "from a");
 });

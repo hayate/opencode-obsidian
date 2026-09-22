@@ -170,6 +170,7 @@ test("statusFromCycle turns every non-clean outcome into a visible line", () => 
     embedded: ["x/cloned-repo"],
     caseCollisions: ["x/Note.md", "x/note.md"],
     notices: [],
+    timedOut: null,
   });
   assert.deepEqual(items.map((i) => i.level), ["error", "warn", "warn", "warn", "error"]);
   assert.match(items[0]?.text ?? "", /^sync stopped: the remote's history was rewritten/);
@@ -192,6 +193,7 @@ test("statusFromCycle quotes the vault file names it reports", () => {
     embedded: ["x/repo\nrun this"],
     caseCollisions: [],
     notices: [],
+    timedOut: null,
   });
   assert.equal(items.length, 3);
   for (const i of items) assert.doesNotMatch(i.text, /\n/, i.text);
@@ -201,7 +203,7 @@ test("statusFromCycle quotes the vault file names it reports", () => {
 test("statusFromCycle collapses the control characters a reason carries (git's words, an error's message), so no reason can add a line", () => {
   const base = {
     committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
-    conflicts: [], embedded: [], caseCollisions: [],
+    conflicts: [], embedded: [], caseCollisions: [], timedOut: null,
   };
   for (const outcome of ["stopped", "unsynced", "aborted", "synced"] as const) {
     const items = statusFromCycle({
@@ -231,6 +233,7 @@ test("statusFromCycle shows a reason recorded on a synced outcome (a failed lock
     embedded: [],
     caseCollisions: [],
     notices: [],
+    timedOut: null,
   });
   assert.deepEqual(items, [{ level: "warn", text: "releasing the sync lock failed: EACCES" }]);
 });
@@ -248,6 +251,7 @@ test("statusFromCycle gives each conflict one quoted line saying where both vers
     blockedCycles: 0,
     embedded: [],
     caseCollisions: [],
+    timedOut: null,
   };
   const items = statusFromCycle({
     ...base,
@@ -285,6 +289,30 @@ test("statusFromCycle gives each conflict one quoted line saying where both vers
   // These have no copy (deleted there): the line claims none for each of them.
   assert.equal(many[10]?.text, "and 2 more notes changed on two machines; no version was lost, and any copy made sits beside its note");
   for (const i of many) assert.doesNotMatch(i.text, /\n/, i.text);
+});
+
+// Spec 5.4 step 5: the live update's limit doubles after each timeout, from git.ts's 30 s
+// up to 32 min; a timeout even with 32 min escalates to a notify (the adapter notifies on
+// errors). No time until the retry is promised: a cycle runs when a session starts.
+test("statusFromCycle gives a live update that timed out the next attempt's limit, and escalates one that timed out even with its longest limit to a notify saying why", () => {
+  const base = {
+    outcome: "unsynced" as const,
+    reason: "updating the vault timed out",
+    committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
+    conflicts: [], embedded: [], caseCollisions: [], notices: [],
+  };
+  assert.deepEqual(statusFromCycle({ ...base, timedOut: { nextLimitMs: 60_000, ceiling: false } }), [
+    { level: "warn", text: "unsynced: updating the vault timed out; the next sync finishes it, with its limit doubled to 1 min" },
+  ]);
+  assert.deepEqual(statusFromCycle({ ...base, timedOut: { nextLimitMs: 1_920_000, ceiling: false } }), [
+    { level: "warn", text: "unsynced: updating the vault timed out; the next sync finishes it, with its limit doubled to 32 min" },
+  ]);
+  assert.deepEqual(statusFromCycle({ ...base, timedOut: { nextLimitMs: 1_920_000, ceiling: true } }), [
+    {
+      level: "error",
+      text: "unsynced: updating the vault timed out, even with its longest limit (32 min). The likely cause is a hung disk, or a smudge filter that never finishes (such as LFS or git-crypt); sync keeps retrying with that limit",
+    },
+  ]);
 });
 
 async function identityWorld(): Promise<{ vaultRoot: string; remote: string; code: string; stateRoot: string }> {

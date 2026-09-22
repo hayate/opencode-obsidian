@@ -5,7 +5,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { basename, join } from "node:path";
 import { git, GitError, gitOk } from "../../core/git.ts";
 import { fold } from "../../core/sync/copies.ts";
-import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted } from "../../core/sync/recovery.ts";
+import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, RepairTimedOut } from "../../core/sync/recovery.ts";
 import { commitFile, initRepo, sleep, tempDir, writeRel } from "./helpers.ts";
 
 interface Interruption {
@@ -174,7 +174,9 @@ test("an update whose fingerprints were never taken (the process died) sets back
 
 test("a repair that times out saves where it got to: the next run finishes, and nothing it set back is taken for an edit", async () => {
   const w = await interrupted({ "x/0new.txt": "brand new\n" }, { stillSlow: true });
-  await assert.rejects(finishInterrupted(w.state, w.dir, { timeoutMs: 500 }), /x\/a\.md|timed out/);
+  // The one error that says the repair's own checkout ran past its limit: the cycle
+  // takes it for a timeout of the live update (cycle.ts doubles the next limit).
+  await assert.rejects(finishInterrupted(w.state, w.dir, { timeoutMs: 500 }), (err: unknown) => err instanceof RepairTimedOut && /x\/a\.md.*timed out/.test((err as Error).message));
   await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: w.dir });
   const done = await finishInterrupted(w.state, w.dir);
   assert.deepEqual(done, { restored: ["x/0new.txt", "x/a.md"], kept: [] });
@@ -187,8 +189,9 @@ test("a HEAD that cannot be read leaves the record for the next run, never read 
   const headFile = join(w.dir, ".git", "HEAD");
   const saved = await readFile(headFile, "utf8");
   await writeFile(headFile, "ref: refs/heads/no-such-branch\n");
-  // git's own error, never the stop for a history that moved, whose way out is to delete the record.
-  await assert.rejects(finishInterrupted(w.state, w.dir), GitError);
+  // git's own error, never the stop for a history that moved, whose way out is to delete the record,
+  // nor a timeout of the repair.
+  await assert.rejects(finishInterrupted(w.state, w.dir), (err: unknown) => err instanceof GitError && !(err instanceof RepairTimedOut));
   await writeFile(headFile, saved);
   assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/a.md"], kept: [] });
 });
