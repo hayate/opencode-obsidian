@@ -142,7 +142,24 @@ test("an add killed on its timeout has the index.lock it left removed", async ()
   assert.match(r.stderr, /removed .*index\.lock/);
 });
 
-test("a commit killed on its timeout has the index.lock it left removed", async () => {
+test("a reset killed on its timeout has the index.lock it left removed", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  await commitFile(dir, "a.md", "one\n", "one");
+  await commitFile(dir, "a.md", "two\n", "two");
+  // The smudge filter hangs while reset writes a.md under the index lock.
+  await gitOk(["config", "filter.slow.smudge", "sleep 10; cat"], { cwd: dir });
+  await writeRel(dir, ".gitattributes", "*.md filter=slow\n");
+  const r = await git(["reset", "-q", "--keep", "HEAD~1"], { cwd: dir, timeoutMs: 500 });
+  assert.equal(r.timedOut, true);
+  assert.equal(await exists(join(dir, ".git", "index.lock")), false);
+  assert.match(r.stderr, /removed .*index\.lock/);
+});
+
+// commit and checkout run hooks after they release the index lock, so a lock found
+// after killing one proves nothing about who holds it: it is left for the user, even
+// when (as here) it is the killed command's own.
+test("a killed commit never has a lock removed, even its own", async () => {
   const dir = await tempDir();
   await initRepo(dir);
   await commitFile(dir, "a.md", "a\n", "a");
@@ -151,22 +168,21 @@ test("a commit killed on its timeout has the index.lock it left removed", async 
   // -a stages the change under the index lock, through the hanging clean filter.
   const r = await git(["commit", "-a", "-q", "-m", "m"], { cwd: dir, timeoutMs: 500 });
   assert.equal(r.timedOut, true);
-  assert.equal(await exists(join(dir, ".git", "index.lock")), false);
-  assert.match(r.stderr, /removed .*index\.lock/);
+  assert.equal(await exists(join(dir, ".git", "index.lock")), true);
+  assert.doesNotMatch(r.stderr, /removed/);
 });
 
-test("a checkout killed on its timeout has the index.lock it left removed", async () => {
+test("a killed checkout never has a lock removed, even its own", async () => {
   const dir = await tempDir();
   await initRepo(dir);
   await commitFile(dir, "a.md", "one\n", "one");
   await commitFile(dir, "a.md", "two\n", "two");
-  // The smudge filter hangs while checkout writes a.md under the index lock.
   await gitOk(["config", "filter.slow.smudge", "sleep 10; cat"], { cwd: dir });
   await writeRel(dir, ".gitattributes", "*.md filter=slow\n");
   const r = await git(["checkout", "-q", "-f", "--detach", "HEAD~1"], { cwd: dir, timeoutMs: 500 });
   assert.equal(r.timedOut, true);
-  assert.equal(await exists(join(dir, ".git", "index.lock")), false);
-  assert.match(r.stderr, /removed .*index\.lock/);
+  assert.equal(await exists(join(dir, ".git", "index.lock")), true);
+  assert.doesNotMatch(r.stderr, /removed/);
 });
 
 test(
@@ -190,18 +206,17 @@ test(
   },
 );
 
-test("a lock taken by another process after a killed command released its own is never removed", async () => {
+test("a lock taken by another process after a killed reset released its own is never removed", async () => {
   const dir = await tempDir();
   await initRepo(dir);
-  await commitFile(dir, "a.md", "a\n", "a");
-  await writeRel(dir, "b.md", "b\n");
-  await gitOk(["add", "b.md"], { cwd: dir });
-  // --no-verify still runs post-commit, after git has released the index lock:
-  // another process takes the lock while this commit hangs in the hook.
-  const hook = join(dir, ".git", "hooks", "post-commit");
-  await writeFile(hook, "#!/bin/sh\ntouch .git/index.lock\nexec sleep 10\n");
+  await commitFile(dir, "a.md", "one\n", "one");
+  await commitFile(dir, "a.md", "two\n", "two");
+  // reset runs the reference-transaction hook after it has released the index lock
+  // (renamed onto the index): another process takes the lock while reset hangs there.
+  const hook = join(dir, ".git", "hooks", "reference-transaction");
+  await writeFile(hook, '#!/bin/sh\n[ "$1" = committed ] || exit 0\ntouch .git/index.lock\nexec sleep 10\n');
   await chmod(hook, 0o755);
-  const r = await git(["commit", "-q", "--no-verify", "-m", "b"], { cwd: dir, timeoutMs: 2000 });
+  const r = await git(["reset", "-q", "--keep", "HEAD~1"], { cwd: dir, timeoutMs: 2000 });
   assert.equal(r.timedOut, true);
   assert.equal(await exists(join(dir, ".git", "index.lock")), true);
   assert.doesNotMatch(r.stderr, /removed/);

@@ -110,10 +110,14 @@ export const INDEX_LOCK_DELAY_MS = 1000;
 // met another process's lock has done nothing and can simply run again.
 const RETRIED_ON_INDEX_LOCK = new Set(["add", "rm", "reset"]);
 
-// These take the index lock as they start, before any filter or checkout work.
-// git releases it by renaming index.lock onto index, so while the index is
-// unchanged the one that was killed has released nothing (spec 5.6).
-const TAKES_INDEX_LOCK = new Set(["add", "rm", "reset", "commit", "checkout"]);
+// These run the user's clean and smudge filters while they hold the index lock,
+// the one place they can hang for long. reset can still run the reference-
+// transaction hook after releasing it, and git releases it by renaming it onto the
+// index: so when one is killed on its timeout, a lock that was absent as it started,
+// found with the index unchanged, is the one it took (spec 5.6). commit and checkout
+// are not here: their hooks after the release are the usual place they hang, so a
+// lock found after killing one proves nothing about who holds it.
+const CLEANED_AFTER_KILL = new Set(["add", "reset"]);
 
 function subcommand(args: string[]): string | undefined {
   for (let i = 0; i < args.length; i++) {
@@ -170,24 +174,26 @@ async function metIndexLock(args: string[], result: GitResult, lock: string | nu
 }
 
 // Spec 5.6: the plugin never deletes a lock it did not create. A command that met
-// another process's index.lock is retried. One the plugin killed on its timeout
-// has its index.lock removed when the lock was absent as it started and the index
-// is unchanged: no lock was released meanwhile, so the lock is the one it took.
-// (One killed before it reached the lock is 5.6's accepted limitation.)
+// another process's index.lock is retried. A filter-running one the plugin killed
+// on its timeout has its index.lock removed when the lock was absent as it started
+// and the index is unchanged. (One killed before it reached the lock is 5.6's
+// accepted limitation.)
 export async function git(args: string[], opts: GitOptions): Promise<GitResult> {
-  const paths = TAKES_INDEX_LOCK.has(subcommand(args) ?? "") ? await indexPaths(opts) : null;
+  const sub = subcommand(args) ?? "";
+  const paths = RETRIED_ON_INDEX_LOCK.has(sub) ? await indexPaths(opts) : null;
+  const cleanup = CLEANED_AFTER_KILL.has(sub) ? paths : null;
   for (let attempt = 1; ; attempt++) {
-    const before = paths !== null && (await exists(paths.lock));
-    const indexBefore = paths === null ? "" : await identity(paths.index);
+    const before = cleanup !== null && (await exists(cleanup.lock));
+    const indexBefore = cleanup === null ? "" : await identity(cleanup.index);
     const result = await runOnce(args, opts);
     if (
       result.timedOut &&
-      paths !== null &&
+      cleanup !== null &&
       !before &&
-      (await exists(paths.lock)) &&
-      (await identity(paths.index)) === indexBefore
+      (await exists(cleanup.lock)) &&
+      (await identity(cleanup.index)) === indexBefore
     ) {
-      const lock = paths.lock;
+      const lock = cleanup.lock;
       const note = await rm(lock, { force: true }).then(
         () => `removed ${lock}, which this command left when it was stopped`,
         (err: Error) => `could not remove ${lock}, which this command left when it was stopped: ${err.message}`,
