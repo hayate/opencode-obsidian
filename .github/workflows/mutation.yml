@@ -1,0 +1,45 @@
+name: mutation
+
+# The mutation gate (tests/mutation/gate.py): every mutation of core/ must be caught by a test,
+# except the few declared to survive on one platform. About an hour of test runs per platform,
+# so it runs in interleaved shards, and only when a pull request touches what it tests (or by
+# hand, from the Actions tab).
+on:
+  pull_request:
+    paths:
+      - "core/**"
+      - "tests/core/**"
+      - "tests/mutation/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/mutation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the pull request replaces the run in progress.
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Three macOS shards and ci.yml's two macOS jobs fit the five concurrent macOS jobs
+        # GitHub allows this plan.
+        os: [ubuntu-latest, macos-latest]
+        shard: [1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: git --version
+      - run: python3 -u tests/mutation/gate.py --shard ${{ matrix.shard }}/3
