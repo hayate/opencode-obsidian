@@ -12,7 +12,7 @@ one platform, with the reason (case handling is only observable on a case-insens
 filesystem). Exit status: 0 when every mutation met its expectation; 1 when one survived that a
 test should catch, or was caught where it is declared to survive (the declaration is stale); 2
 when the gate cannot judge at all: a test file fails unmutated (every mutation would read as
-caught), or a mutation's target text is gone."""
+caught), or a mutation's target text is gone or in more than one place."""
 import argparse, os, pathlib, subprocess, sys
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -52,11 +52,16 @@ def shard_of(mutations: list, shard: Tuple[int, int]) -> list:
 
 
 def moved_targets(mutations: list, root: pathlib.Path) -> list:
+    """Each target that is not in its file exactly once: gone, or in more than one place, where
+    the gate would change only the first, which need not be the code the mutation means."""
     texts = {}
     moved = []
     for m in mutations:
         text = texts.setdefault(m.path, (root / m.path).read_text())
-        moved += [f"{m.path}: {o.strip()[:80]!r}" for o in m.old if o not in text]
+        for o in m.old:
+            count = text.count(o)
+            if count != 1:
+                moved.append(f"{m.path}: {o.strip()[:80]!r} ({'gone' if count == 0 else f'{count} times'})")
     return moved
 
 
@@ -98,7 +103,7 @@ def run(mutations: list, shard: Tuple[int, int], root: pathlib.Path, platform: s
     mine = shard_of(mutations, shard)
     moved = moved_targets(mine, root)
     if moved:
-        print("these mutation targets are gone (update tests/mutation/mutations.py):")
+        print("these mutation targets are gone or not unique (update tests/mutation/mutations.py):")
         for line in moved:
             print(f"  {line}")
         return 2

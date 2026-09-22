@@ -94,6 +94,14 @@ class Gate(unittest.TestCase):
         self.assertIn("a * b", out)
         self.assertNotIn("CAUGHT", out)
 
+    def test_a_target_that_occurs_more_than_once_stops_the_gate_as_a_moved_target(self):
+        # "return" is in add and in unused: the gate would mutate only the first, which may
+        # not be the code the mutation means.
+        status, out = self.run_gate([self.m("return", "throw")])
+        self.assertEqual(status, 2, out)
+        self.assertIn("'return' (2 times)", out)
+        self.assertNotIn("CAUGHT", out)
+
     def test_shards_split_the_list_exactly(self):
         items = [self.m(f"x{k}", "y") for k in range(11)]
         for n in range(1, 6):
