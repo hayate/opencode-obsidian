@@ -38,36 +38,36 @@ mutate("core/git.ts", "  const paths = RETRIED_ON_INDEX_LOCK.has(sub) ? await in
 mutate("core/git.ts", "if (result.code === 0 || result.timedOut) return false;", "if (result.code === 0) return false;", G)
 mutate("core/git.ts", "  return lock !== null && (await exists(lock));\n}", "  return true;\n}", G)
 # Literal pathspecs at every path core passes.
-mutate("core/sync/cycle.ts", '["reset", "-q", "--", literal(file)]', '["reset", "-q", "--", file]', C)
-mutate("core/sync/cycle.ts", '"--cached", "--", literal(rel)]', '"--cached", "--", rel]', C, **CASE)
-mutate("core/sync/cycle.ts", '"-f", "--", literal(path)]', '"-f", "--", path]', C)
+mutate("core/sync/cycle.ts", '["reset", "-q", "--", literal(file)]', '["reset", "-q", "--", file]', C, pattern='unstages only itself')
+mutate("core/sync/cycle.ts", '"--cached", "--", literal(rel)]', '"--cached", "--", rel]', C, pattern='keeps a\\.md tracked', **CASE)
+mutate("core/sync/cycle.ts", '"-f", "--", literal(path)]', '"-f", "--", path]', C, pattern='untracks only itself|named like pathspec magic')
 mutate("core/migrate.ts", '"--", literal(rel)]', '"--", rel]', M)
 # The secret scan.
-mutate("core/secrets.ts", "return unquoteGitPath(raw).replace(", 'return raw.replace(/^"|"$/g, "").replace(', C)
+mutate("core/secrets.ts", "return unquoteGitPath(raw).replace(", 'return raw.replace(/^"|"$/g, "").replace(', C, pattern='a secret in a file whose name holds a newline|in a quoted name holding an emoji')
 mutate("core/secrets.ts", "const ch = String.fromCodePoint(body.codePointAt(i) ?? 0);", 'const ch = body[i] ?? "";', SEC)
 mutate("core/secrets.ts", r'header.slice(4).replace(/\t$/, "")', "header.slice(4).trim()", SEC)
-mutate("core/secrets.ts", '      "--src-prefix=a/",\n      "--dst-prefix=b/",\n', "", C)
-mutate("core/secrets.ts", '      "--no-textconv",\n', "", C)
-mutate("core/secrets.ts", "      `--attr-source=${EMPTY_TREE}`,\n", "", C)
+mutate("core/secrets.ts", '      "--src-prefix=a/",\n      "--dst-prefix=b/",\n', "", C, pattern='changes diff prefixes')
+mutate("core/secrets.ts", '      "--no-textconv",\n', "", C, pattern='a textconv driver rewrites the diff')
+mutate("core/secrets.ts", "      `--attr-source=${EMPTY_TREE}`,\n", "", C, pattern='marking notes -diff cannot hide')
 mutate("core/sync/state.ts", "  if (hits.size) {", "  if (false) {", S)
 # The sync cycle.
-mutate("core/sync/cycle.ts", '["reset", "-q", "--keep", next]', '["reset", "-q", "--hard", next]', C)
-mutate("core/sync/cycle.ts", "for (const [file, hits] of await scanStaged(dir)) {", "for (const [file, hits] of new Map<string, { rule: string }[]>()) {", C)
-mutate("core/sync/cycle.ts", '  if (/^!\\t.*\\[rejected\\]/m.test(r.stdout)) return { kind: "raced", detail };\n', "", C)
-mutate("core/sync/cycle.ts", "if (s && Math.abs(Date.now() - s.mtimeMs) < quietMs) {", "if (false) {", C)
-mutate("core/sync/cycle.ts", "Math.abs(Date.now() - s.mtimeMs) < quietMs", "Date.now() - s.mtimeMs < quietMs", C)
-mutate("core/sync/cycle.ts", "  result.embedded = await dropEmbeddedRepos(dir);\n", "", C)
+mutate("core/sync/cycle.ts", '["reset", "-q", "--keep", next]', '["reset", "-q", "--hard", next]', C, pattern='blocks the whole live update|an edit staged by hand that the update would overwrite')
+mutate("core/sync/cycle.ts", "for (const [file, hits] of await scanStaged(dir)) {", "for (const [file, hits] of new Map<string, { rule: string }[]>()) {", C, pattern='a held-back file stays dirty and does not block')
+mutate("core/sync/cycle.ts", '  if (/^!\\t.*\\[rejected\\]/m.test(r.stdout)) return { kind: "raced", detail };\n', "", C, pattern='a push that loses a race')
+mutate("core/sync/cycle.ts", "if (s && Math.abs(Date.now() - s.mtimeMs) < quietMs) {", "if (false) {", C, pattern='the quiet period defers a file written just now|an mtime just ahead of the clock')
+mutate("core/sync/cycle.ts", "Math.abs(Date.now() - s.mtimeMs) < quietMs", "Date.now() - s.mtimeMs < quietMs", C, pattern='far in the future')
+mutate("core/sync/cycle.ts", "  result.embedded = await dropEmbeddedRepos(dir);\n", "", C, pattern='is reported and never committed as a gitlink|a gitlink an old client committed')
 mutate("core/sync/cycle.ts",
        ("  result.caseCollisions = await stageCaseRenames(dir);\n",
         "  // After the quiet pass: unstaging a freshly written nested repository would\n  // otherwise restore the gitlink an older client committed.\n  result.embedded = await dropEmbeddedRepos(dir);\n"),
-       ("  result.caseCollisions = await stageCaseRenames(dir);\n  result.embedded = await dropEmbeddedRepos(dir);\n", ""), C)
-mutate("core/sync/cycle.ts", "    await writeBlocked(input.stateDir, 0);\n", "", C)
+       ("  result.caseCollisions = await stageCaseRenames(dir);\n  result.embedded = await dropEmbeddedRepos(dir);\n", ""), C, pattern='a gitlink an old client committed')
+mutate("core/sync/cycle.ts", "    await writeBlocked(input.stateDir, 0);\n", "", C, pattern='an aborted cycle breaks the blocked-cycle streak|a stopped cycle breaks the blocked-cycle streak')
 # Case handling (caught only on a case-insensitive filesystem such as macOS).
-mutate("core/sync/cycle.ts", "  result.caseCollisions = await stageCaseRenames(dir);\n", "", C, **CASE)
-mutate("core/sync/cycle.ts", "    if (ambiguous.has(rel)) continue;\n", "", C, **CASE)
+mutate("core/sync/cycle.ts", "  result.caseCollisions = await stageCaseRenames(dir);\n", "", C, pattern='a case-only rename reaches the remote|a case-only directory rename reaches the remote', **CASE)
+mutate("core/sync/cycle.ts", "    if (ambiguous.has(rel)) continue;\n", "", C, pattern='differing only by case are never', **CASE)
 mutate("core/sync/cycle.ts", "const found = exact ? part : names.find((n) => fold(n) === fold(part));",
-       'const found = exact ? part : part === rel.split("/").at(-1) ? names.find((n) => fold(n) === fold(part)) : undefined;', C, **CASE)
-mutate("core/sync/cycle.ts", "collisions: tracked.filter(clash) };", "collisions: [] };", C, **CASE)
+       'const found = exact ? part : part === rel.split("/").at(-1) ? names.find((n) => fold(n) === fold(part)) : undefined;', C, pattern='a case-only directory rename reaches the remote', **CASE)
+mutate("core/sync/cycle.ts", "collisions: tracked.filter(clash) };", "collisions: [] };", C, pattern='tracked files differing only by case are never inferred', **CASE)
 # Bootstrap, identity, config and session.
 mutate("core/sync/state.ts", "const info = await lstat(path);", "const info = await stat(path);", S)
 mutate("core/sync/state.ts", "  if (failed) {\n    await removeCreatedGit(projectsDir);\n", "  if (failed) {\n", S)
@@ -82,7 +82,7 @@ mutate("core/session.ts", 'join(stateDir, "prepare.lock")', "join(stateDir, `pre
 mutate("core/session.ts", "    if (cfg.remote) {\n      const vis = await remoteVisibility(cfg.remote);", "    if (false) {\n      const vis = await remoteVisibility(cfg.remote);", SE, network=True)
 # The gauntlet fix wave.
 mutate("core/secrets.ts", "    if (oldLeft === 0 && newLeft === 0) {\n      if (line.startsWith(\"+++ \")) file = diffPath(line);", "    if (line.startsWith(\"+++ \")) { file = diffPath(line); continue; }\n    if (oldLeft === 0 && newLeft === 0) {\n      if (line.startsWith(\"+++ \")) file = diffPath(line);", SEC)
-mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit", "-q", "--no-verify", "-m", message]', '[...NO_SIGN, "commit", "-q", "-m", message]', C)
+mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit", "-q", "--no-verify", "-m", message]', '[...NO_SIGN, "commit", "-q", "-m", message]', C, pattern='a pre-commit hook cannot add unscanned content to the snapshot')
 mutate("core/sync/state.ts", '[...NO_SIGN, "commit", "-q", "--no-verify", "-m", message]', '[...NO_SIGN, "commit", "-q", "-m", message]', S)
 mutate("core/store.ts", "    if (isLink) throw new MemoryPathError(rel, verb, linkWhy(parts, i), true);", "", "tests/core/store.test.ts")
 mutate("core/store.ts", '  if (real !== base && !real.startsWith(base + sep)) throw new MemoryPathError(rel, verb, "resolves outside the project", true);', "", "tests/core/store.test.ts",
@@ -139,15 +139,15 @@ mutate("core/sync/recovery.ts", "  } else if (head !== record.from) {\n", "  } e
 mutate("core/sync/recovery.ts", '    await remove(dir, unit[0] ?? "");\n', "", RC, pattern="already created is removed with the rest")
 mutate("core/sync/recovery.ts", "  if (head === record.to) {", "  if (false) {", RC)
 # cycle.ts: two parents, the rewrite stop, adopt, the outbound scan, step 5.
-mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-p", live, "-m", message]', '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-m", message]', C)
-mutate("core/sync/cycle.ts", '    if (kept === "no") {', "    if (false) {", C)
-mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-m", message]', '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-p", live, "-m", message]', C)
+mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-p", live, "-m", message]', '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-m", message]', C, pattern='a snapshot pushed before step 5 failed is never merged again|a note deleted after a push whose acknowledgement was lost')
+mutate("core/sync/cycle.ts", '    if (kept === "no") {', "    if (false) {", C, pattern='a rewritten remote stops the cycle: nothing is merged')
+mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-m", message]', '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-p", live, "-m", message]', C, pattern='adopting a rewritten remote carries over only the changes')
 mutate("core/sync/cycle.ts", "if (!(await exempt(to, file))) inTree.push(file);", "inTree.push(file);", C, pattern="what the remote already holds never blocks")
 mutate("core/sync/cycle.ts", "  const { inCommits, inTree } = await outboundHits(clone, from, to, built);", "  const { inCommits, inTree } = { inCommits: [], inTree: [] };", C,
        pattern="reached a local commit without the snapshot scan")
-mutate("core/sync/cycle.ts", "  await gitOk([\"update-ref\", REMOTE_SEEN, next], { cwd: dir });\n", "", C)
-mutate("core/sync/cycle.ts", "  if (reset.timedOut) {\n    // Not the user's block", "  if (false) {\n    // Not the user's block", C)
-mutate("core/sync/cycle.ts", "    const finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: input.liveUpdateTimeoutMs });", "    const finished = null as Finished | null;", C)
+mutate("core/sync/cycle.ts", "  await gitOk([\"update-ref\", REMOTE_SEEN, next], { cwd: dir });\n", "", C, pattern='a rewritten remote stops the cycle: nothing is merged')
+mutate("core/sync/cycle.ts", "  if (reset.timedOut) {\n    // Not the user's block", "  if (false) {\n    // Not the user's block", C, pattern="a live update killed on its timeout is not the user's block")
+mutate("core/sync/cycle.ts", "    const finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: input.liveUpdateTimeoutMs });", "    const finished = null as Finished | null;", C, pattern="a live update that fails partway|a live update killed on its timeout is not the user's block")
 CY = "core/sync/cycle.ts"; K = "core/sync/clone.ts"; F_R = "core/sync/resolve.ts"; F_RC = "core/sync/recovery.ts"; P = "remote-seen that cannot be read"
 # resolve
 mutate("core/sync/copies.ts", "[0-9a-f]{6}(?:-\\d+)?$/;", "[0-9a-f]{6}(?:-\\d+)?/;", CP, pattern="a copy of a conflict copy is recognised")

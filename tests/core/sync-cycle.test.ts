@@ -1193,7 +1193,10 @@ test("a live update that finished leaves nothing to finish, even after a commit 
   assert.ok((await cycle(remote, a)).pushed);
   assert.ok((await cycle(remote, b)).liveUpdated);
   await gitOk(["commit", "-q", "--allow-empty", "-m", "by hand"], { cwd: b.projects });
-  assert.deepEqual((await cycle(remote, b)).notices, []);
+  // A record left behind would now stop sync: the history moved since it was written.
+  const after = await cycle(remote, b);
+  assert.equal(after.outcome, "synced", after.reason ?? "");
+  assert.deepEqual(after.notices, []);
 });
 
 test("a repair that times out stops the cycle before its snapshot; the next cycle finishes it", async () => {
