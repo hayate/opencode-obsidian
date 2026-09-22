@@ -591,6 +591,41 @@ test("twelve conflicting notes give twelve copies; the raw conflict list is neve
   assert.equal((await remoteNames(remote)).filter((n) => n.includes(".conflict-")).length, 12);
 });
 
+// The state clone sits outside the vault, where neither an includeIf "gitdir:" nor the
+// live repository's own config reaches: the identity is copied into it.
+for (const where of ["an includeIf gitdir: in the user's config", "the live repository's own config"]) {
+  test(`a merge the state clone commits carries the user's identity when only the live repository sees it (${where})`, async () => {
+    const { remote, m } = await setup(["a", "b"]);
+    const [a, b] = m as [Machine, Machine];
+    const home = await tempDir();
+    const identity = join(home, "identity");
+    await writeFile(identity, "[user]\n\tname = Vault User\n\temail = vault@example.com\n");
+    const included = where.startsWith("an includeIf");
+    const global = join(home, "gitconfig");
+    await writeFile(global, `[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n${included ? `[includeIf "gitdir:**/Projects/"]\n\tpath = ${identity}\n` : ""}`);
+    if (!included) {
+      for (const x of [a, b]) {
+        await gitOk(["config", "user.name", "Vault User"], { cwd: x.projects });
+        await gitOk(["config", "user.email", "vault@example.com"], { cwd: x.projects });
+      }
+    }
+    const saved = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = global;
+    try {
+      await writeRel(a.projects, "x/from-a.md", "a\n");
+      assert.ok((await cycle(remote, a)).pushed);
+      await writeRel(b.projects, "x/from-b.md", "b\n");
+      const r = await cycle(remote, b);
+      assert.equal(r.outcome, "synced", r.reason ?? "");
+      assert.ok(r.pushed);
+    } finally {
+      process.env.GIT_CONFIG_GLOBAL = saved;
+    }
+    assert.equal((await gitOk(["log", "-1", "--format=%P", "main"], { cwd: remote })).split(" ").length, 2, "the state clone made a merge");
+    assert.equal(await gitOk(["log", "-1", "--format=%an <%ae> / %cn <%ce>", "main"], { cwd: remote }), "Vault User <vault@example.com> / Vault User <vault@example.com>");
+  });
+}
+
 test("a busy lock returns busy without touching anything", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];

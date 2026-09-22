@@ -130,7 +130,7 @@ mutate("core/sync/copies.ts", "  return prefix !== \"\" && stem.startsWith(prefi
 # clone.ts: bare, files format, no maintenance, rebuilt atomically when unusable.
 mutate("core/sync/clone.ts", '"--ref-format=files", ', "", CL)
 mutate("core/sync/clone.ts", '  for (const remote of ["live", "origin"]) {', "  for (const remote of [] as string[]) {", CL)
-mutate("core/sync/clone.ts", "    if (LEFTOVER.test(name)) await rm(join(stateDir, name), { recursive: true, force: true });", "", CL)
+mutate("core/sync/clone.ts", "    if (LEFTOVER.test(name)) await rm(join(stateDir, name), { recursive: true, force: true }).catch(() => undefined);", "", CL)
 mutate("core/sync/clone.ts", "  } finally {\n    await rm(tmp, { recursive: true, force: true });", "  } finally {\n    await Promise.resolve();", CL, pattern="git refuses the remote")
 # recovery.ts: only untouched paths are repaired.
 mutate("core/sync/recovery.ts", "printed(rel) ? (await fingerprint(dir, rel)) === prints[rel] :", "printed(rel) ? true :", RC,
@@ -174,7 +174,7 @@ mutate(K, '  if ((await ask(["rev-parse", "--is-bare-repository"])) !== "true") 
 mutate(K, '  if ((await ask(["rev-parse", "--show-ref-format"])) !== "files") return false;\n', '', CL, pattern="reftable \\(locks")
 mutate(K, '["config", "--local", "--get", `remote.${remote}.url`]', '["config", "--get", `remote.${remote}.url`]', CL, pattern="only the user's global config")
 mutate(K, "    await rename(clone, old).catch(", "    await rm(clone, { recursive: true, force: true }).catch(", CL, pattern="half-deleted")
-mutate(K, '["-c", `core.hooksPath=${join(tmp, NO_HOOKS)}`, "clone",', '["clone",', CL, pattern="global hook never runs")
+mutate(K, '[...noHooks, "clone",', '["clone",', CL, pattern="global hook never runs")
 mutate(K, '["gc.auto", "0"], ["core.hooksPath", NO_HOOKS]]', '["gc.auto", "0"]]', CL, pattern="put back every time")
 mutate(K, '["maintenance.auto", "false"], ["gc.auto", "0"],', '["gc.auto", "0"],', CL, pattern="put back every time")
 mutate(K, "sro-(tmp|old)$/", "sro-tmp$/", CL, pattern="leftovers are swept")
@@ -329,3 +329,12 @@ mutate(CY, '    if (scanText(await gitOk(["log", "-1", "--format=%B", commit], {
 mutate("core/sync/state.ts", '  if (format) return { kind: "stopped", reason: format };\n', "", S, pattern="a sha256 repository is refused")
 mutate("core/sync/state.ts", "    if (format) return format;\n", "", S, pattern="a sha256 repository is refused")
 mutate("core/sync/state.ts", '["init", "-q", "--object-format=sha1"]', '["init", "-q"]', S, pattern="an import makes a sha1 repository")
+# The state clone: a leftover the sweep cannot delete never stops a rebuild, the identity is
+# copied in (an includeIf "gitdir:" or the live repository's own config does not reach it), and
+# no hook runs in the remote commands of a rebuild.
+mutate(K, "{ recursive: true, force: true }).catch(() => undefined);\n  }", "{ recursive: true, force: true });\n  }", CL, pattern="sweep cannot delete")
+mutate(K, '  for (const key of ["user.name", "user.email"]) {\n    await gitOk(["config", key, await gitOk(["config", key], { cwd: projectsDir })], { cwd: clone });\n  }\n', "", C,
+       pattern="carries the user's identity")
+mutate(K, ('[...noHooks, "remote", "rename",', '[...noHooks, "remote", "add",'), ('["remote", "rename",', '["remote", "add",'), CL, pattern="global hook never runs",
+       survives=("linux", "darwin"),
+       why="defence in depth: a fresh bare clone holds only refs/heads, so neither remote command changes a ref or runs a hook (checked, git 2.50.1)")

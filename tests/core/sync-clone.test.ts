@@ -143,6 +143,27 @@ test("a rebuild goes through a temporary sibling: leftovers are swept, and a fai
   assert.deepEqual((await readdir(fresh)).filter((n) => n.endsWith(".sro-tmp")), []);
 });
 
+test(
+  "a leftover the sweep cannot delete never stops a rebuild: the rebuild uses a fresh name, and a later one sweeps it",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const w = await world();
+    const stuck = join(w.stateDir, ".sync.0badf00d.sro-old");
+    await mkdir(join(stuck, "locked", "inner"), { recursive: true });
+    await chmod(join(stuck, "locked"), 0o555);
+    try {
+      const clone = await ensureStateClone(w.stateDir, w.live, w.remote);
+      assert.equal(await gitOk(["rev-parse", "--is-bare-repository"], { cwd: clone }), "true");
+      assert.ok((await readdir(w.stateDir)).includes(".sync.0badf00d.sro-old"), "the leftover it could not delete stays");
+    } finally {
+      await chmod(join(stuck, "locked"), 0o755);
+    }
+    await rm(join(w.stateDir, "sync.git"), { recursive: true });
+    await ensureStateClone(w.stateDir, w.live, w.remote);
+    assert.deepEqual((await readdir(w.stateDir)).sort(), ["sync.git"]);
+  },
+);
+
 test("a rebuild that fails after the clone (git refuses the remote) leaves no temporary sibling", async () => {
   const w = await world();
   // git remote add reads a URL beginning with "-" as an option and refuses it (exit 129).

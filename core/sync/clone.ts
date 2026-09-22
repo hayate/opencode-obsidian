@@ -13,6 +13,10 @@ const LEFTOVER = /^\.sync\.[0-9a-f]{8}\.sro-(tmp|old)$/;
 // 2.50.1: it survives the rename into place). Nothing ever creates it, so no hook,
 // the user's global core.hooksPath included, runs in the clone.
 const NO_HOOKS = "sro-no-hooks";
+// A rebuild's local clone copies every object when the state directory is on another
+// volume than the vault. 10 minutes: at a slow disk's 20 MB/s that is 12 GB, far past
+// a notes vault, and a hung disk still frees the sync lock within that bound.
+const REBUILD_CLONE_TIMEOUT_MS = 10 * 60_000;
 
 // Nobody else uses the clone and the sync lock is held, so any lock file in it is a
 // leftover (spec 5.6). --local: its own remotes, not ones a user's global config
@@ -39,21 +43,26 @@ async function usable(clone: string): Promise<boolean> {
 
 async function rebuild(stateDir: string, clone: string, projectsDir: string, remote: string): Promise<void> {
   await mkdir(stateDir, { recursive: true });
+  // Best effort: a leftover that cannot be deleted stays, never in the way (this
+  // rebuild uses a fresh random name), and a later rebuild tries it again.
   for (const name of await readdir(stateDir)) {
-    if (LEFTOVER.test(name)) await rm(join(stateDir, name), { recursive: true, force: true });
+    if (LEFTOVER.test(name)) await rm(join(stateDir, name), { recursive: true, force: true }).catch(() => undefined);
   }
   const id = randomBytes(4).toString("hex");
   const tmp = join(stateDir, `.sync.${id}.sro-tmp`);
   const old = join(stateDir, `.sync.${id}.sro-old`);
   try {
     // Local and hard-linked, no network; files format, so the leftover-lock check
-    // above knows every lock it can hold; no hook runs in the clone command (the
-    // setting itself is put in place below, before anything else could run one).
-    await gitOk(["-c", `core.hooksPath=${join(tmp, NO_HOOKS)}`, "clone", "-q", "--bare", "--ref-format=files", projectsDir, tmp], {
+    // above knows every lock it can hold. No hook runs in the clone command, nor in
+    // the two remote commands after it: each gets core.hooksPath on its own command
+    // line, since the clone's config has it only once ensureStateClone puts it there.
+    const noHooks = ["-c", `core.hooksPath=${join(tmp, NO_HOOKS)}`];
+    await gitOk([...noHooks, "clone", "-q", "--bare", "--ref-format=files", projectsDir, tmp], {
       cwd: stateDir,
+      timeoutMs: REBUILD_CLONE_TIMEOUT_MS,
     });
-    await gitOk(["remote", "rename", "origin", "live"], { cwd: tmp });
-    await gitOk(["remote", "add", "origin", remote], { cwd: tmp });
+    await gitOk([...noHooks, "remote", "rename", "origin", "live"], { cwd: tmp });
+    await gitOk([...noHooks, "remote", "add", "origin", remote], { cwd: tmp });
     // Two renames, then the old clone goes: the path holds the old clone, nothing, or
     // the new one, never a half-deleted one. Nothing needs putting back if the second
     // rename fails: an absent clone is rebuilt next cycle.
@@ -64,7 +73,8 @@ async function rebuild(stateDir: string, clone: string, projectsDir: string, rem
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
-  // The new clone is in place: a failure here only leaves a leftover the next rebuild sweeps.
+  // The new clone is in place: a failure here stops this cycle alone, with its error.
+  // The next cycle uses the new clone, and a later rebuild's sweep tries the leftover again.
   await rm(old, { recursive: true, force: true });
 }
 
@@ -77,8 +87,8 @@ export async function ensureStateClone(stateDir: string, projectsDir: string, re
   await gitOk(["remote", "set-url", "live", projectsDir], { cwd: clone });
   await gitOk(["remote", "set-url", "origin", remote], { cwd: clone });
   // git fetch would otherwise start a detached `git maintenance run --auto`.
-  for (const [key, value] of [["maintenance.auto", "false"], ["gc.auto", "0"], ["core.hooksPath", NO_HOOKS]]) {
-    await gitOk(["config", key ?? "", value ?? ""], { cwd: clone });
+  for (const [key, value] of [["maintenance.auto", "false"], ["gc.auto", "0"], ["core.hooksPath", NO_HOOKS]] as const) {
+    await gitOk(["config", key, value], { cwd: clone });
   }
   for (const key of ["user.name", "user.email"]) {
     await gitOk(["config", key, await gitOk(["config", key], { cwd: projectsDir })], { cwd: clone });
