@@ -424,6 +424,46 @@ test("a local file replacing the folder the other machine renamed a note into (d
   for (const [, entry] of tree) assert.doesNotMatch(await blob(clone, entry.oid), /^<{7}/m);
 });
 
+test("a note renamed into a folder there and elsewhere here, with the folder replaced by a file here: each side keeps its name, the folder moves aside", async () => {
+  const clone = await scenario(
+    { "q.md": TEXT, "p/a.md": "a\n", "keep.md": "k\n" },
+    { move: [["q.md", "p/b.md"]] },
+    { move: [["q.md", "z.md"]], remove: ["p"], write: { p: "file\n" } },
+  );
+  const { r, tree } = await resolved(clone);
+  const folder = r.conflicts.find((c) => c.kind === "file-folder")?.copy ?? "";
+  assert.ok(folder.startsWith("p.conflict-2026-09-22-0915-"), folder);
+  // The other name is where the remote's note now is: inside the folder's copy.
+  assert.deepEqual(r.conflicts, [
+    { kind: "file-folder", path: "p", copy: folder },
+    { kind: "two-names", path: "z.md", copy: null, other: `${folder}/b.md` },
+  ]);
+  assert.equal(await blob(clone, tree.get("p")?.oid ?? ""), "file");
+  assert.deepEqual(tree.get(`${folder}/b.md`), (await treeOf(clone, "remote")).get("p/b.md"));
+  assert.deepEqual(tree.get("z.md"), (await treeOf(clone, "local")).get("z.md"));
+  assert.deepEqual([...tree.keys()].sort(), [`${folder}/b.md`, "keep.md", "p", "z.md"].sort());
+  for (const [, entry] of tree) assert.doesNotMatch(await blob(clone, entry.oid), /^<{7}/m);
+});
+
+test("a note renamed into a folder here and elsewhere there, with the folder replaced by a file there: the folder and both names stay", async () => {
+  const clone = await scenario(
+    { "q.md": TEXT, "p/a.md": "a\n", "keep.md": "k\n" },
+    { move: [["q.md", "z.md"]], remove: ["p"], write: { p: "file\n" } },
+    { move: [["q.md", "p/b.md"]] },
+  );
+  const { r, tree } = await resolved(clone);
+  const copy = r.conflicts.find((c) => c.kind === "file-folder")?.copy ?? "";
+  assert.ok(copy.startsWith("p.conflict-2026-09-22-0915-"), copy);
+  assert.deepEqual(r.conflicts, [
+    { kind: "file-folder", path: "p", copy },
+    { kind: "two-names", path: "p/b.md", copy: null, other: "z.md" },
+  ]);
+  assert.equal(await blob(clone, tree.get(copy)?.oid ?? ""), "file");
+  assert.deepEqual(tree.get("p/b.md"), (await treeOf(clone, "local")).get("p/b.md"));
+  assert.deepEqual(tree.get("z.md"), (await treeOf(clone, "remote")).get("z.md"));
+  assert.deepEqual([...tree.keys()].sort(), [copy, "keep.md", "p/b.md", "z.md"].sort());
+});
+
 test("a remote file replacing a folder edited here: the local folder keeps its notes, the file becomes the copy", async () => {
   const clone = await scenario({ "p/a.md": "a\n", "keep.md": "k\n" }, { remove: ["p"], write: { p: "file\n" } }, { write: { "p/a.md": "a local edit\n" } });
   const { r, tree } = await resolved(clone);
@@ -569,6 +609,18 @@ test("a rename/delete onto a name both sides hold stops when no content record n
   assert.equal(r?.kind, "stop", JSON.stringify(r));
   assert.match((r as { reason: string }).reason, /rename\/delete\) with an unexpected pair of versions/);
   assert.deepEqual((r as { paths: string[] }).paths, ["r.md", "n.md"]);
+});
+
+test("a record naming only paths neither commit holds is not resolved by a folder move it has no path in", async () => {
+  const clone = await scenario({ "q.md": TEXT, "p/a.md": "a\n", "keep.md": "k\n" }, { move: [["q.md", "p/b.md"]] }, { remove: ["q.md", "p"], write: { p: "file\n" } });
+  let r: Resolution | undefined;
+  // git's rename/delete record now names zz.md, outside the folder p/ the local file displaces.
+  await withRewrittenMergeTree("\x002\0p/b.md\0q.md\0CONFLICT (rename/delete)\0", "\x002\0zz.md\0q.md\0CONFLICT (rename/delete)\0", async () => {
+    r = await mergeAndResolve(clone, "remote", "local", { when: WHEN });
+  });
+  assert.equal(r?.kind, "stop", JSON.stringify(r));
+  assert.match((r as { reason: string }).reason, /rename\/delete\) with an unexpected pair of versions/);
+  assert.deepEqual((r as { paths: string[] }).paths, ["zz.md", "q.md"]);
 });
 
 test("the check stops a merge whose written tree lost a version", async () => {

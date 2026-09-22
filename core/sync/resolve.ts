@@ -237,6 +237,8 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
   // neither side has a note there to keep, so the folder move resolves that record too.
   const collided = new Set<string>();
   const displaced: string[] = [];
+  // The folder copies the file/directory rule chose, moved after the loop.
+  const asideMoves: Array<{ path: string; folder: string }> = [];
   for (const record of merge.records) {
     if (record.type === COLLISION) for (const path of record.paths) collided.add(path);
     if (record.type === "CONFLICT (file/directory)") {
@@ -335,13 +337,13 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
         if (!localFile && !remoteFile) return stop("git reported a file/directory conflict without the file", record.paths);
         final.delete(moved);
         if (localFile) {
-          // The local file takes the path; the remote folder moves to a copy.
-          const inside = [...final].filter(([p]) => p.startsWith(`${path}/`));
+          // The local file takes the path; the remote folder moves to a copy once
+          // every rule has run (below the loop), so a note another rule puts inside
+          // it, such as the remote's name of a note renamed into it, moves too.
           const folder = copyPath(path, (await run(clone, ["rev-parse", `${merge.tree}:${path}`])).trim(), opts.when, (p) => names.taken(p));
-          for (const [p, e] of inside) {
-            final.delete(p);
-            put(`${folder}${p.slice(path.length)}`, e);
-          }
+          // Its notes arrive after the loop; no copy chosen meanwhile may take its name.
+          names.add(folder);
+          asideMoves.push({ path, folder });
           put(path, localFile);
           conflicts.push({ kind: "file-folder", path, copy: folder });
         } else if (remoteFile) {
@@ -363,6 +365,17 @@ export async function mergeAndResolve(clone: string, ours: string, theirs: strin
         break;
       }
     }
+  }
+  // Each remote folder a local file displaced moves aside whole, with whatever the
+  // rules left inside it; a note's other name inside the folder follows the note.
+  for (const { path, folder } of asideMoves) {
+    const moved = (p: string): string => `${folder}${p.slice(path.length)}`;
+    const inside = [...final].filter(([p]) => p.startsWith(`${path}/`));
+    for (const [p, e] of inside) {
+      final.delete(p);
+      put(moved(p), e);
+    }
+    for (const c of conflicts) if (c.other?.startsWith(`${path}/`)) c.other = moved(c.other);
   }
   const tree = await (opts.writeTree ?? writeResolved)(clone, merge.tree, result, final);
   const problems = checkResolved(await listTree(clone, tree), final, facts);
