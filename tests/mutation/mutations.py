@@ -394,3 +394,17 @@ mutate(CY, "      result.reason = `an earlier vault update is still running (pro
 mutate(CY, "    onSpawn: (group) => recordIntent(input.stateDir, live, next, group),\n", "", C, pattern="records its process group")
 mutate("core/git.ts", '  if (started.size === 0) process.on("exit", killStarted);\n', "", G, pattern="session that exits normally takes the git")
 mutate("core/git.ts", "    started.delete(pid);\n", "", G, pattern="session that exits normally takes the git")
+# The wait comes before the blocked-cycle bookkeeping, so a cycle that only waited leaves
+# the streak where it was, as a busy one does; and a group of 0 or 1 is never a group.
+WAIT_BLOCK = """    const running = await runningUpdate(input.stateDir);
+    if (running !== null) {
+      result.outcome = "unsynced";
+      result.reason = `an earlier vault update is still running (process group ${running}); sync waits for it. If it is hung, end that process.`;
+      return result;
+    }
+"""
+STREAK_BLOCK = """    const streak = await readBlocked(input.stateDir);
+    await writeBlocked(input.stateDir, 0);
+"""
+mutate(CY, (WAIT_BLOCK, STREAK_BLOCK), ("", STREAK_BLOCK + WAIT_BLOCK), C, pattern=WAITS)
+mutate(F_RC, "!Number.isInteger(group) || group < 2", "!Number.isInteger(group) || group < 0", RC, pattern="a record that cannot be read")

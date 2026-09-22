@@ -1859,6 +1859,7 @@ test("a cycle waits for a record's live process group, and the cycle after it fi
   const group = alive.pid ?? 0;
   assert.ok(group >= 2);
   await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group }));
+  await writeRel(b.state, "blocked-cycles", "2");
   const waiting = await runCycle(slow);
   assert.equal(waiting.outcome, "unsynced", waiting.reason ?? "");
   assert.match(waiting.reason ?? "", new RegExp(`^an earlier vault update is still running \\(process group ${group}\\); sync waits for it\\.`));
@@ -1866,7 +1867,7 @@ test("a cycle waits for a record's live process group, and the cycle after it fi
   assert.deepEqual(waiting.notices, []);
   assert.equal(waiting.timedOut, null, "waiting is not a timeout: the limit stays where it was");
   assert.equal(await rung(b), "1");
-  assert.equal(await streak(b), "0", "and it is not a block");
+  assert.equal(await streak(b), "2", "and it is not a block: like a busy cycle, it leaves the streak alone");
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushed, "nothing pushed");
   assert.equal((await recordOf(b)).group, group, "the record is left exactly as it was");
 
@@ -1877,6 +1878,29 @@ test("a cycle waits for a record's live process group, and the cycle after it fi
   assert.equal(after.outcome, "synced", after.reason ?? "");
   assert.equal(await read(b, "x/t.md"), "from a\n");
   assert.deepEqual((await readdir(b.state)).filter((n) => n === RECORD), []);
+});
+
+test("a running update is waited for even when the vault's history moved by hand: the wait comes before every other judgement of the record", async () => {
+  const { remote, b, slow } = await behindSlowFilter("sleep 10; cat", 500);
+  assert.equal((await runCycle(slow)).outcome, "unsynced");
+  const pushed = await gitOk(["rev-parse", "main"], { cwd: remote });
+  // The history moved since the record was written, which alone stops sync with the
+  // record kept; but an update is still running, so the cycle waits for it instead.
+  await gitOk(["commit", "-q", "--allow-empty", "-m", "by hand"], { cwd: b.projects });
+  const alive = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  const group = alive.pid ?? 0;
+  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group }));
+  const waiting = await runCycle(slow);
+  assert.equal(waiting.outcome, "unsynced", waiting.reason ?? "");
+  assert.match(waiting.reason ?? "", new RegExp(`^an earlier vault update is still running \\(process group ${group}\\)`));
+  assert.equal(waiting.committed, null);
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushed, "nothing pushed");
+  process.kill(-group, "SIGKILL");
+  await new Promise((done) => alive.on("exit", done));
+  // Once it is gone the record is judged as before: the history moved, so sync stops.
+  const stopped = await runCycle(slow);
+  assert.equal(stopped.outcome, "aborted", stopped.reason ?? "");
+  assert.match(stopped.reason ?? "", /the vault's history moved since it began/);
 });
 
 test("a record naming a process group that is gone is repaired like any other, and a killed update leaves none to wait for", async () => {
