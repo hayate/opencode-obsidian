@@ -408,3 +408,13 @@ STREAK_BLOCK = """    const streak = await readBlocked(input.stateDir);
 """
 mutate(CY, (WAIT_BLOCK, STREAK_BLOCK), ("", STREAK_BLOCK + WAIT_BLOCK), C, pattern=WAITS)
 mutate(F_RC, "!Number.isInteger(group) || group < 2", "!Number.isInteger(group) || group < 0", RC, pattern="a record that cannot be read")
+# Fix round 2: git() settles what onSpawn returns before its own result (the live update's
+# group write, which the kill's fingerprints would otherwise overwrite), and a throw from it
+# where it stands still forgets the child.
+mutate("core/git.ts", """      resolve(
+        spawned.then((failed) => {
+          if (failed !== undefined) throw failed;
+          return result;
+        }),
+      );""", "      resolve(result);", G, pattern="git waits for what onSpawn writes")
+mutate("core/git.ts", "      reported = Promise.reject(err);", "      throw err;", G, pattern="an onSpawn that throws where it stands")

@@ -381,3 +381,41 @@ test("a session that exits normally takes the git it started with it, and instal
   await gitOk(["--version"], { cwd: process.cwd() });
   assert.equal(process.listenerCount("exit"), 0, "no exit listener is left behind");
 });
+
+// Spec 5.4 step 5 (fix round 2): the live update records its process group from onSpawn
+// while git is running. git() settles what onSpawn returns before its own result, so that
+// record is on disk before the caller goes on: a write that landed later would fall on top
+// of the fingerprints the kill records, and the next repair would have to judge every path
+// by content instead. A write that fails is the call's failure, never a silent loss.
+test("git waits for what onSpawn writes before it returns, and a write that fails is the call's failure", async () => {
+  let written = false;
+  const waited = await git(["--version"], {
+    cwd: process.cwd(),
+    onSpawn: () =>
+      new Promise<void>((done) => {
+        setTimeout(() => {
+          written = true;
+          done();
+        }, 150);
+      }),
+  });
+  assert.equal(written, true, "what onSpawn started had finished when git() returned");
+  assert.equal(waited.code, 0);
+  await assert.rejects(
+    git(["--version"], { cwd: process.cwd(), onSpawn: () => Promise.reject(new Error("no room on disk")) }),
+    /no room on disk/,
+  );
+});
+
+test("an onSpawn that throws where it stands is the call's failure too, and leaves nothing registered for a child that is gone", async () => {
+  await assert.rejects(
+    git(["--version"], {
+      cwd: process.cwd(),
+      onSpawn: () => {
+        throw new Error("the state directory is gone");
+      },
+    }),
+    /the state directory is gone/,
+  );
+  assert.equal(process.listenerCount("exit"), 0, "the child's group is forgotten however the call ends");
+});
