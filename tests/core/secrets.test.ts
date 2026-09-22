@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { redactUrlCredentials, scanDiff, scanText, unquoteGitPath } from "../../core/secrets.ts";
+import { redactUrlCredentials, scanDiff, scanRange, scanText, unquoteGitPath } from "../../core/secrets.ts";
+import { gitOk } from "../../core/git.ts";
+import { commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
 
 // Fixtures are assembled at runtime: a literal token-shaped string in this file
 // would trip GitHub push protection on the repository itself.
@@ -197,4 +199,17 @@ test("the scanner stays linear on a 1 MB line and ignores identifiers notes are 
   const started = performance.now();
   assert.deepEqual(scanText("a".repeat(1024 * 1024)), []);
   assert.ok(performance.now() - started < 500, "a 1 MB line took over 500 ms");
+});
+
+test("scanRange scans what a commit range adds, with the same pinned diff as the snapshot scan", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  const from = await commitFile(dir, "x/a.md", "plain\n", "a");
+  await gitOk(["config", "diff.mnemonicPrefix", "true"], { cwd: dir });
+  await writeRel(dir, ".gitattributes", "*.md -diff\n");
+  await writeRel(dir, "x/b.md", `token ${j("gh", "p_", noise(36))}\n`);
+  await gitOk(["add", "-A"], { cwd: dir });
+  await gitOk(["commit", "-q", "-m", "b"], { cwd: dir });
+  const hits = await scanRange(dir, from, "HEAD");
+  assert.deepEqual([...hits.keys()], ["x/b.md"]);
 });
