@@ -343,4 +343,4 @@ mutate(K, '  for (const key of ["user.name", "user.email"]) {\n    await gitOk([
        pattern="carries the user's identity")
 mutate(K, ('[...noHooks, "remote", "rename",', '[...noHooks, "remote", "add",'), ('["remote", "rename",', '["remote", "add",'), CL, pattern="global hook never runs",
        survives=("linux", "darwin"),
-       why="defence in depth: a fresh bare clone holds only refs/heads, so neither remote command changes a ref or runs a hook (checked, git 2.50.1)")
+       why="defence in depth: a fresh bare clone holds only refs/heads and refs/tags, which neither remote command touches, so neither changes a ref or runs a hook (checked, git 2.50.1)")
