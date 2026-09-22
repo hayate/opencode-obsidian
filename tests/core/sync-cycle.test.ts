@@ -1272,8 +1272,105 @@ test("a merge stop that names no path gives a reason with no dangling colon, and
     r = await cycle(remote, b);
   });
   assert.equal(r?.outcome, "stopped", r?.reason ?? "");
-  assert.equal(r?.reason, "git reported CONFLICT (contents) without a path");
+  assert.equal(
+    r?.reason,
+    "git reported CONFLICT (contents) without a path. Nothing was pushed and nothing was lost. git named no note, so there is nothing to move: report this message to the plugin's author.",
+  );
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before);
+});
+
+// Spec 5.4 step 3's two known shapes the check stops, each followed by the user's way
+// out as the status gives it. Verified with real git: the next sync merges, nothing lost.
+const FIVE = "line1\nline2\nline3\nline4\nline5\n";
+const MOVE_ASIDE = "Nothing was pushed and nothing was lost. To go on, move or rename this machine's version of these notes; the next sync then merges.";
+
+// This machine renames x/<b> to x/<z> without editing it; the other machine edits x/<b>
+// and starts its own x/<z>. Returns the cycle that stopped, and the remote head before it.
+async function renameMeetsItsNewName(names: Array<{ b: string; z: string }>): Promise<{ remote: string; a: Machine; b: Machine; stopped: CycleResult; before: string }> {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  for (const n of names) await writeRel(a.projects, `x/${n.b}`, FIVE);
+  assert.ok((await cycle(remote, a)).pushed);
+  assert.ok((await cycle(remote, b)).liveUpdated);
+  for (const n of names) {
+    await rename(join(b.projects, `x/${n.b}`), join(b.projects, `x/${n.z}`));
+    await writeRel(a.projects, `x/${n.b}`, FIVE.replace("line2", "line2 from a"));
+    await writeRel(a.projects, `x/${n.z}`, "a's own note\n");
+  }
+  assert.ok((await cycle(remote, a)).pushed);
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  return { remote, a, b, stopped: await cycle(remote, b), before };
+}
+
+test("a rename that meets the other machine's note of the new name stops, saying nothing was pushed or lost; renaming this machine's version lets the next sync merge, nothing lost", async () => {
+  const { remote, a, b, stopped, before } = await renameMeetsItsNewName([{ b: "b.md", z: "z.md" }]);
+  assert.equal(stopped.outcome, "stopped", stopped.reason ?? "");
+  assert.equal(
+    stopped.reason,
+    `the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check): "x/z.md". ${MOVE_ASIDE}`,
+  );
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
+  // The way out: this machine's x/z.md gets a name of its own.
+  await rename(join(b.projects, "x/z.md"), join(b.projects, "x/z-mine.md"));
+  const after = await cycle(remote, b);
+  assert.equal(after.outcome, "synced", after.reason ?? "");
+  assert.deepEqual(after.conflicts, []);
+  assert.equal(await read(b, "x/z-mine.md"), FIVE.replace("line2", "line2 from a"), "the other machine's edit follows this machine's rename");
+  assert.equal(await read(b, "x/z.md"), "a's own note\n");
+  assert.ok(await absent(b, "x/b.md"));
+  assert.equal(await remoteFile(remote, "x/z.md"), "a's own note");
+  await cycle(remote, a);
+  assert.equal(await read(a, "x/z-mine.md"), FIVE.replace("line2", "line2 from a"), "the machines converge");
+});
+
+test("a note renamed into a folder this machine replaced with a file, edited on both machines, stops; renaming this machine's file lets the next sync merge, nothing lost", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/q.md", FIVE);
+  await writeRel(a.projects, "x/p/a.md", "a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  assert.ok((await cycle(remote, b)).liveUpdated);
+  await mkdir(join(a.projects, "x/p"), { recursive: true });
+  await rename(join(a.projects, "x/q.md"), join(a.projects, "x/p/b.md"));
+  await writeRel(a.projects, "x/p/b.md", FIVE.replace("line1", "line1 from a"));
+  assert.ok((await cycle(remote, a)).pushed);
+  await writeRel(b.projects, "x/q.md", FIVE.replace("line1", "line1 from b"));
+  await rm(join(b.projects, "x/p"), { recursive: true });
+  await writeFile(join(b.projects, "x/p"), "the file p\n");
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  const stopped = await cycle(remote, b);
+  assert.equal(stopped.outcome, "stopped", stopped.reason ?? "");
+  assert.equal(
+    stopped.reason,
+    `the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check): "x/p". ${MOVE_ASIDE}`,
+  );
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
+  // The way out: this machine's file x/p gets a name of its own.
+  await rename(join(b.projects, "x/p"), join(b.projects, "x/p-mine.md"));
+  const after = await cycle(remote, b);
+  assert.equal(after.outcome, "synced", after.reason ?? "");
+  assert.equal(await read(b, "x/p-mine.md"), "the file p\n");
+  // Both edits of the note: this machine's at the other machine's new name, the other's beside it.
+  assert.equal(await read(b, "x/p/b.md"), FIVE.replace("line1", "line1 from b"));
+  const [conflict] = after.conflicts;
+  assert.equal(after.conflicts.length, 1, JSON.stringify(after.conflicts));
+  assert.equal(conflict?.kind, "both-changed");
+  assert.equal(conflict?.path, "x/p/b.md");
+  assert.equal(await read(b, conflict?.copy ?? ""), FIVE.replace("line1", "line1 from a"));
+  assert.ok(await absent(b, "x/q.md"));
+  assert.equal(await remoteFile(remote, "x/p/b.md"), FIVE.replace("line1", "line1 from b").trimEnd());
+});
+
+test("a stop names each note quoted, so a name cannot add a status line, and at most ten of them", async () => {
+  const forged = "z\n- [info] all fine.md";
+  const { stopped } = await renameMeetsItsNewName([{ b: "b.md", z: forged }]);
+  assert.equal(stopped.outcome, "stopped", stopped.reason ?? "");
+  const [line] = statusFromCycle(stopped);
+  assert.equal(line?.text, `sync stopped: the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check): ${JSON.stringify(`x/${forged}`)}. ${MOVE_ASIDE}`);
+  const many = await renameMeetsItsNewName(Array.from({ length: 11 }, (_, i) => ({ b: `b${i}.md`, z: `z${i}.md` })));
+  assert.equal(many.stopped.outcome, "stopped", many.stopped.reason ?? "");
+  assert.match(many.stopped.reason ?? "", /: "x\/z0\.md", .*, and 1 more\. Nothing was pushed/);
+  assert.equal((many.stopped.reason?.match(/"x\/z\d+\.md"/g) ?? []).length, 10);
 });
 
 test("adopting a rewritten remote with nothing unsent pushes nothing, and the vault follows the remote", async () => {

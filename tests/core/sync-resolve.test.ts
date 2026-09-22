@@ -709,6 +709,40 @@ test("a record type no rule covers stops the cycle even when a collision or a fo
   }
 });
 
+test("each stop says the one thing to do: a submodule's is to remove the nested repository, any other type's to move this machine's version aside", async () => {
+  for (const [to, todo] of [
+    ["CONFLICT (submodule)", /remove the nested repository there \(move it out of Projects\/, or remove its \.git\), then sync again\.$/],
+    ["Fast forwarding submodule", /remove the nested repository there/],
+    ["CONFLICT (file location)", /move or rename this machine's version of these notes, then sync again\.$/],
+  ] as const) {
+    const clone = await scenario({ "x/n.md": "a\n" }, { write: { "x/n.md": "remote\n" } }, { write: { "x/n.md": "local\n" } });
+    let r: Resolution | undefined;
+    await withRewrittenMergeTree("\0CONFLICT (contents)\0", `\0${to}\0`, async () => {
+      r = await mergeAndResolve(clone, "remote", "local", { when: WHEN });
+    });
+    assert.equal(r?.kind, "stop", JSON.stringify(r));
+    assert.match((r as { todo: string }).todo, todo);
+    assert.deepEqual((r as { paths: string[] }).paths, ["x/n.md"]);
+  }
+});
+
+// Real git (2.50.1): the other machine renames q.md into p/ and edits it; this machine
+// edits q.md on the same line and replaces folder p/ with a file. A known shape the
+// check stops (spec 5.4 step 3).
+test("a merge the check stops names the notes this machine holds among the conflict's paths, and never reads as a loss", async () => {
+  const clone = await scenario(
+    { "q.md": TEXT, "p/a.md": "a\n", "keep.md": "k\n" },
+    { move: [["q.md", "p/b.md"]], write: { "p/b.md": TEXT.replace("line two", "line two REMOTE") } },
+    { remove: ["p"], write: { "q.md": TEXT.replace("line two", "line two LOCAL"), p: "the file p\n" } },
+  );
+  const r = await mergeAndResolve(clone, "remote", "local", { when: WHEN });
+  assert.equal(r.kind, "stop", JSON.stringify(r));
+  const stop = r as { reason: string; paths: string[]; todo: string };
+  assert.equal(stop.reason, "the plugin could not merge this machine's changes with the remote's safely (the merged tree failed its check)");
+  assert.deepEqual(stop.paths, ["p"], "not git's relocation p~<commit>, nor the other machine's name p/b.md");
+  assert.equal(stop.todo, "To go on, move or rename this machine's version of these notes; the next sync then merges.");
+});
+
 test("a conflict that names no path stops the cycle", async () => {
   const clone = await scenario({ "x/n.md": "a\n" }, { write: { "x/n.md": "remote\n" } }, { write: { "x/n.md": "local\n" } });
   let r: Resolution | undefined;
@@ -717,6 +751,7 @@ test("a conflict that names no path stops the cycle", async () => {
   });
   assert.equal(r?.kind, "stop", JSON.stringify(r));
   assert.match((r as { reason: string }).reason, /without a path/);
+  assert.match((r as { todo: string }).todo, /git named no note, so there is nothing to move/);
 });
 
 test("a rename/delete onto a name both sides hold stops when no content record names that name", async () => {

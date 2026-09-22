@@ -130,6 +130,12 @@ function conflictLine(c: Conflict): string {
   }
 }
 
+// A reason carries git's own words and error messages, which can hold a raw line
+// break or other control character (a vault path in a failed git command's
+// arguments): each run of them becomes one space here, the one place every cycle
+// line passes, so no line can add lines of its own.
+const oneLine = (text: string): string => text.replace(/[\p{Cc}\p{Cf}\u2028\u2029]+/gu, " ");
+
 // File names come from the vault, and status lines sit outside the payload's data
 // block: every one is quoted.
 export function statusFromCycle(r: CycleResult): StatusItem[] {
@@ -161,7 +167,7 @@ export function statusFromCycle(r: CycleResult): StatusItem[] {
       text: `live update blocked by local edits to: ${files(r.blockedBy)}${r.blockedCycles > 1 ? ` (${r.blockedCycles} cycles in a row)` : ""}`,
     });
   }
-  return out;
+  return out.map((item) => ({ ...item, text: oneLine(item.text) }));
 }
 
 // No project and no memory: the bootstrap and the status lines only.

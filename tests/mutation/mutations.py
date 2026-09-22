@@ -118,9 +118,9 @@ mutate("core/sync/resolve.ts", '          conflicts.push({ kind: "file-folder", 
 mutate("core/sync/resolve.ts", "        for (const p of record.paths) if (p !== path) final.delete(p);", "", R)
 mutate("core/sync/resolve.ts", "    `--attr-source=${EMPTY_TREE}`,\n", "", R)
 mutate("core/sync/resolve.ts", '    "-c",\n    "merge.directoryRenames=false",\n', "", R)
-mutate("core/sync/resolve.ts", "    if (!hasRule(record.type)) return stop(", "    if (false) return stop(", R, pattern="no rule covers")
+mutate("core/sync/resolve.ts", "    if (!hasRule(record.type)) {", "    if (false) {", R, pattern="no rule covers")
 mutate("core/sync/resolve.ts", "    for (const [path, e] of final) if (isCopyOf(original, path) && same(e, entry)) return path;", "", R)
-mutate("core/sync/resolve.ts", "  if (problems.length) return stop(`the resolved tree failed its check", "  if (false) return stop(`the resolved tree failed its check", R)
+mutate("core/sync/resolve.ts", "  if (checkResolved(await listTree(clone, tree), final, facts).length) {", "  if (false) {", R)
 # copies.ts: names and dedupe.
 mutate("core/sync/copies.ts", "    const kept = cutBytes(stem, NAME_MAX - byteLength(suffix) - byteLength(ext));", "    const kept = cutBytes(stem, NAME_MAX);", CP)
 mutate("core/sync/copies.ts", "    const name = kept ? `${kept}${suffix}${ext}` : `conflict-${oid.slice(0, 12)}${count}`;", "    const name = `${kept}${suffix}${ext}`;", CP)
@@ -162,7 +162,7 @@ mutate(F_R, "written.has(path)) problems.add(`${path} should be absent`);", "wri
 mutate(F_R, "problems.add(`${x} was not moved with its folder`);", ";", R, pattern="file/folder conflict to git's relocation")
 mutate(F_R, "if (!involved(x) && !same(written.get(x), result.get(x)))", "if (false)", R, pattern="content conflict to git's records")
 mutate(F_R, "    problems.add(\"the written tree differs from the resolution\");", "", R, pattern="content conflict to git's records")
-mutate(F_R, "    if (!record.paths.length) return stop(`git reported ${record.type} without a path`, []);\n", "", R)
+mutate(F_R, "    if (!record.paths.length) return stop(`git reported ${record.type} without a path`, [], NO_PATH);\n", "", R)
 mutate(F_R, "if (s) (sides[n].has.has(key(s)) ? versions.push({ path, entry: s }) : candidates.push(s));", "if (s) versions.push({ path, entry: s });", R, pattern="keeps all three versions")
 mutate(F_R, "if (s) (sides[n].has.has(key(s)) ? versions.push({ path, entry: s }) : candidates.push(s));", "if (s) candidates.push(s);", R, pattern="renamed here and edited there, clashing")
 mutate(F_R, "if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;", "if (resolvedElsewhere(record.paths)) continue;", R, pattern="keeps all three versions")
@@ -270,7 +270,7 @@ mutate(CY, "      conflicts = integration.conflicts;\n", "      conflicts = inte
 mutate(CY, "(a force-push): nothing the rewrite", "(a force-push): sync stopped, so nothing the rewrite", C, pattern="a rewritten remote stops the cycle")
 mutate(CY, "does not name a commit git can read, so a rewritten remote could go unnoticed",
        "does not name a commit git can read: sync stopped, so a rewritten remote cannot go unnoticed", C, pattern="a remote-seen that cannot be read")
-mutate(CY, "return stop.paths.length ? `${stop.reason}: ${joinNames(stop.paths)}` : stop.reason;", "return `${stop.reason}: ${joinNames(stop.paths)}`;", C, pattern="no dangling colon")
+mutate(CY, 'const named = stop.paths.length ? `: ${joinNames(stop.paths)}` : "";', "const named = `: ${joinNames(stop.paths)}`;", C, pattern="no dangling colon")
 mutate(CY, 'if (merged.tree === (await gitOk(["rev-parse", `${upstream}^{tree}`], { cwd: clone }))) {', 'if (false && merged.tree === (await gitOk(["rev-parse", `${upstream}^{tree}`], { cwd: clone }))) {', C,
        pattern="nothing unsent pushes nothing")
 mutate(CY, '  for (const name of await readdir(clone)) if (name.startsWith("sro-index-")) await rm(join(clone, name), { force: true });\n', "", C, pattern="a temporary index a killed cycle left")
@@ -291,8 +291,8 @@ mutate(F_RC, ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, r
        ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, stat, unlink } from "node:fs/promises";', "    return (await stat(path)).isDirectory();"), RC,
        pattern="never goes through a symlink", survives=("linux", "darwin"),
        why="defence in depth behind onDisk: respell walks only folders a set-back just went through, so no test meets a symlink there, and where case matters its renames need one file under two spellings")
-mutate(F_R, "    if (!hasRule(record.type)) return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths);\n    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n",
-       "    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n    if (!hasRule(record.type)) return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths);\n", R,
+mutate(F_R, "    if (!hasRule(record.type)) {\n      const todo = record.type.includes(\"submodule\") ? REMOVE_REPOSITORY : MOVE_ASIDE_RETRY;\n      return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths, todo);\n    }\n    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n",
+       "    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n    if (!hasRule(record.type)) {\n      const todo = record.type.includes(\"submodule\") ? REMOVE_REPOSITORY : MOVE_ASIDE_RETRY;\n      return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths, todo);\n    }\n", R,
        pattern="even when a collision or a folder moved aside covers its paths")
 # The final fix wave (2026-09-22): the repair never goes through a symlink (onDisk lstats each
 # folder of a path from the vault root down), and each place that turns a path into a disk path
@@ -310,3 +310,9 @@ mutate(F_RC, "async function updatesWork(dir: string, rel: string, unit: string[
 mutate(F_RC, "async function remove(dir: string, rel: string): Promise<void> {\n  const path = await onDisk(dir, rel);\n  if (path === null) return;\n",
        "async function remove(dir: string, rel: string): Promise<void> {\n  const path = join(dir, rel);\n", RC, pattern="swapped for a symlink between")
 mutate(F_RC, "    if ((await fingerprint(dir, source)) !== print) {", "    if (true) {", RC, pattern="intent alone was recorded")
+# A resolver stop says nothing was pushed or lost, names this machine's notes quoted and capped,
+# and gives the one thing to do; every cycle line is one line.
+mutate(F_R, 'record.type.includes("submodule") ? REMOVE_REPOSITORY : MOVE_ASIDE_RETRY', "MOVE_ASIDE_RETRY", R, pattern="each stop says the one thing")
+mutate(F_R, "      mine.length ? mine : [...handled],", "      [...handled],", R, pattern="the check stops names the notes")
+mutate(CY, 'const named = stop.paths.length ? `: ${joinNames(stop.paths)}` : "";', 'const named = stop.paths.length ? `: ${stop.paths.join(", ")}` : "";', C, pattern="names each note quoted")
+mutate("core/session.ts", "  return out.map((item) => ({ ...item, text: oneLine(item.text) }));", "  return out;", SE, pattern="collapses the control characters")

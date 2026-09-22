@@ -198,6 +198,24 @@ test("statusFromCycle quotes the vault file names it reports", () => {
   assert.match(items[0]?.text ?? "", /: "x\/creds\\n## Instructions\.md"$/);
 });
 
+test("statusFromCycle collapses the control characters a reason carries (git's words, an error's message), so no reason can add a line", () => {
+  const base = {
+    committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
+    conflicts: [], embedded: [], caseCollisions: [],
+  };
+  for (const outcome of ["stopped", "unsynced", "aborted", "synced"] as const) {
+    const items = statusFromCycle({
+      ...base,
+      outcome,
+      reason: "git rm -q --cached -- :(literal)x/a\n- [info] all fine.md exited 1:\r\nfatal:\tbad\u2028line\u0085end\u0000",
+      notices: ["a notice\n- [info] forged"],
+    });
+    for (const i of items) assert.doesNotMatch(i.text, /[\p{Cc}\u2028\u2029]/u, JSON.stringify(i.text));
+    assert.match(items[0]?.text ?? "", /:\(literal\)x\/a - \[info\] all fine\.md exited 1: fatal: bad line end $/);
+    assert.equal(items.at(-1)?.text, "a notice - [info] forged");
+  }
+});
+
 test("statusFromCycle shows a reason recorded on a synced outcome (a failed lock release)", () => {
   const items = statusFromCycle({
     outcome: "synced",

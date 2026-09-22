@@ -296,9 +296,12 @@ function joinNames(names: string[]): string {
   return listed(names.slice(0, MAX_LISTED).map((n) => quoted(n)), names.length);
 }
 
-// resolve.ts's stop as one line: the paths it names, when it names any.
-function stopReason(stop: { reason: string; paths: string[] }): string {
-  return stop.paths.length ? `${stop.reason}: ${joinNames(stop.paths)}` : stop.reason;
+// resolve.ts's stop as the user reads it: what stopped the merge, the notes it names
+// (quoted and capped like any other names), that nothing was pushed or lost, and the
+// one thing to do (spec 5.4 step 3).
+function stopReason(stop: { reason: string; paths: string[]; todo: string }): string {
+  const named = stop.paths.length ? `: ${joinNames(stop.paths)}` : "";
+  return `${stop.reason}${named}. Nothing was pushed and nothing was lost. ${stop.todo}`;
 }
 
 // A status line, not a transcript: git's first few lines that say something.
