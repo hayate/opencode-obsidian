@@ -628,8 +628,11 @@ test("where the old tree holds two spellings of a note from two Unicode planes, 
   // U+FA6C's NFC form is U+242EE: one name on this disk. By bytes (git's order) U+FA6C
   // comes first; by UTF-16 code units U+242EE's surrogate pair does. The one file goes
   // back to the last old twin's version, so the order decides what it holds.
-  const compat = "𤋮.md";
+  // Escaped, never the raw character: a pass that normalizes the source to NFC would
+  // turn it into U+242EE, and the test would pin nothing.
+  const compat = "\uFA6C.md";
   const astral = "\u{242EE}.md";
+  assert.notEqual(compat, astral);
   const v = await caseHistory(t, { [compat]: "compat\n", [astral]: "astral\n", "z.md": "old\n" }, { [compat]: "compat\n", [astral]: "astral changed\n", "z.md": "new\n" });
   if (!v) return;
   const oracle = await checkedOutByGit(v.dir);
