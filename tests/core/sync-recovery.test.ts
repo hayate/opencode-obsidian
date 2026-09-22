@@ -7,7 +7,7 @@ import { basename, join } from "node:path";
 import { git, GitError, gitOk } from "../../core/git.ts";
 import { fold } from "../../core/sync/copies.ts";
 import { bootInstant, clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, RepairTimedOut, runningUpdate } from "../../core/sync/recovery.ts";
-import { commitFile, initRepo, sleep, tempDir, writeRel } from "./helpers.ts";
+import { commitFile, endHelper, initRepo, sleep, tempDir, writeRel } from "./helpers.ts";
 
 interface Interruption {
   // false: the process died before it could fingerprint (only the intent is recorded).
@@ -1040,8 +1040,7 @@ test("where the platform has no process groups the check answers gone, so nothin
   } finally {
     Object.defineProperty(process, "platform", { value: platform, configurable: true });
   }
-  process.kill(-group, "SIGKILL");
-  await new Promise((done) => alive.on("exit", done));
+  await endHelper(alive, "group");
 });
 
 // Spec 5.4 step 5 (fix round 2): a repair whose session died goes on writing its scratch

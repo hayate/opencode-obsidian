@@ -1,5 +1,7 @@
 // Shared test helpers. Every test runs git against a private global config, so
 // results never depend on the developer's own ~/.gitconfig.
+import type { ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { mkdtemp, realpath, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -78,4 +80,26 @@ export async function withRewrittenMergeTree(from: string, to: string, fn: () =>
   } finally {
     process.env.PATH = path;
   }
+}
+
+// Ends a helper process a test started and waits for node to reap it, so a later look at
+// its process group cannot find a zombie (a zombie answers process.kill(pid, 0) as alive).
+// Tests unreference their helpers, so that a failed assertion never leaves the file
+// waiting one out; awaiting an unreferenced child's exit would then leave the event loop
+// with nothing referenced at all, and node's test runner cancels the test for it
+// ("Promise resolution is still pending but the event loop has already resolved",
+// reproduced on Linux with node 22.23.2, where macOS happened to survive the same code).
+// So the child is referenced again for the wait itself, which every caller does after the
+// assertions that matter. `kill` says what to signal: the child alone, or the process
+// group it leads (a detached helper, which may have started children of its own).
+export async function endHelper(child: ChildProcess, kill: "child" | "group" = "child"): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.ref();
+  try {
+    if (kill === "group" && child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+    else child.kill("SIGKILL");
+  } catch {
+    // Already gone: the wait below still reaps it.
+  }
+  await once(child, "exit");
 }

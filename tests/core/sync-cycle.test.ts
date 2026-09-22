@@ -9,7 +9,7 @@ import { statusFromCycle } from "../../core/session.ts";
 import { prepareProjects, REQUIRED_IGNORES } from "../../core/sync/state.ts";
 import { acquireLock } from "../../core/lock.ts";
 import { git, gitOk } from "../../core/git.ts";
-import { GIT_CONFIG, commitFile, initRepo, sleep, tempDir, withRewrittenMergeTree, writeRel } from "./helpers.ts";
+import { GIT_CONFIG, commitFile, endHelper, initRepo, sleep, tempDir, withRewrittenMergeTree, writeRel } from "./helpers.ts";
 
 const TZ = "Asia/Tokyo";
 const j = (...parts: string[]): string => parts.join("");
@@ -1834,8 +1834,7 @@ test("a session that died mid-update leaves it running: the next cycle waits for
   // Long enough for the update to have written the two quick notes and be inside the
   // third one's filter: exactly what a repair would set back under it.
   await sleep(700);
-  session.kill("SIGKILL");
-  await new Promise((done) => session.on("close", done));
+  await endHelper(session);
   assert.ok(groupAlive(group), "the update outlives the session that started it");
 
   const waiting = await runCycle(input);
@@ -1885,8 +1884,7 @@ test("a cycle waits for a record's live process group, and the cycle after it fi
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushed, "nothing pushed");
   assert.equal((await recordOf(b)).group, group, "the record is left exactly as it was");
 
-  process.kill(-group, "SIGKILL");
-  await new Promise((done) => alive.on("exit", done));
+  await endHelper(alive, "group");
   await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });
   const after = await runCycle({ ...slow, liveUpdateTimeoutMs: undefined });
   assert.equal(after.outcome, "synced", after.reason ?? "");
@@ -1910,8 +1908,7 @@ test("a running update is waited for even when the vault's history moved by hand
   assert.equal(waiting.waiting?.group, group);
   assert.equal(waiting.committed, null);
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushed, "nothing pushed");
-  process.kill(-group, "SIGKILL");
-  await new Promise((done) => alive.on("exit", done));
+  await endHelper(alive, "group");
   // Once it is gone the record is judged as before: the history moved, so sync stops.
   const stopped = await runCycle(slow);
   assert.equal(stopped.outcome, "aborted", stopped.reason ?? "");
@@ -1924,7 +1921,7 @@ test("a record naming a process group that is gone is repaired like any other, a
   assert.equal((await recordOf(b)).group, undefined, "git was killed with its group, so nothing is left running");
   // A record naming a process that has exited: the repair goes ahead.
   const ended = spawn(process.execPath, ["-e", ""], { detached: true, stdio: "ignore" });
-  await new Promise((done) => ended.on("exit", done));
+  await endHelper(ended);
   const group = ended.pid ?? 0;
   await waitGone(group, "the helper process never exited");
   await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group, boot: bootInstant(), startedAt: Date.now() }));
@@ -1951,8 +1948,7 @@ test("a group recorded before a reboot is ignored: any process may hold that id 
   assert.deepEqual(after.notices, ["finished an interrupted vault update; 1 file set back to update again"]);
   assert.equal(await read(b, "x/t.md"), "from a\n");
   assert.equal(await remoteFile(remote, "x/t.md"), "from a");
-  process.kill(-group, "SIGKILL");
-  await new Promise((done) => alive.on("exit", done));
+  await endHelper(alive, "group");
 });
 
 test("an update still running after the longest limit a live update gets is hung: the wait escalates to a notify naming it and its age, and a start in the future reads as just started", async () => {
@@ -1982,6 +1978,5 @@ test("an update still running after the longest limit a live update gets is hung
   assert.equal(fresh.waiting?.hung, false);
   assert.equal(fresh.waiting?.runningMs, 0);
   assert.equal(statusFromCycle(fresh)[0]?.level, "warn");
-  process.kill(-group, "SIGKILL");
-  await new Promise((done) => alive.on("exit", done));
+  await endHelper(alive, "group");
 });
