@@ -407,7 +407,8 @@ function insideCopyOf(p: string, x: string): boolean {
 // - git's merged results (neither side's version) are gone from those paths and are
 //   in no new copy of them; an unrelated note with the same bytes is someone's note;
 // - git's relocations (conflict paths neither commit has) are gone;
-// - every other entry of a remote folder a local file displaced moved aside with it;
+// - a remote folder a local file displaced moved aside whole: git's merge of it, and
+//   at a conflict path inside it the remote commit's own entry;
 // - every other path is exactly git's merge, and the tree is exactly the resolution.
 // A note's own text is never inspected, so notes that quote markers pass.
 export function checkResolved(written: Map<string, Entry>, resolution: Map<string, Entry>, facts: MergeFacts): string[] {
@@ -451,12 +452,16 @@ export function checkResolved(written: Map<string, Entry>, resolution: Map<strin
     }
   }
 
-  // A local file at a conflict path displaced the remote folder git merged there.
-  // A conflict path inside it is held to its record above instead: git's result
-  // there is its own merge, which must not move with the folder.
+  // A local file at a conflict path displaced the remote folder git merged there, and
+  // each entry inside it must sit at its own place in a copy of the folder. At a
+  // conflict path that entry is the remote commit's own, never git's result: git's
+  // result there can be its own merge (rename/rename) or lack the note. Elsewhere it
+  // is git's result.
   const displacedEntry = (x: string): boolean => displacing.some((p) => x.startsWith(`${p}/`));
-  for (const [x, entry] of result) {
-    if (!displacedEntry(x) || conflictPaths.has(x)) continue;
+  for (const x of new Set([...result.keys(), ...sides[2].tree.keys()])) {
+    if (!displacedEntry(x)) continue;
+    const entry = conflictPaths.has(x) ? sides[2].tree.get(x) : result.get(x);
+    if (!entry) continue;
     if (!entries.some(([at, e]) => same(e, entry) && movedWith(x, at))) problems.add(`${x} was not moved with its folder`);
   }
   const involved = (x: string): boolean =>

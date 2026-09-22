@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { gitOk } from "../../core/git.ts";
-import { checkResolved, mergeAndResolve, writeResolved, type Resolution } from "../../core/sync/resolve.ts";
+import { checkResolved, mergeAndResolve, writeResolved, type MergeFacts, type Resolution } from "../../core/sync/resolve.ts";
 import { initRepo, tempDir } from "./helpers.ts";
 
 const WHEN = "2026-09-22-0915";
@@ -391,6 +391,59 @@ test("the check holds a conflict path inside a displaced folder to its own recor
   // Every version kept, and git's merge at the note's place in a second copy of the folder.
   const other = "p.conflict-2026-09-22-0915-777777";
   assert.equal(check([...good, [`${other}/b.md`, e("3")]]), `${other}/b.md: git's merged result remains`);
+});
+
+// q.md renamed into p/ there as p/b.md (1), and a local file p (2) displaced the folder;
+// the remote's untouched p/a.md (6) was removed here, so git's result lacks it. The
+// records are real git's (2.50.1). Deleted here, git's result at p/b.md is the remote's note.
+const renamedInDeletedHere: MergeFacts = {
+  records: [
+    { paths: ["p/b.md", "q.md"], type: "CONFLICT (rename/delete)" },
+    { paths: ["p~local", "p"], type: "CONFLICT (file/directory)" },
+  ],
+  stages: new Map([["p/b.md", { 1: e("1"), 2: e("1") }], ["p~local", { 3: e("2") }]]),
+  result: new Map([["p/b.md", e("1")], ["p~local", e("2")], ["keep.md", e("5")]]),
+  remote: new Map([["p/b.md", e("1")], ["p/a.md", e("6")], ["keep.md", e("5")]]),
+  local: new Map([["p", e("2")], ["keep.md", e("5")]]),
+};
+// Edited there (1) and renamed to z.md here (4, the base text): git's result at both
+// names is the remote's edit.
+const renamedInEditedThere: MergeFacts = {
+  records: [
+    { paths: ["p~local", "p"], type: "CONFLICT (file/directory)" },
+    { paths: ["q.md", "p/b.md", "z.md"], type: "CONFLICT (rename/rename)" },
+  ],
+  stages: new Map([["p/b.md", { 2: e("1") }], ["p~local", { 3: e("2") }], ["q.md", { 1: e("4") }], ["z.md", { 3: e("1") }]]),
+  result: new Map([["p/b.md", e("1")], ["p~local", e("2")], ["z.md", e("1")], ["keep.md", e("5")]]),
+  remote: new Map([["p/b.md", e("1")], ["p/a.md", e("6")], ["keep.md", e("5")]]),
+  local: new Map([["p", e("2")], ["z.md", e("4")], ["keep.md", e("5")]]),
+};
+const checkWith = (facts: MergeFacts, written: Array<[string, E]>): string => checkResolved(new Map(written), new Map(written), facts).join("; ");
+const aside = "p.conflict-2026-09-22-0915-666666";
+const notMoved = "p/b.md was not moved with its folder";
+
+test("the check holds a note renamed into a displaced folder there and deleted here to the moved folder, not to a copy of its old name", () => {
+  assert.equal(checkWith(renamedInDeletedHere, [["p", e("2")], [`${aside}/b.md`, e("1")], ["keep.md", e("5")]]), "", "p/a.md was never in git's result");
+  assert.equal(checkWith(renamedInDeletedHere, [["p", e("2")], ["q.conflict-2026-09-22-0915-111111.md", e("1")], ["keep.md", e("5")]]), notMoved);
+  // Were git's result to lack the note (not seen from real git), the remote's own note
+  // would still have to move with the folder.
+  const lacking = { ...renamedInDeletedHere, result: new Map([["p~local", e("2")], ["keep.md", e("5")]]) };
+  assert.equal(checkWith(lacking, [["p", e("2")], ["q.conflict-2026-09-22-0915-111111.md", e("1")], ["keep.md", e("5")]]), notMoved);
+});
+
+test("the check holds a note renamed into a displaced folder and edited there, renamed elsewhere here, to the moved folder, not to a copy of its old name", () => {
+  assert.equal(checkWith(renamedInEditedThere, [["p", e("2")], [`${aside}/b.md`, e("1")], ["z.md", e("4")], ["keep.md", e("5")]]), "");
+  assert.equal(checkWith(renamedInEditedThere, [["p", e("2")], ["q.conflict-2026-09-22-0915-111111.md", e("1")], ["z.md", e("4")], ["keep.md", e("5")]]), notMoved);
+});
+
+test("the check holds a note renamed into a displaced folder and edited there, renamed elsewhere here, to the moved folder, not to a copy of this machine's name", () => {
+  assert.equal(checkWith(renamedInEditedThere, [["p", e("2")], ["z.conflict-2026-09-22-0915-111111.md", e("1")], ["z.md", e("4")], ["keep.md", e("5")]]), notMoved);
+});
+
+test("the check rejects a displaced folder left in place while the local file moves to a copy", () => {
+  const file = "p.conflict-2026-09-22-0915-222222";
+  assert.equal(checkWith(renamedInDeletedHere, [["p/b.md", e("1")], [file, e("2")], ["keep.md", e("5")]]), notMoved);
+  assert.equal(checkWith(renamedInEditedThere, [["p/b.md", e("1")], [file, e("2")], ["z.md", e("4")], ["keep.md", e("5")]]), notMoved);
 });
 
 test("a rename colliding with a new note, with content changed on both sides, keeps all three versions", async () => {
