@@ -2,6 +2,7 @@
 // child would block the event loop, and with it the 15 s initialization bound.
 import { spawn } from "node:child_process";
 import { rm, stat } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
 
 export interface GitResult {
   code: number;
@@ -20,23 +21,14 @@ export interface GitOptions {
 export const LOCAL_TIMEOUT_MS = 30_000;
 export const NETWORK_TIMEOUT_MS = 45_000;
 
-// Spec 5.6: a lock git could not create, in one sentence a user can act on.
-// git's own paragraph assumes the reader knows what a lock file is.
-function leftLockNotice(stderr: string): string | null {
-  const lock = /Unable to create '([^']+\.lock)': File exists/.exec(stderr)?.[1];
-  return lock === undefined
-    ? null
-    : `git left a lock file behind: '${lock}' (a git program stopped before it finished). If no git program is running on this machine, delete that file.`;
-}
-
 export class GitError extends Error {
   readonly args: string[];
   readonly result: GitResult;
 
-  constructor(args: string[], result: GitResult) {
+  constructor(args: string[], result: GitResult, message?: string) {
     const outcome = result.timedOut ? "timed out" : `exited ${result.code}`;
     const detail = result.stderr.trim() || result.stdout.trim();
-    super(leftLockNotice(result.stderr) ?? `git ${args.join(" ")} ${outcome}${detail ? `: ${detail}` : ""}`);
+    super(message ?? `git ${args.join(" ")} ${outcome}${detail ? `: ${detail}` : ""}`);
     this.name = "GitError";
     this.args = args;
     this.result = result;
@@ -118,9 +110,9 @@ export const INDEX_LOCK_DELAY_MS = 1000;
 // met another process's lock has done nothing and can simply run again.
 const RETRIED_ON_INDEX_LOCK = new Set(["add", "rm", "reset"]);
 
-// These take the index lock as they start, before any filter, hook or checkout
-// work, so one killed on its timeout was holding it: an index.lock that was not
-// there when it started is its own leftover (spec 5.6).
+// These take the index lock as they start, before any filter or checkout work.
+// git releases it by renaming index.lock onto index, so while the index is
+// unchanged the one that was killed has released nothing (spec 5.6).
 const TAKES_INDEX_LOCK = new Set(["add", "rm", "reset", "commit", "checkout"]);
 
 function subcommand(args: string[]): string | undefined {
@@ -135,13 +127,36 @@ async function exists(path: string): Promise<boolean> {
   return stat(path).then(() => true, () => false);
 }
 
-async function indexLockPath(opts: GitOptions): Promise<string | null> {
-  const r = await runOnce(["rev-parse", "--path-format=absolute", "--git-path", "index.lock"], {
+interface IndexPaths {
+  index: string;
+  lock: string;
+}
+
+async function indexPaths(opts: GitOptions): Promise<IndexPaths | null> {
+  const r = await runOnce(["rev-parse", "--path-format=absolute", "--git-path", "index", "--git-path", "index.lock"], {
     cwd: opts.cwd,
     env: opts.env,
     timeoutMs: opts.timeoutMs,
   });
-  return r.code === 0 && !r.timedOut ? r.stdout.trim() : null;
+  const [index, lock] = r.stdout.trim().split("\n");
+  return r.code === 0 && !r.timedOut && index && lock ? { index, lock } : null;
+}
+
+// Which file is at a path: a rename onto it (a released lock) changes the answer.
+async function identity(path: string): Promise<string> {
+  return stat(path).then(
+    (s) => `${s.dev}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`,
+    () => "absent",
+  );
+}
+
+// Spec 5.6: a lock git could not create, in one sentence a user can act on (git's
+// own paragraph assumes the reader knows what a lock file is). Only for a lock
+// that really exists: a hook or filter can print git's wording for its own reasons.
+async function leftLockNotice(stderr: string, cwd: string): Promise<string | undefined> {
+  const named = /Unable to create '(.+?\.lock)': File exists/.exec(stderr)?.[1];
+  if (named === undefined || !(await exists(resolvePath(cwd, named)))) return undefined;
+  return `git left a lock file behind: '${named}' (a git program stopped before it finished). If no git program is running on this machine, delete that file.`;
 }
 
 // The message alone proves nothing: a hook or a filter can print it after doing
@@ -155,27 +170,37 @@ async function metIndexLock(args: string[], result: GitResult, lock: string | nu
 }
 
 // Spec 5.6: the plugin never deletes a lock it did not create. A command that met
-// another process's index.lock is retried; one the plugin killed on its timeout
-// has its own index.lock removed, so a timeout never strands the repository.
+// another process's index.lock is retried. One the plugin killed on its timeout
+// has its index.lock removed when the lock was absent as it started and the index
+// is unchanged: no lock was released meanwhile, so the lock is the one it took.
+// (One killed before it reached the lock is 5.6's accepted limitation.)
 export async function git(args: string[], opts: GitOptions): Promise<GitResult> {
-  const lock = TAKES_INDEX_LOCK.has(subcommand(args) ?? "") ? await indexLockPath(opts) : null;
+  const paths = TAKES_INDEX_LOCK.has(subcommand(args) ?? "") ? await indexPaths(opts) : null;
   for (let attempt = 1; ; attempt++) {
-    const before = lock !== null && (await exists(lock));
+    const before = paths !== null && (await exists(paths.lock));
+    const indexBefore = paths === null ? "" : await identity(paths.index);
     const result = await runOnce(args, opts);
-    if (result.timedOut && lock !== null && !before && (await exists(lock))) {
+    if (
+      result.timedOut &&
+      paths !== null &&
+      !before &&
+      (await exists(paths.lock)) &&
+      (await identity(paths.index)) === indexBefore
+    ) {
+      const lock = paths.lock;
       const note = await rm(lock, { force: true }).then(
         () => `removed ${lock}, which this command left when it was stopped`,
         (err: Error) => `could not remove ${lock}, which this command left when it was stopped: ${err.message}`,
       );
       result.stderr += `${result.stderr && !result.stderr.endsWith("\n") ? "\n" : ""}${note}\n`;
     }
-    if (attempt >= INDEX_LOCK_RETRIES || !(await metIndexLock(args, result, lock))) return result;
+    if (attempt >= INDEX_LOCK_RETRIES || !(await metIndexLock(args, result, paths?.lock ?? null))) return result;
     await new Promise((resolve) => setTimeout(resolve, INDEX_LOCK_DELAY_MS));
   }
 }
 
 export async function gitOk(args: string[], opts: GitOptions): Promise<string> {
   const result = await git(args, opts);
-  if (result.code !== 0 || result.timedOut) throw new GitError(args, result);
+  if (result.code !== 0 || result.timedOut) throw new GitError(args, result, await leftLockNotice(result.stderr, opts.cwd));
   return result.stdout.trim();
 }

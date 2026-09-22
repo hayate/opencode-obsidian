@@ -190,6 +190,23 @@ test(
   },
 );
 
+test("a lock taken by another process after a killed command released its own is never removed", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  await commitFile(dir, "a.md", "a\n", "a");
+  await writeRel(dir, "b.md", "b\n");
+  await gitOk(["add", "b.md"], { cwd: dir });
+  // --no-verify still runs post-commit, after git has released the index lock:
+  // another process takes the lock while this commit hangs in the hook.
+  const hook = join(dir, ".git", "hooks", "post-commit");
+  await writeFile(hook, "#!/bin/sh\ntouch .git/index.lock\nexec sleep 10\n");
+  await chmod(hook, 0o755);
+  const r = await git(["commit", "-q", "--no-verify", "-m", "b"], { cwd: dir, timeoutMs: 2000 });
+  assert.equal(r.timedOut, true);
+  assert.equal(await exists(join(dir, ".git", "index.lock")), true);
+  assert.doesNotMatch(r.stderr, /removed/);
+});
+
 test("an index.lock that was already there when a killed command started is never removed", async () => {
   const dir = await tempDir();
   await initRepo(dir);
@@ -244,6 +261,34 @@ test("a lock file nobody removes is named in one plain sentence", async () => {
     return true;
   });
   assert.equal(await exists(lock), true);
+});
+
+test("a vault path with an apostrophe is named whole in the lock sentence", async () => {
+  const dir = join(await tempDir(), "Andrea's vault");
+  await initRepo(dir);
+  await commitFile(dir, "a.md", "a\n", "a");
+  const lock = join(dir, ".git", "refs", "heads", "side.lock");
+  await writeFile(lock, "");
+  await assert.rejects(gitOk(["update-ref", "refs/heads/side", "HEAD"], { cwd: dir }), (err: unknown) => {
+    assert.ok(err instanceof GitError);
+    assert.match(err.message, /^git left a lock file behind: '(.+)' /);
+    assert.equal(/^git left a lock file behind: '(.+)' \(a git/.exec(err.message)?.[1], lock);
+    return true;
+  });
+});
+
+test("git's lock wording about a file that does not exist keeps git's own message", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  // A filter prints the lock sentence (naming no real file) and fails for its own reason.
+  await fakeFilter(dir, "exit 1");
+  await writeRel(dir, "a.md", "a\n");
+  await assert.rejects(gitOk(["add", "a.md"], { cwd: dir }), (err: unknown) => {
+    assert.ok(err instanceof GitError);
+    assert.match(err.message, /^git add a\.md exited \d+: /);
+    assert.match(err.message, /clean filter 'fake' failed/);
+    return true;
+  });
 });
 
 test("literal() pathspecs: unstaging a note named a*.md leaves ab.md staged", async () => {
