@@ -194,7 +194,7 @@ mutate(CY, "    await clearInterrupted(input.stateDir);\n    result.liveUpdated 
 mutate(CY, "  await clearInterrupted(input.stateDir);\n  result.blockedBy = blocked;", "  result.blockedBy = blocked;", C, pattern="held-back new note")
 mutate(CY, "  if (!blocked.length) {", "  if (false) {", C, pattern="fails partway")
 mutate(CY, "would be (?:overwritten|removed) by merge", "would be (?:removed) by merge", C, pattern="held-back new note")
-mutate(CY, "  await recordIntent(input.stateDir, live, next);\n", "", C, pattern="fails partway")
+mutate(CY, "  await recordIntent(input.stateDir, live, next);\n  const reset = await git(", "  const reset = await git(", C, pattern="fails partway")
 mutate(CY, "finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) })", "finishInterrupted(input.stateDir, dir)", C, pattern="repair that times out stops")
 # The review fix rounds of Tasks 3, 5 and 6 (2026-09-22): each piece a round added, broken
 # alone, as its implementer checked it by hand.
@@ -357,7 +357,7 @@ mutate(CY, "  await clearInterrupted(input.stateDir);\n  result.blockedBy = bloc
 mutate(CY, "  if (!blocked.length) {", "  if (!blocked.length) {\n    await writeLevel(input.stateDir, 0);", C, pattern=KEPT)
 mutate(CY, "finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) })", "finishInterrupted(input.stateDir, dir, { timeoutMs: ladder.base })", C, runs=5,
        pattern="a repair gets the live update's current limit")
-mutate(CY, '["reset", "-q", "--keep", next], { cwd: dir, timeoutMs: limitOf(ladder) }', '["reset", "-q", "--keep", next], { cwd: dir, timeoutMs: ladder.base }', C, runs=5, pattern=LADDER)
+mutate(CY, "    timeoutMs: limitOf(ladder),\n", "    timeoutMs: ladder.base,\n", C, runs=5, pattern=LADDER)
 mutate(CY, "      if (!(err instanceof RepairTimedOut)) throw err;\n", "      throw err;\n", C, runs=5, pattern=f"{LADDER}|repair that times out stops")
 mutate(CY, "/^[0-6]$/.test(text) ? Number(text) : 0", "Number(text) || 0", C, pattern="cannot be read is the base")
 mutate(CY, "/^[0-6]$/.test(text) ? Number(text) : 0", "/^[0-6]$/.test(text.trim()) ? Number(text.trim()) : 0", C, pattern="cannot be read is the base")
