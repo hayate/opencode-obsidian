@@ -449,3 +449,4 @@ mutate(F_RC, '`${SCRATCH}-${randomBytes(4).toString("hex")}`', "SCRATCH", RC, pa
 mutate(F_RC, "    await sweepScratch(dir);\n", "", RC, pattern="sweeps the scratch worktrees")
 mutate(F_RC, "await rm(join(gitDir, name), { recursive: true, force: true }).catch(() => undefined);", "await rm(join(gitDir, name), { recursive: true, force: true });", RC,
        pattern="leftover the sweep cannot remove never stops a repair")
+mutate(F_RC, "  return Math.round((Date.now() - uptime() * 1000) / 1000) * 1000;", "  return Date.now();", RC, pattern="the boot instant is the same number")

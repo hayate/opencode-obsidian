@@ -1000,6 +1000,19 @@ test("a stopped repair records a file it had removed as nothing there, so a fold
   assert.equal(await readFile(join(dir, "x/b.md"), "utf8"), "old b\n");
 });
 
+// Spec 5.4 step 5 (fix round 2): the boot instant is what makes a recorded group this
+// boot's. It must be the same number throughout a boot, and it can never be later than
+// this process started, or a record would keep counting after a reboot.
+test("the boot instant is the same number at any moment of this boot, and never later than this process started", async () => {
+  const first = bootInstant();
+  await sleep(1100);
+  // The machine booted before this process started, and by now this process has been
+  // running for over a second: an instant that is merely "now" cannot satisfy that.
+  assert.ok(bootInstant() <= Date.now() - process.uptime() * 1000 + 500, `the machine booted before this process: ${bootInstant()}`);
+  // The same number throughout, within the second uptime() is counted in.
+  assert.ok(Math.abs(bootInstant() - first) <= 2000, `the same number a second later: ${first} then ${bootInstant()}`);
+});
+
 // Spec 5.4 step 5 (fix round 2): process groups here are POSIX, so where the platform has
 // none the question cannot be answered and the repair must go ahead rather than wait for
 // ever. CI runs ubuntu and macOS; this pins the answer without a Windows path.
