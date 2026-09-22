@@ -1247,10 +1247,31 @@ test("a secret one hand commit added and the next removed stops the cycle, namin
   assert.equal(r.outcome, "stopped", r.reason ?? "");
   const short = await gitOk(["rev-parse", "--short", added], { cwd: a.projects });
   assert.ok((r.reason ?? "").includes(`"x/by-hand.md" (commit ${short})`), r.reason ?? "");
-  assert.match(r.reason ?? "", /removing the file is not enough/);
+  assert.match(r.reason ?? "", /changing the notes is not enough/);
   assert.match(r.reason ?? "", /drop or amend the one that added it/);
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
   assert.ok(!(await gitOk(["log", "-p", "--all"], { cwd: remote })).includes(TOKEN));
+});
+
+test("a secret in the message of an unsent commit stops the cycle, naming that commit; rewording it lets the next cycle send it", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  await writeRel(a.projects, "x/plain.md", "harmless\n");
+  await gitOk(["add", "-A"], { cwd: a.projects });
+  await gitOk(["commit", "-q", "-m", `a note\n\nthe key is ${TOKEN}`], { cwd: a.projects });
+  const short = await gitOk(["rev-parse", "--short", "HEAD"], { cwd: a.projects });
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "stopped", r.reason ?? "");
+  assert.ok((r.reason ?? "").includes(`in the message of commit ${short}: nothing was pushed`), r.reason ?? "");
+  assert.match(r.reason ?? "", /changing the notes is not enough: rewrite those commits \(for example, drop or amend the one that added it\)/);
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
+  await gitOk(["commit", "-q", "--amend", "-m", "a note"], { cwd: a.projects });
+  const again = await cycle(remote, a);
+  assert.equal(again.outcome, "synced", again.reason ?? "");
+  assert.ok(again.pushed);
+  assert.equal(await remoteFile(remote, "x/plain.md"), "harmless");
+  assert.ok(!(await gitOk(["log", "--all", "--format=%B"], { cwd: remote })).includes(TOKEN));
 });
 
 test("a secret in commits already on the remote is not scanned again: the cycles that bring them into this history sync", async () => {

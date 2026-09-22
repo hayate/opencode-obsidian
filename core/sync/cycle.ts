@@ -7,7 +7,7 @@ import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock, type LockHandle } from "../lock.ts";
-import { EMPTY_TREE, redactUrlCredentials, scanRange, scanStaged } from "../secrets.ts";
+import { EMPTY_TREE, redactUrlCredentials, scanRange, scanStaged, scanText } from "../secrets.ts";
 import { quoted, writeAtomic } from "../store.ts";
 import { ensureStateClone } from "./clone.ts";
 import { conflictStamp } from "./copies.ts";
@@ -331,8 +331,9 @@ async function mergeMessage(clone: string, machine: string, from: string, tree: 
 }
 
 interface OutboundHits {
-  // Flagged in a commit of the vault's own history that the push would send.
-  inCommits: Array<{ file: string; commit: string }>;
+  // Flagged in a commit of the vault's own history that the push would send: in a
+  // file it adds, or in its message (file null).
+  inCommits: Array<{ file: string | null; commit: string }>;
   // Flagged in what the push leaves on the remote (from..to as two trees).
   inTree: string[];
 }
@@ -340,7 +341,8 @@ interface OutboundHits {
 // Spec 5.4 step 3: nothing unscanned leaves the machine. The push sends every commit
 // in from..to, so each one's additions against its first parent go through the
 // step-2 scan (a commit made by hand never met it, and a later commit that removes
-// a secret does not unsend it), and so does the tree the push leaves. Exempt: objects
+// a secret does not unsend it), and so does its message, sent with it; and so does
+// the tree the push leaves. Exempt: objects
 // the remote's tree already holds (a copy of a remote version is inside the trusted
 // remote already, and would otherwise block every cycle). `built` is the commit this
 // cycle made in the state clone, if `to` is one: its first parent is `from`, so its
@@ -360,6 +362,7 @@ async function outboundHits(clone: string, from: string, to: string, built: bool
   for (const line of commits.filter(Boolean)) {
     const [commit = "", parent = EMPTY_TREE] = line.split(" ");
     if (built && commit === to) continue;
+    if (scanText(await gitOk(["log", "-1", "--format=%B", commit], { cwd: clone })).length) inCommits.push({ file: null, commit });
     for (const file of [...(await scanRange(clone, parent, commit)).keys()].sort()) {
       if (!(await exempt(commit, file))) inCommits.push({ file, commit });
     }
@@ -375,11 +378,12 @@ async function outbound(clone: string, input: CycleInput, from: string, to: stri
     // The short hash as git abbreviates it in the vault, where the user rewrites.
     const shown: string[] = [];
     for (const { file, commit } of inCommits.slice(0, MAX_LISTED)) {
-      shown.push(`${quoted(file)} (commit ${await gitOk(["rev-parse", "--short", commit], { cwd: input.projectsDir })})`);
+      const short = await gitOk(["rev-parse", "--short", commit], { cwd: input.projectsDir });
+      shown.push(file === null ? `the message of commit ${short}` : `${quoted(file)} (commit ${short})`);
     }
     return {
       kind: "stopped",
-      reason: `the secret scan flags what this sync would send in ${listed(shown, inCommits.length)}: nothing was pushed. The secret is in commits of Projects/ that were never sent, so removing the file is not enough: rewrite those commits (for example, drop or amend the one that added it), then sync again`,
+      reason: `the secret scan flags what this sync would send in ${listed(shown, inCommits.length)}: nothing was pushed. The secret is in commits of Projects/ that were never sent, so changing the notes is not enough: rewrite those commits (for example, drop or amend the one that added it), then sync again`,
     };
   }
   if (inTree.length) {

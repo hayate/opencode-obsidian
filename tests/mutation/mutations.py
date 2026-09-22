@@ -321,3 +321,6 @@ mutate(CY, (r"/^error: (?:Entry '", r"would lose untracked files in it)$/gm"), (
 mutate(CY, r"(?:Entry '([\s\S]+?)' (?:not uptodate", r"(?:Entry '(.+?)' (?:not uptodate", C, pattern="whose name holds a line break is named")
 # Both scans read renames as git does by default, whatever diff.renames says.
 mutate("core/secrets.ts", '      "--find-renames",\n', "", SEC, pattern="read renames as git does")
+# The outbound scan reads each unsent commit's message too.
+mutate(CY, '    if (scanText(await gitOk(["log", "-1", "--format=%B", commit], { cwd: clone })).length) inCommits.push({ file: null, commit });\n', "", C,
+       pattern="in the message of an unsent commit")
