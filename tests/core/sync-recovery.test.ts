@@ -1022,3 +1022,61 @@ test("where the platform has no process groups the check answers gone, so nothin
   process.kill(-group, "SIGKILL");
   await new Promise((done) => alive.on("exit", done));
 });
+
+// Spec 5.4 step 5 (fix round 2): a repair whose session died goes on writing its scratch
+// worktree. With one fixed path the next repair would delete and recreate that very
+// directory under it, and a partial file could land between the new repair's check and
+// its rename, to be kept as the user's edit and snapshotted.
+const scratches = async (gitDir: string): Promise<string[]> => (await readdir(gitDir)).filter((n) => n.startsWith("sro-repair"));
+
+test("each repair run builds the old version in a scratch worktree of its own, and removes its own when it ends", async () => {
+  const w = await interrupted({}, { stillSlow: true });
+  const gitDir = join(w.dir, ".git");
+  const names: string[] = [];
+  for (let run = 0; run < 2; run++) {
+    const repairing = assert.rejects(finishInterrupted(w.state, w.dir, { timeoutMs: 700 }), RepairTimedOut);
+    const started = Date.now();
+    let seen: string | undefined;
+    while (seen === undefined) {
+      seen = (await scratches(gitDir))[0];
+      assert.ok(Date.now() - started < 10_000, "the repair never made its scratch worktree");
+      if (seen === undefined) await sleep(10);
+    }
+    names.push(seen);
+    await repairing;
+  }
+  for (const name of names) assert.match(name, /^sro-repair-[0-9a-f]{8}$/);
+  assert.notEqual(names[0], names[1], `each run gets a name of its own: ${names.join(", ")}`);
+  assert.deepEqual(await scratches(gitDir), [], "and each run takes its own away");
+});
+
+test("a repair sweeps the scratch worktrees earlier runs left behind, whatever they were named", async () => {
+  const w = await interrupted();
+  const gitDir = join(w.dir, ".git");
+  // What a killed repair leaves: this plugin's earlier fixed name, and a named run of its own.
+  await mkdir(join(gitDir, "sro-repair", "tree", "x"), { recursive: true });
+  await writeFile(join(gitDir, "sro-repair", "tree", "x", "a.md"), "half written\n");
+  await mkdir(join(gitDir, "sro-repair-0badf00d", "tree"), { recursive: true });
+  assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/a.md"], kept: [] });
+  assert.equal(await readFile(join(w.dir, "x/a.md"), "utf8"), "old\n");
+  assert.deepEqual(await scratches(gitDir), []);
+});
+
+test(
+  "a leftover the sweep cannot remove never stops a repair: it builds under a name of its own",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const w = await interrupted();
+    const gitDir = join(w.dir, ".git");
+    const stuck = join(gitDir, "sro-repair-0badf00d");
+    await mkdir(join(stuck, "locked", "inner"), { recursive: true });
+    await chmod(join(stuck, "locked"), 0o555);
+    try {
+      assert.deepEqual(await finishInterrupted(w.state, w.dir), { restored: ["x/a.md"], kept: [] });
+      assert.equal(await readFile(join(w.dir, "x/a.md"), "utf8"), "old\n");
+      assert.deepEqual(await scratches(gitDir), ["sro-repair-0badf00d"], "the one it could not remove stays");
+    } finally {
+      await chmod(join(stuck, "locked"), 0o755);
+    }
+  },
+);

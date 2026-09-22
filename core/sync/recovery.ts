@@ -6,7 +6,7 @@
 // cycle, before its snapshot, puts every path that is still the update's work back
 // to the old version (the update then runs again as usual), and never overwrites a
 // path that changed since: that is the user's edit.
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { uptime } from "node:os";
 import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -341,6 +341,22 @@ async function respell(dir: string, names: string[]): Promise<void> {
   }
 }
 
+// Each repair run builds in a scratch worktree of its own, named at random as the state
+// clone's temporaries are: a repair whose session died goes on writing its own, so one
+// fixed path would let this run delete and recreate the directory under it, and a partial
+// file could land between this run's last check and its rename, to be kept as the user's
+// edit. What earlier runs left is swept when a repair starts, best effort: a leftover
+// that cannot be removed is never a reason to stop sync, and the name here is fresh
+// anyway.
+const SCRATCH = "sro-repair";
+
+async function sweepScratch(dir: string): Promise<void> {
+  const gitDir = await gitOk(["rev-parse", "--absolute-git-dir"], { cwd: dir });
+  for (const name of await readdir(gitDir).catch(() => [] as string[])) {
+    if (name === SCRATCH || name.startsWith(`${SCRATCH}-`)) await rm(join(gitDir, name), { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 // Puts a unit the caller found untouched back to the old version, and says false
 // when it changed while that version was being built (someone's edit, which it then
 // leaves alone) or when something that is not the update's is in the way. What it
@@ -374,7 +390,7 @@ async function setBack(
     for (const rel of unit) left.set(rel, null);
     return true;
   }
-  const scratch = join(await gitOk(["rev-parse", "--absolute-git-dir"], { cwd: dir }), "sro-repair");
+  const scratch = join(await gitOk(["rev-parse", "--absolute-git-dir"], { cwd: dir }), `${SCRATCH}-${randomBytes(4).toString("hex")}`);
   const tree = join(scratch, "tree");
   await rm(scratch, { recursive: true, force: true });
   await mkdir(tree, { recursive: true });
@@ -571,6 +587,7 @@ export async function finishInterrupted(stateDir: string, dir: string, opts: Fin
       `an interrupted vault update cannot be finished: the vault's history moved since it began (git by hand), and its record '${path}' is kept. Check \`git status\` in Projects/: it shows what that update left half done, which sync would send as your own changes. Undo what you did not change yourself, then delete that file to let sync carry on.`,
     );
   } else {
+    await sweepScratch(dir);
     const old = await treeOf(dir, record.from);
     const target = await treeOf(dir, record.to);
     const prints = record.prints ?? {};

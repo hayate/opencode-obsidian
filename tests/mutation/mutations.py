@@ -442,3 +442,9 @@ mutate(CY, "result.waiting = { ...running, hung: running.runningMs > limitOf({ .
 mutate("core/session.ts", "    if (!hung) {", "    if (true) {", SE, pattern="statusFromCycle waits at warn for an update")
 mutate("core/session.ts", "  return seconds < 60 ? `${seconds} s` : `${Math.round(seconds / 60)} min`;", "  return `${seconds} s`;", SE,
        pattern="statusFromCycle waits at warn for an update")
+# Fix round 2: each repair run builds under a name of its own, and sweeps what earlier runs
+# left, best effort.
+mutate(F_RC, '`${SCRATCH}-${randomBytes(4).toString("hex")}`', "SCRATCH", RC, pattern="scratch worktree of its own")
+mutate(F_RC, "    await sweepScratch(dir);\n", "", RC, pattern="sweeps the scratch worktrees")
+mutate(F_RC, "await rm(join(gitDir, name), { recursive: true, force: true }).catch(() => undefined);", "await rm(join(gitDir, name), { recursive: true, force: true });", RC,
+       pattern="leftover the sweep cannot remove never stops a repair")
