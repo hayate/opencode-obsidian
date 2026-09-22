@@ -13,7 +13,7 @@ import { legacyReappeared, schemaVersion, SCHEMA_VERSION } from "./migrate.ts";
 import { normalizeOrigin, recordOrigin, resolveProject, type ProjectResolution } from "./project.ts";
 import { acquireLock } from "./lock.ts";
 import { branchKey, computeHeads, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
-import { runCycle, type CycleResult } from "./sync/cycle.ts";
+import { runCycle, TIMED_OUT, type CycleResult } from "./sync/cycle.ts";
 import type { Conflict } from "./sync/resolve.ts";
 import { remoteVisibility, type Visibility } from "./sync/privacy.ts";
 import { prepareProjects, syncConfig, type SyncConfig, type SyncState } from "./sync/state.ts";
@@ -146,17 +146,25 @@ function duration(ms: number): string {
 
 // Spec 5.4 step 5: a live update, or the repair of one, killed on its limit gets twice
 // the time next, up to the longest limit; one killed even with that escalates to a
-// notify (the adapter notifies on errors), and sync keeps retrying with it. The reason
-// leads, so a problem recorded with it (a failed lock release) still shows. No line
-// says when the retry comes: a cycle runs when an OpenCode session starts.
+// notify (the adapter notifies on errors), and sync keeps retrying with it. It says the
+// next sync tries again, never that it finishes: at the ceiling six timeouts in a row
+// are the normal case. No line says when the retry comes: a cycle runs when an OpenCode
+// session starts. Anything runCycle appended to the reason (a failed lock release) goes
+// last, after the limit, so both read cleanly.
 function unsynced(r: CycleResult): StatusItem {
-  const text = `unsynced: ${r.reason ?? "push did not happen"}`;
-  if (r.timedOut === null) return { level: "warn", text };
+  const said = r.reason ?? "push did not happen";
+  if (r.timedOut === null) return { level: "warn", text: `unsynced: ${said}` };
+  const also = said.startsWith(TIMED_OUT) ? said.slice(TIMED_OUT.length) : `; ${said}`;
   const limit = duration(r.timedOut.nextLimitMs);
-  if (!r.timedOut.ceiling) return { level: "warn", text: `${text}; the next sync finishes it, with its limit doubled to ${limit}` };
+  if (!r.timedOut.ceiling) {
+    return { level: "warn", text: `unsynced: ${TIMED_OUT}; the next sync tries again, with its limit doubled to ${limit}${also}` };
+  }
+  // At the ceiling the repair's checkout is what usually times out, and it knows the note
+  // whose filters it was running; `reset --keep` names none, and none is guessed.
+  const note = r.timedOut.note === null ? "" : ` while it was rewriting ${quoted(r.timedOut.note)}`;
   return {
     level: "error",
-    text: `${text}, even with its longest limit (${limit}). The likely cause is a hung disk, or a smudge filter that never finishes (such as LFS or git-crypt); sync keeps retrying with that limit`,
+    text: `unsynced: ${TIMED_OUT}${note}, even with its longest limit (${limit}). The likely cause is a hung disk, or a smudge filter that never finishes (such as LFS or git-crypt); sync keeps retrying with that limit${also}`,
   };
 }
 

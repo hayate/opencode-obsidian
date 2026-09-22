@@ -176,7 +176,11 @@ test("a repair that times out saves where it got to: the next run finishes, and 
   const w = await interrupted({ "x/0new.txt": "brand new\n" }, { stillSlow: true });
   // The one error that says the repair's own checkout ran past its limit: the cycle
   // takes it for a timeout of the live update (cycle.ts doubles the next limit).
-  await assert.rejects(finishInterrupted(w.state, w.dir, { timeoutMs: 500 }), (err: unknown) => err instanceof RepairTimedOut && /x\/a\.md.*timed out/.test((err as Error).message));
+  await assert.rejects(
+    finishInterrupted(w.state, w.dir, { timeoutMs: 500 }),
+    (err: unknown) =>
+      err instanceof RepairTimedOut && err.name === "RepairTimedOut" && err.path === "x/a.md" && /x\/a\.md.*timed out/.test((err as Error).message),
+  );
   await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: w.dir });
   const done = await finishInterrupted(w.state, w.dir);
   assert.deepEqual(done, { restored: ["x/0new.txt", "x/a.md"], kept: [] });

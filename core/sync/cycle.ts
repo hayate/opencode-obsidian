@@ -49,9 +49,11 @@ export interface CycleResult {
   // Things the user should know that did not stop the cycle.
   notices: string[];
   // Spec 5.4 step 5: the live update, or the repair of one, killed on its limit (the
-  // outcome is unsynced): the limit the next attempt gets, and whether this one already
-  // had the longest, which escalates the status to a notify. Null otherwise.
-  timedOut: { nextLimitMs: number; ceiling: boolean } | null;
+  // outcome is unsynced): the limit the next attempt gets, whether this one already had
+  // the longest, which escalates the status to a notify, and the note it was rewriting
+  // where one is known (the repair's checkout knows it; `reset --keep` names none).
+  // Null otherwise.
+  timedOut: { nextLimitMs: number; ceiling: boolean; note: string | null } | null;
 }
 
 // The remote head this machine last integrated with (spec 5.3).
@@ -206,13 +208,17 @@ async function writeLevel(stateDir: string, level: number): Promise<void> {
   await writeAtomic(join(stateDir, LEVEL), String(level));
 }
 
+// The cycle's own words for it; session.ts says what follows from the limit, and
+// runCycle can append a problem of its own (a failed lock release) to the reason.
+export const TIMED_OUT = "updating the vault timed out";
+
 // A live update or its repair killed on its limit: the next attempt gets the next rung.
-async function timedOut(stateDir: string, ladder: Ladder, result: CycleResult): Promise<void> {
+async function timedOut(stateDir: string, ladder: Ladder, result: CycleResult, note: string | null = null): Promise<void> {
   const next = { ...ladder, level: Math.min(ladder.level + 1, MAX_LEVEL) };
   await writeLevel(stateDir, next.level);
   result.outcome = "unsynced";
-  result.reason = "updating the vault timed out";
-  result.timedOut = { nextLimitMs: limitOf(next), ceiling: ladder.level === MAX_LEVEL };
+  result.reason = TIMED_OUT;
+  result.timedOut = { nextLimitMs: limitOf(next), ceiling: ladder.level === MAX_LEVEL, note };
 }
 
 async function unstage(cwd: string, file: string): Promise<void> {
@@ -624,7 +630,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) });
     } catch (err) {
       if (!(err instanceof RepairTimedOut)) throw err;
-      await timedOut(input.stateDir, ladder, result);
+      await timedOut(input.stateDir, ladder, result, err.path);
       return result;
     }
     if (finished && (finished.restored.length || finished.kept.length)) result.notices.push(describeFinished(finished));

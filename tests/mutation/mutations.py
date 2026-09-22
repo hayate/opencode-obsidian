@@ -369,3 +369,11 @@ mutate(CY, "      await timedOut(input.stateDir, ladder, result);\n      return 
 mutate(F_RC, "err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result) : err", "err", RC, pattern="a repair that times out saves")
 mutate("core/session.ts", "  if (!r.timedOut.ceiling) return", "  if (true) return", SE, pattern="statusFromCycle gives a live update that timed out")
 mutate("core/session.ts", "  if (ms % 60_000 === 0) return `${ms / 60_000} min`;\n", "", SE, pattern="statusFromCycle gives a live update that timed out")
+# Fix round 1: the ceiling names the note the repair was rewriting, and a problem recorded
+# with the reason (a failed lock release) still reaches the line.
+mutate(CY, "await timedOut(input.stateDir, ladder, result, err.path);", "await timedOut(input.stateDir, ladder, result);", C, runs=5,
+       pattern="never finishes climbs|slower than the base limit")
+mutate("core/session.ts", '  const note = r.timedOut.note === null ? "" : ` while it was rewriting ${quoted(r.timedOut.note)}`;',
+       '  const note = "";', SE, pattern="statusFromCycle gives a live update that timed out")
+mutate("core/session.ts", "  const also = said.startsWith(TIMED_OUT) ? said.slice(TIMED_OUT.length) : `; ${said}`;", '  const also = "";', SE,
+       pattern="statusFromCycle gives a live update that timed out")

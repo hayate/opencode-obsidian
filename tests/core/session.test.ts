@@ -293,25 +293,40 @@ test("statusFromCycle gives each conflict one quoted line saying where both vers
 
 // Spec 5.4 step 5: the live update's limit doubles after each timeout, from git.ts's 30 s
 // up to 32 min; a timeout even with 32 min escalates to a notify (the adapter notifies on
-// errors). No time until the retry is promised: a cycle runs when a session starts.
-test("statusFromCycle gives a live update that timed out the next attempt's limit, and escalates one that timed out even with its longest limit to a notify saying why", () => {
+// errors) and names the note the repair was rewriting, if it knows one. No time until the
+// retry is promised: a cycle runs when a session starts.
+test("statusFromCycle gives a live update that timed out the next attempt's limit, and escalates one that timed out even with its longest limit to a notify saying why and naming the note", () => {
   const base = {
     outcome: "unsynced" as const,
     reason: "updating the vault timed out",
     committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
     conflicts: [], embedded: [], caseCollisions: [], notices: [],
   };
-  assert.deepEqual(statusFromCycle({ ...base, timedOut: { nextLimitMs: 60_000, ceiling: false } }), [
-    { level: "warn", text: "unsynced: updating the vault timed out; the next sync finishes it, with its limit doubled to 1 min" },
+  const causes = "The likely cause is a hung disk, or a smudge filter that never finishes (such as LFS or git-crypt); sync keeps retrying with that limit";
+  assert.deepEqual(statusFromCycle({ ...base, timedOut: { nextLimitMs: 60_000, ceiling: false, note: null } }), [
+    { level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 1 min" },
   ]);
-  assert.deepEqual(statusFromCycle({ ...base, timedOut: { nextLimitMs: 1_920_000, ceiling: false } }), [
-    { level: "warn", text: "unsynced: updating the vault timed out; the next sync finishes it, with its limit doubled to 32 min" },
+  assert.deepEqual(
+    statusFromCycle({ ...base, timedOut: { nextLimitMs: 1_920_000, ceiling: false, note: "x/n.md" } }),
+    [{ level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 32 min" }],
+    "below the ceiling the note is not named: the next sync may well finish it",
+  );
+  assert.deepEqual(statusFromCycle({ ...base, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: null } }), [
+    { level: "error", text: `unsynced: updating the vault timed out, even with its longest limit (32 min). ${causes}` },
   ]);
-  assert.deepEqual(statusFromCycle({ ...base, timedOut: { nextLimitMs: 1_920_000, ceiling: true } }), [
-    {
-      level: "error",
-      text: "unsynced: updating the vault timed out, even with its longest limit (32 min). The likely cause is a hung disk, or a smudge filter that never finishes (such as LFS or git-crypt); sync keeps retrying with that limit",
-    },
+  assert.deepEqual(
+    statusFromCycle({ ...base, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: "x/n\n- [info] all fine.md" } }),
+    [{ level: "error", text: `unsynced: updating the vault timed out while it was rewriting "x/n\\n- [info] all fine.md", even with its longest limit (32 min). ${causes}` }],
+    "the note is quoted, so it cannot add a status line",
+  );
+  // A problem runCycle recorded with the reason (a failed lock release) comes last, so
+  // both it and the limit read cleanly.
+  const lock = { ...base, reason: "updating the vault timed out; releasing the sync lock failed: EACCES" };
+  assert.deepEqual(statusFromCycle({ ...lock, timedOut: { nextLimitMs: 60_000, ceiling: false, note: null } }), [
+    { level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 1 min; releasing the sync lock failed: EACCES" },
+  ]);
+  assert.deepEqual(statusFromCycle({ ...lock, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: null } }), [
+    { level: "error", text: `unsynced: updating the vault timed out, even with its longest limit (32 min). ${causes}; releasing the sync lock failed: EACCES` },
   ]);
 });
 

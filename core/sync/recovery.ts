@@ -9,7 +9,7 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { git, GitError, gitOk, literal } from "../git.ts";
+import { git, GitError, gitOk, literal, type GitResult } from "../git.ts";
 import { writeAtomic } from "../store.ts";
 import { fold } from "./copies.ts";
 import { isEffectivelyEmpty, isFinderLitter } from "./state.ts";
@@ -20,8 +20,17 @@ const RECORD = "interrupted-update.json";
 // of the repair that the live update's limit governs, so the cycle takes it for a
 // timeout of the live update (cycle.ts doubles the next limit). Every other error of the
 // repair, a timeout of a git call with the default limit included, is a GitError or an
-// Error as before.
-export class RepairTimedOut extends GitError {}
+// Error as before. It carries the note whose filters it was running, which the status
+// names at the ceiling.
+export class RepairTimedOut extends GitError {
+  readonly path: string;
+
+  constructor(args: string[], result: GitResult, path: string) {
+    super(args, result);
+    this.name = "RepairTimedOut";
+    this.path = path;
+  }
+}
 
 interface Record_ {
   from: string;
@@ -374,7 +383,7 @@ async function setBack(
       ],
       { cwd: tree, env: { GIT_INDEX_FILE: join(scratch, "index") }, timeoutMs },
     ).catch((err: unknown) => {
-      throw err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result) : err;
+      throw err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result, source) : err;
     });
     const built = join(tree, source);
     // The rename keeps the file (inode, mode, bytes), so this is what the path holds after.
