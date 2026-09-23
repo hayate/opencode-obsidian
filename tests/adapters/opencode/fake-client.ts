@@ -35,6 +35,8 @@ export class FakeClient implements OpenCodeClient {
   deleted: string[] = [];
   prompted: Prompted[] = [];
   toasts: Array<{ message: string; variant: string }> = [];
+  // No TUI (headless opencode run): every toast is refused.
+  toastFails = false;
   private next = 0;
 
   constructor(sessions: FakeSession[] = []) {
@@ -73,6 +75,7 @@ export class FakeClient implements OpenCodeClient {
 
   tui: OpenCodeClient["tui"] = {
     showToast: (o) => {
+      if (this.toastFails) return fail({ name: "NoTUI" });
       this.toasts.push({ message: o.body.message, variant: o.body.variant });
       return ok(true);
     },

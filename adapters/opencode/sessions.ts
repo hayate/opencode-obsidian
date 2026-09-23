@@ -1,7 +1,7 @@
 // Spec 7.1-7.2 and 8: what the plugin keeps per OpenCode session. Initialization runs
 // once per top-level session (single-flight), its payload is frozen and re-applied on
 // every transform, and status that arrives later (the background sync, an idle) is
-// appended to the user message that was latest when it arrived.
+// appended to the first user message the model sees after it arrived.
 import { escapeBlockTags, PAYLOAD_MARKER, type StatusItem } from "../../core/inject.ts";
 import { idleSession, initializeSession, syncSession, type InitResult } from "../../core/session.ts";
 import { errorText } from "../../core/store.ts";
@@ -34,6 +34,8 @@ export interface SessionsInput {
 
 interface Note {
   id: number;
+  // The message it sits on, fixed at its first render: a note arriving between turns lands
+  // on the next user message, which no cache holds yet, after the reply it never informed.
   anchor: string | null;
   items: StatusItem[];
   // Rendered into a message at least once: from then on it never changes, or the prompt
@@ -46,19 +48,27 @@ interface Entry {
   // A positive lookup said this is a top-level session. Until one does (the lookup
   // failed), every transform and idle asks again, and a child is dropped when found.
   verified: boolean;
+  // Why the last lookup failed, for the line an idle it skipped leaves.
+  unverifiedWhy: string | null;
   notes: Note[];
   // What the latest report said: a line is new when the report before it did not have
   // it, so a problem that stays is told once, and one that clears and comes back is told
   // again.
   last: Set<string>;
-  latestUser: string | null;
+  // Reports since initialization (idles, remember_sync): the start's own late report,
+  // arriving after one, is older than what they said.
+  reports: number;
+  // The start's late report once it arrived, for remember_sync's answer when memory is off.
+  startLines: StatusItem[];
   idle: Promise<void> | null;
   // An idle that arrived while one ran: one more runs after it, so what the session wrote
   // after the running one's snapshot is not left for the next session start.
   again: boolean;
+  // Lines told once per session whatever the reports say (a model setting, a skipped idle).
+  once: Set<string>;
 }
 
-type Lookup = { kind: "top"; directory: string } | { kind: "child" } | { kind: "unknown" };
+type Lookup = { kind: "top"; directory: string } | { kind: "child" } | { kind: "unknown"; why: string };
 
 const key = (item: StatusItem): string => `${item.level} ${item.text}`;
 
@@ -67,6 +77,19 @@ export function renderStatus(id: number, items: StatusItem[]): string {
 }
 
 const lines = (items: StatusItem[]): string => items.map((s) => `- [${s.level}] ${s.text}`).join("\n");
+
+// What a session gets when initialization itself failed (a bug of the plugin's, since
+// initializeSession never throws): memory off, and the reason where the model reads it.
+function failedInit(bootstrap: string, err: unknown): InitResult {
+  const item: StatusItem = { level: "error", text: `memory initialization failed: ${errorText(err)}` };
+  return {
+    payload: `${PAYLOAD_MARKER}\n${bootstrap.trim()}\n\n## Project and status\n- [${item.level}] ${escapeBlockTags(item.text)}`,
+    status: [item],
+    context: null,
+    background: Promise.resolve([]),
+    settled: Promise.resolve(null),
+  };
+}
 
 export class Sessions {
   private readonly input: SessionsInput;
@@ -81,19 +104,19 @@ export class Sessions {
   }
 
   // Spec 7.1: a task child (it has a parentID) or one of the summarizer's own sessions is
-  // never initialized. Never rejects: a lookup that fails is "unknown".
+  // never initialized. Never rejects: a lookup that fails is "unknown", with why.
   private async lookup(sessionId: string): Promise<Lookup> {
     if (this.input.harness.helpers.has(sessionId) || this.children.has(sessionId)) return { kind: "child" };
     try {
       const r = await this.input.client.session.get({ path: { id: sessionId } });
-      if (r.data === undefined) throw new Error(errorText(r.error));
+      if (r.data === undefined) throw new Error(r.error !== null && typeof r.error === "object" ? JSON.stringify(r.error) : errorText(r.error));
       if (r.data.parentID !== undefined) {
         this.children.add(sessionId);
         return { kind: "child" };
       }
       return { kind: "top", directory: r.data.directory };
-    } catch {
-      return { kind: "unknown" };
+    } catch (err) {
+      return { kind: "unknown", why: errorText(err) };
     }
   }
 
@@ -107,6 +130,7 @@ export class Sessions {
       return false;
     }
     if (found.kind === "top") entry.verified = true;
+    else entry.unverifiedWhy = found.why;
     return true;
   }
 
@@ -116,25 +140,44 @@ export class Sessions {
     this.children.delete(sessionId);
   }
 
-  private start(sessionId: string, directory: string, verified: boolean): Entry {
+  private start(sessionId: string, directory: string, found: Lookup): Entry {
     const existing = this.entries.get(sessionId);
     if (existing) return existing;
-    const init = this.input.harness.model().then(({ name }) =>
-      this.core.initialize({ env: this.input.env, sessionDir: directory, sessionId, harness: this.input.harness, bootstrap: this.input.bootstrap, journalModel: name }),
-    );
-    const entry: Entry = { init, verified, notes: [], last: new Set(), latestUser: null, idle: null, again: false };
+    const { bootstrap, env, harness } = this.input;
+    const init = harness
+      .model()
+      .then(({ name }) => this.core.initialize({ env, sessionDir: directory, sessionId, harness, bootstrap, journalModel: name }))
+      .catch((err: unknown) => failedInit(bootstrap, err));
+    const entry: Entry = {
+      init,
+      verified: found.kind === "top",
+      unverifiedWhy: found.kind === "unknown" ? found.why : null,
+      notes: [],
+      last: new Set(),
+      reports: 0,
+      startLines: [],
+      idle: null,
+      again: false,
+      once: new Set(),
+    };
     this.entries.set(sessionId, entry);
-    void init.then(
-      (result) => {
+    void init
+      .then(async (result) => {
         entry.last = new Set(result.status.map(key));
         this.alert(result.status);
+        const { problem } = await harness.model();
+        if (problem !== null) this.tellOnce(entry, { level: "warn", text: problem });
+        const later = await result.background;
+        entry.startLines = later;
         // An empty background is "nothing more" (initialization finished in time, or its
         // late work had nothing to say), not a report that the problems cleared.
-        return result.background.then((later) => (later.length > 0 ? this.surface(entry, later) : undefined));
-      },
-      // initializeSession never throws; anything that does is the plugin's own bug.
-      (err: unknown) => this.alert([{ level: "error", text: `memory initialization failed: ${errorText(err)}` }]),
-    );
+        if (later.length === 0) return;
+        // After a newer report (an idle, remember_sync) the start's is older news: told as
+        // the start's, and the newer one stays what "new" is measured against.
+        if (entry.reports > 0) this.tell(entry, [{ level: "info", text: "from the sync at this session's start, before the latest one:" }, ...later]);
+        else this.surface(entry, later);
+      })
+      .catch((err: unknown) => this.tell(entry, [{ level: "error", text: `memory status failed: ${errorText(err)}` }]));
     return entry;
   }
 
@@ -145,14 +188,25 @@ export class Sessions {
     }
   }
 
-  // A later report: its new lines become a note on the user message latest now (a status
-  // change costs one cache break from there on).
+  // A note, pinned where it is first rendered (a status change costs one cache break at most).
+  private tell(entry: Entry, items: StatusItem[]): void {
+    if (items.length === 0) return;
+    entry.notes.push({ id: ++this.notesMade, anchor: null, items, delivered: false });
+    this.alert(items);
+  }
+
+  private tellOnce(entry: Entry, item: StatusItem): void {
+    if (entry.once.has(key(item))) return;
+    entry.once.add(key(item));
+    this.tell(entry, [item]);
+  }
+
+  // A later report: its new lines become a note, and it is the latest report.
   private surface(entry: Entry, items: StatusItem[]): void {
     const fresh = items.filter((item) => !entry.last.has(key(item)));
     entry.last = new Set(items.map(key));
-    if (fresh.length === 0) return;
-    entry.notes.push({ id: ++this.notesMade, anchor: entry.latestUser, items: fresh, delivered: false });
-    this.alert(fresh);
+    entry.reports++;
+    this.tell(entry, fresh);
   }
 
   async transform(messages: Message[]): Promise<void> {
@@ -168,18 +222,17 @@ export class Sessions {
       // second finds the first's entry. A failed lookup initializes in the plugin's
       // directory, as upstream superpowers injects when its lookup fails (memory in a child
       // is a cost, none in a real session is a loss), and the next transform asks again.
-      entry = this.start(sessionId, found.kind === "top" ? found.directory : this.input.directory, found.kind === "top");
+      entry = this.start(sessionId, found.kind === "top" ? found.directory : this.input.directory, found);
     }
     const result = await entry.init;
     const latest = messages.findLast((m) => m.info.role === "user") ?? first;
-    entry.latestUser = latest.info.id;
     const ref = first.parts[0];
     if (ref && !first.parts.some((p) => p.type === "text" && p.text?.includes(PAYLOAD_MARKER))) {
       first.parts.unshift({ id: ref.id, sessionID: ref.sessionID, messageID: ref.messageID, type: "text", text: result.payload });
     }
     for (const note of entry.notes) {
-      // A note that arrived before any message was seen, or whose message a compaction
-      // removed, sits on the latest user message, and stays there from then on.
+      // A note sits on the user message latest at its first render, and stays there; one
+      // whose message a compaction removed moves once, to the latest.
       let at = note.anchor === null ? undefined : messages.find((m) => m.info.id === note.anchor);
       if (!at) {
         at = latest;
@@ -195,8 +248,8 @@ export class Sessions {
   }
 
   // Spec 8: idle, best effort, for a verified session whose memory is on once initialization
-  // has settled (its background work included, so the two never race for the locks). One at
-  // a time; an idle during one runs once more after it.
+  // has settled (its pull, so the two never race for the locks). One at a time; an idle during
+  // one runs once more after it, even when the running one failed.
   async idle(sessionId: string): Promise<void> {
     const entry = this.entries.get(sessionId);
     if (!entry) return;
@@ -204,21 +257,27 @@ export class Sessions {
       entry.again = true;
       return entry.idle;
     }
+    const once = async (): Promise<void> => {
+      if (!(await this.confirm(sessionId, entry))) return;
+      if (!entry.verified) {
+        const why = entry.unverifiedWhy ?? "no answer";
+        this.tellOnce(entry, { level: "warn", text: `idle sync and journal skipped: this session could not be looked up (${why}); they run once a lookup succeeds` });
+        return;
+      }
+      const ctx = await (await entry.init).settled;
+      if (ctx === null) return;
+      const { name } = await this.input.harness.model();
+      this.surface(entry, await this.core.idle(ctx, { harness: this.input.harness, sessionId, journalModel: name }));
+    };
     const run = async (): Promise<void> => {
       do {
         entry.again = false;
-        if (!(await this.confirm(sessionId, entry)) || !entry.verified) return;
-        const ctx = await (await entry.init).settled;
-        if (ctx === null) return;
-        const { name } = await this.input.harness.model();
-        this.surface(entry, await this.core.idle(ctx, { harness: this.input.harness, sessionId, journalModel: name }));
-      } while (entry.again);
+        await once().catch((err: unknown) => this.surface(entry, [{ level: "error", text: `idle sync failed: ${errorText(err)}` }]));
+      } while (entry.again && this.entries.get(sessionId) === entry);
     };
-    entry.idle = run()
-      .catch((err: unknown) => this.surface(entry, [{ level: "error", text: `idle sync failed: ${errorText(err)}` }]))
-      .finally(() => {
-        entry.idle = null;
-      });
+    entry.idle = run().finally(() => {
+      entry.idle = null;
+    });
     await entry.idle;
   }
 
@@ -229,13 +288,22 @@ export class Sessions {
     if (!entry) return "memory is not initialized in this session (remember_sync runs in the session the memory was loaded into, not in a subagent)";
     const result = await entry.init;
     const ctx = await result.settled;
-    // Memory off: the answer is why, which the session may also have queued as a note.
-    const items =
-      ctx === null
-        ? result.context === null
-          ? result.status
-          : [...result.status, ...(await result.background)]
-        : await this.core.sync(ctx, { adoptRewrite });
+    if (ctx === null) {
+      // Memory off: nothing ran, and the answer never waits for the start's late report
+      // (behind the journal's model calls): what is known now is all it gives.
+      const known = [...result.status, ...entry.startLines];
+      this.bookkeep(entry, known, false);
+      return `remember_sync did not run: memory is off in this session, for the reason below.\n${lines(known)}`;
+    }
+    const items = await this.core.sync(ctx, { adoptRewrite });
+    this.bookkeep(entry, items, true);
+    return items.length === 0 ? "synced: nothing to report" : lines(items);
+  }
+
+  // The tool's answer told the model these lines: out of notes not delivered yet (never out
+  // of delivered ones), and a report like any other; a toast only for what is new and only
+  // when the answer is a sync's (memory off: the user was told when it happened).
+  private bookkeep(entry: Entry, items: StatusItem[], toast: boolean): void {
     const told = new Set(items.map(key));
     for (const note of entry.notes) {
       if (!note.delivered) note.items = note.items.filter((item) => !told.has(key(item)));
@@ -243,7 +311,7 @@ export class Sessions {
     entry.notes = entry.notes.filter((note) => note.items.length > 0);
     const fresh = items.filter((item) => !entry.last.has(key(item)));
     entry.last = told;
-    if (ctx !== null) this.alert(fresh); // memory off: the user was told when it happened
-    return ctx !== null && items.length === 0 ? "synced: nothing to report" : lines(items);
+    entry.reports++;
+    if (toast) this.alert(fresh);
   }
 }

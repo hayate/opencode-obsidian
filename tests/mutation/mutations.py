@@ -691,36 +691,50 @@ OS = "adapters/opencode/sessions.ts"; AS = "tests/adapters/opencode/sessions.tes
 mutate(OS, "    if (this.input.harness.helpers.has(sessionId) || this.children.has(sessionId)) return", "    if (this.children.has(sessionId)) return", AS, pattern="summarizer's own sessions")
 mutate(OS, "      if (r.data.parentID !== undefined) {", "      if (false) {", AS, pattern="task child")
 mutate(OS, "        this.children.add(sessionId);\n", "", AS, pattern="looked up once")
-mutate(OS, 'found.kind === "top" ? found.directory : this.input.directory, found.kind === "top"', 'found.kind === "top" ? found.directory : this.input.directory, true', AS, pattern="failed lookup")
+mutate(OS, 'found.kind === "top" ? found.directory : this.input.directory, found);', 'found.kind === "top" ? found.directory : "", found);', AS, pattern="plugin's directory")
+mutate(OS, '      verified: found.kind === "top",\n', "      verified: true,\n", AS, pattern="is a child")
 mutate(OS, '    if (found.kind === "child") {\n      this.entries.delete(sessionId);', '    if (found.kind === "child") {\n      void 0;', AS, pattern="is a child")
 mutate(OS, '    if (found.kind === "top") entry.verified = true;\n', "", AS, pattern="confirmed by a later one")
-mutate(OS, "        if (!(await this.confirm(sessionId, entry)) || !entry.verified) return;", "        if (!(await this.confirm(sessionId, entry))) return;", AS, pattern="is a child")
+mutate(OS, "      if (!entry.verified) {", "      if (false) {", AS, pattern="is a child|could not be looked up")
 # Single-flight initialization, and the payload once per message list.
 mutate(OS, "    const existing = this.entries.get(sessionId);\n    if (existing) return existing;\n", "", AS, pattern="initialized once")
 mutate(OS, ' && !first.parts.some((p) => p.type === "text" && p.text?.includes(PAYLOAD_MARKER))', "", AS, pattern="payload goes first")
 # Spec 7.2: later status, told when new, where it arrived, and errors to the user.
 mutate(OS, "  private surface(entry: Entry, items: StatusItem[]): void {\n    const fresh = items.filter((item) => !entry.last.has(key(item)));", "  private surface(entry: Entry, items: StatusItem[]): void {\n    const fresh = items;", AS, pattern="stays is told once")
-mutate(OS, "    entry.last = new Set(items.map(key));\n    if (fresh.length === 0) return;", "    if (fresh.length === 0) return;", AS, pattern="stays is told once")
+mutate(OS, "    entry.last = new Set(items.map(key));\n    entry.reports++;", "    entry.reports++;", AS, pattern="stays is told once")
 mutate(OS, "        entry.last = new Set(result.status.map(key));\n", "", AS, pattern="never shown again")
-mutate(OS, "(later) => (later.length > 0 ? this.surface(entry, later) : undefined)", "(later) => this.surface(entry, later)", AS, pattern="never shown again")
+mutate(OS, "        if (later.length === 0) return;\n", "", AS, pattern="never shown again")
 mutate(OS, "`${STATUS_MARKER} ${id} -->`", "`${STATUS_MARKER} -->`", AS, pattern="stays is told once")
 mutate(OS, ' && !at.parts.some((p) => p.type === "text" && p.text === text)', "", AS, pattern="stays there")
-mutate(OS, "    entry.latestUser = latest.info.id;\n", "", AS, pattern="stays there")
 mutate(OS, '      if (item.level === "error") void', "      void", AS, pattern="stays there")
 mutate(OS, "        note.anchor = latest.info.id;\n", "", AS, pattern="compaction")
 # Idle: settled first, one at a time, and once more for an idle that came during one.
 mutate(OS, "      entry.again = true;\n", "", AS, pattern="one at a time")
-mutate(OS, "        if (ctx === null) return;\n", "", AS, pattern="settle")
-mutate(OS, "        const ctx = await (await entry.init).settled;", "        const ctx = (await entry.init).context;", AS, pattern="settle")
+mutate(OS, "      if (ctx === null) return;\n", "", AS, pattern="settle")
+mutate(OS, "      const ctx = await (await entry.init).settled;", "      const ctx = (await entry.init).context;", AS, pattern="settle")
 # remember_sync: undelivered notes lose what it said, delivered ones never change, and its
 # lines are the latest report.
 mutate(OS, "      if (!note.delivered) note.items = note.items.filter", "      note.items = note.items.filter", AS, pattern="already delivered")
 mutate(OS, "      note.delivered = true;\n", "", AS, pattern="already delivered")
 mutate(OS, "      if (!note.delivered) note.items = note.items.filter((item) => !told.has(key(item)));\n", "", AS, pattern="not delivered yet")
 mutate(OS, "    entry.last = told;\n", "", AS, pattern="adopt option")
-mutate(OS, "    // Memory off: the answer is why, which the session may also have queued as a note.\n",
-       "    if (ctx === null) return lines(result.context === null ? result.status : [...result.status, ...(await result.background)]);\n", AS, pattern="pull disabled memory is taken out")
-mutate(OS, "    if (ctx !== null) this.alert(fresh);", "    this.alert(fresh);", AS, pattern="pull disabled memory is taken out")
+mutate(OS, "      this.bookkeep(entry, known, false);\n", "", AS, pattern="pull disabled memory is taken out")
+mutate(OS, "    if (toast) this.alert(fresh);", "    this.alert(fresh);", AS, pattern="pull disabled memory is taken out")
+# Gauntlet fix pass: a failed initialization is a session with memory off, the init chain never
+# leaves a rejection unhandled, the start's late report is labelled after a newer one, a skipped
+# idle and a model setting are told once, a failed idle still runs the queued one, memory off
+# never waits on the journal, a refused toast is harmless, and notes escape the block's tags.
+mutate(OS, "      .catch((err: unknown) => failedInit(bootstrap, err));\n", "      ;\n", AS, pattern="rejected initialization")
+mutate(OS, "      .catch((err: unknown) => this.tell(entry, [{ level: \"error\", text: `memory status failed: ${errorText(err)}` }]));", "      .catch((err: unknown) => { throw err; });", AS, pattern="background that rejects")
+mutate(OS, "        if (entry.reports > 0) this.tell(", "        if (false) this.tell(", AS, pattern="start's own report")
+mutate(OS, "    entry.reports++;\n    this.tell(entry, fresh);", "    this.tell(entry, fresh);", AS, pattern="start's own report")
+mutate(OS, "    if (entry.once.has(key(item))) return;\n", "", AS, pattern="could not be looked up")
+mutate(OS, "        this.tellOnce(entry, { level: \"warn\", text: `idle sync and journal skipped", "        void ({ level: \"warn\", text: `idle sync and journal skipped", AS, pattern="could not be looked up")
+mutate(OS, "        if (problem !== null) this.tellOnce(entry, { level: \"warn\", text: problem });\n", "", AS, pattern="not provider/model is told once")
+mutate(OS, "        await once().catch((err: unknown) => this.surface(entry, [{ level: \"error\", text: `idle sync failed: ${errorText(err)}` }]));", "        await once();", AS, pattern="fails still runs")
+mutate(OS, "      const known = [...result.status, ...entry.startLines];", "      const known = [...result.status, ...(await result.background)];", AS, pattern="without waiting for the journal")
+mutate(OS, '      if (item.level === "error") void this.input.harness.notify(item.text).catch(() => undefined);', '      if (item.level === "error") void this.input.harness.notify(item.text);', AS, pattern="no toast can be shown")
+mutate(OS, "${escapeBlockTags(s.text)}`)].join", "${s.text}`)].join", AS, pattern="shaped like the memory block")
 mutate(OS, "  forget(sessionId: string): void {\n    this.entries.delete(sessionId);", "  forget(sessionId: string): void {\n    void 0;", AS, pattern="deleted session")
 
 # The OpenCode adapter (spec 8): its entry.
