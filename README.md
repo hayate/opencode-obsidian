@@ -1,74 +1,168 @@
 # opencode-superpower-obsidian
 
-A bundle of skills that use an Obsidian vault as opencode's single home for
-memory, handoffs, specs, plans, decisions, and notes.
+An OpenCode plugin and a bundle of skills that use an Obsidian vault as
+OpenCode's single home for memory, handoffs, specs, plans, decisions, and notes.
+The plugin loads each project's memory into the session and keeps the vault's
+`Projects/` folder in sync across machines; the skills carry the process.
 
 ## Installation
 
-1. Install the bundle into opencode's skills directory:
+1. Clone the repository into OpenCode's skills directory and install its
+   dependencies:
 
    ```
    git clone https://github.com/<your-fork>/opencode-superpower-obsidian \
      ~/.config/opencode/skills/opencode-superpower-obsidian
+   cd ~/.config/opencode/skills/opencode-superpower-obsidian && npm ci
    ```
 
-   Or place the `opencode-superpower-obsidian/` directory anywhere opencode
-   scans for skills (e.g. `~/.config/opencode/skills/`, `~/.claude/skills/`,
-   or `~/.agents/skills/`).
+2. Load the same folder as a plugin: add it to the `plugin` list in
+   `~/.config/opencode/opencode.jsonc`, as an absolute `file://` path:
 
-2. Set the `OBSIDIAN_VAULT_PATH` environment variable to the absolute path of
-   your Obsidian vault directory. For example, add this to your shell profile
-   (`~/.zshrc` on macOS):
+   ```
+   "plugin": ["file:///Users/you/.config/opencode/skills/opencode-superpower-obsidian"]
+   ```
+
+   To choose the model that writes the journal (see the cost note below), use
+   the two-element form instead:
+
+   ```
+   "plugin": [["file:///Users/you/.config/opencode/skills/opencode-superpower-obsidian", { "journalModel": "provider/model" }]]
+   ```
+
+3. Set `OBSIDIAN_VAULT_PATH` to the absolute path of your Obsidian vault (the
+   folder holding `.obsidian/`), for example in `~/.zshrc`:
 
    ```
    export OBSIDIAN_VAULT_PATH="/path/to/your/Obsidian Vault"
    ```
 
-   This variable is required. The skills read it at runtime and fail loudly if
-   it is unset or unreachable, so set it before relying on the bundle.
+   Without it the plugin still loads, and every session says, at the top, that
+   memory and sync are disabled.
 
-3. (Optional) Set the `OBSIDIAN_PROJECTS_REMOTE` environment variable to the
-   URL or path of a git repository that will hold your `Projects/` content.
-   This variable acts as the on/off switch for cross-machine syncing: if it is
-   unset or empty, sync is off and nothing is pushed or pulled; if it is
-   nonempty, sync is on. Create the repo yourself (a bare repo, a GitHub repo,
-   or similar), then:
+4. (Optional) Set `OBSIDIAN_PROJECTS_REMOTE` to a **private** git repository that
+   will hold `Projects/`. It is the on/off switch for syncing across machines:
+   unset or empty means off; a URL or path means on. Create the repository
+   yourself (a private GitHub repository, or a bare repository on a machine you
+   control):
 
    ```
    export OBSIDIAN_PROJECTS_REMOTE="git@github.com:you/oso-projects.git"
    ```
 
-   Acceptable values are any URL or path `git` can push to, most commonly:
+   SSH is the simplest: your SSH keys cover clone, pull, and push. HTTPS works
+   when you have HTTPS credentials set up (a token, Git Credential Manager, or
+   the GitHub CLI). A local bare path works on a filesystem the machine reaches
+   directly. Every machine should point at the same repository.
 
-   - SSH (recommended): `git@github.com:you/oso-projects.git` or
-     `ssh://host/path/to/projects.git`. Uses your SSH keys for clone, pull,
-     and push - one setup, everything works.
-   - HTTPS: `https://github.com/you/oso-projects.git`. Public repositories can
-     normally be cloned and fetched anonymously; private repositories and every
-     push require HTTPS authentication (a personal access token, Git Credential
-     Manager, or GitHub CLI auth) - SSH keys do not cover HTTPS. Use HTTPS only
-     if you have that authentication set up, otherwise clone and push will fail.
-   - Local bare path: `/path/to/projects.git`. Works when the repo is on a
-     filesystem the machine can reach directly.
+   The remote is trusted with everything in `Projects/`: keep it private. For a
+   github.com remote, the plugin checks at every session start and refuses to
+   sync to a public repository; for any other host, privacy is up to you.
 
-   The trailing `.git` is optional on GitHub but include it to be unambiguous
-   on other hosts.
+5. Restart OpenCode.
 
-   On first use, opencode clones this repo into `<vault>/Projects/`. On each
-   session start it pulls, and after each edit under `Projects/` it commits and
-   pushes. Every machine you use should set this to the same repo so they stay
-   in sync. If the repo is freshly created and empty, opencode initializes it
-   with the first commit.
+## How sync works
 
-4. Restart opencode so it picks up the new skills and the environment variables.
+The plugin syncs `Projects/` when a session starts and, best effort, when it
+goes idle: it commits what changed (after a secret scan), integrates what other
+machines pushed, and pushes. This happens in main sessions whose memory is on,
+never in subagents. An idle first writes the session's journal entry, then
+waits a moment so the notes just written are complete, then syncs; headless
+`opencode run` can exit before an idle finishes, in which case the next
+session's start sends what it left. On a machine's first session it clones
+the remote into `Projects/`, or, when the remote is empty, fills it from the
+`Projects/` already there. A note changed on two machines keeps both versions:
+yours at the path, the other beside it as a conflict copy, and the session's
+status says where both are.
 
-The `Projects/` directory (and its per-project subfolders) is created
-automatically by opencode on first use if it does not already exist - you do
-not need to create it yourself.
+Sync runs only inside OpenCode sessions. A machine you use only to read in
+Obsidian stays behind until OpenCode runs there, or until you pull by hand:
+
+```
+git -C "$OBSIDIAN_VAULT_PATH/Projects" pull --ff-only
+```
+
+What each sync did appears as status lines at the top of the session. Errors
+also appear as a toast in the TUI. Headless `opencode run` has no toast: there
+the status reaches only the model, and the next session's start.
+
+The journal is written by a model call from the plugin: the `journalModel`
+option, else OpenCode's `small_model`, else its default model. Each idle session
+is journaled at most once every ten minutes; choose a small, cheap model if your
+default is an expensive one.
+
+## Procedures
+
+### The vault's own repository tracks `Projects/`
+
+`Projects/` is its own repository, so a vault that is itself a git repository
+must not track it; the plugin refuses to sync until it does not. Untracking is
+a commit to the vault's repository, and every machine that pulls that commit
+has git **delete** its copy of `Projects/`. So do it in this order, and do not
+let any machine pull the vault in between (turn off automatic vault syncing,
+such as the Obsidian Git plugin, on every machine first):
+
+1. On every machine, copy `Projects/` somewhere outside the vault, as a backup.
+2. On one machine (the one with the most complete notes), with
+   `OBSIDIAN_PROJECTS_REMOTE` set to a new, empty, private repository:
+
+   ```
+   echo "Projects/" >> .gitignore
+   git rm -r --cached Projects
+   git commit -m "Stop tracking Projects/ (synced on its own)"
+   git push
+   ```
+
+   Then start an OpenCode session there: the plugin imports `Projects/` into
+   the empty remote. Check the remote has the notes before going on.
+3. On each other machine, with OpenCode closed there, and **before** pulling
+   the vault: move `Projects/` out of the vault
+   (`mv Projects ../Projects.before-sync`, or anywhere outside), pull the vault
+   (there is now nothing for the pull to delete), set
+   `OBSIDIAN_PROJECTS_REMOTE`, and start an OpenCode session: the plugin clones
+   `Projects/` from the remote. Close OpenCode again and compare the two:
+
+   ```
+   diff -rq "$OBSIDIAN_VAULT_PATH/Projects" ../Projects.before-sync
+   ```
+
+   Copy in every file only the backup has. For every file both have with
+   different contents (the same note edited on two machines before sync
+   existed), merge the backup's version into the clone's copy by hand, or keep
+   it beside the note under another name. Then start a session: the sync sends
+   what you copied and merged.
+4. Delete the backups only when every machine has done step 3 and its merges
+   are on the remote (open one merged note on another machine after its next
+   session start). Then turn vault syncing back on.
+
+### Two folders claim the same repository
+
+Two machines that first used a repository under different clone names, before
+either synced, each create a folder for it. The plugin then disables memory for
+that repository and names both folders. Quit OpenCode on every machine, move the
+notes of one folder into the other, delete the emptied folder (its
+`remember/.origin` included), and start a session: the next sync sends the
+merge.
+
+### A repository was renamed
+
+A folder records its repository's origin in `remember/.origin`, and a session
+finds its folder by that origin first. After a rename no folder holds the new
+origin. If your clone still has the old folder's name, the plugin disables
+memory (that folder belongs to another origin); if the clone's name changed
+too, it starts a new folder under the new name. To keep one folder,
+quit OpenCode on every machine, then, before the next session: replace the one
+line in the old folder's `remember/.origin` with the new origin, written the
+way the file already writes it (for example `github.com/you/new-name`), rename
+the folder if you want the new name, and delete any new folder a session
+already started (moving its notes in first). The next sync sends it all
+together.
 
 ## Troubleshooting
 
 - **Projects don't appear in Obsidian after the first clone.** Obsidian may not
-  pick up the freshly cloned `Projects/` directory until it is restarted. If
-  the files are on disk but missing from Obsidian's file explorer, quit and
-  reopen Obsidian.
+  pick up the freshly cloned `Projects/` directory until it is restarted. Quit
+  and reopen Obsidian.
+- **A session says memory and sync are disabled.** The line says why: the
+  vault variable is missing or points at a folder without `.obsidian/`, the
+  repository is bare, or one of the procedures above applies.
