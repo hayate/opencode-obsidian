@@ -38,7 +38,7 @@ mutate("core/git.ts", "  const paths = RETRIED_ON_INDEX_LOCK.has(sub) ? await in
 mutate("core/git.ts", "if (result.code === 0 || result.timedOut) return false;", "if (result.code === 0) return false;", G)
 mutate("core/git.ts", "  return lock !== null && (await exists(lock));\n}", "  return true;\n}", G)
 # Literal pathspecs at every path core passes.
-mutate("core/sync/cycle.ts", '["reset", "-q", "--", literal(file)]', '["reset", "-q", "--", file]', C, pattern='unstages only itself')
+mutate("core/sync/cycle.ts", '["reset", "-q", "--no-refresh", "--", literal(file)]', '["reset", "-q", "--no-refresh", "--", file]', C, pattern='unstages only itself')
 mutate("core/sync/cycle.ts", '"--cached", "--", literal(rel)]', '"--cached", "--", rel]', C, pattern='keeps a\\.md tracked', **CASE)
 mutate("core/sync/cycle.ts", '"-f", "--", literal(path)]', '"-f", "--", path]', C, pattern='untracks only itself|named like pathspec magic')
 mutate("core/migrate.ts", '"--", literal(rel)]', '"--", rel]', M)
@@ -589,3 +589,15 @@ mutate("core/session.ts", "/[\\p{Cc}\\p{Cf}\\u2028\\u2029]+/gu", "/[\\p{Cc}\\u20
 mutate(CY, "  const stillDirty = await scanStaged(dir);\n  if (stillDirty.size) {", "  const stillDirty = new Map<string, unknown>();\n  if (false) {", C,
        pattern="a held-back file stays dirty and does not block", survives=("linux", "darwin"),
        why="defence in depth: it fires only if `git reset -- <path>` leaves a flagged addition staged, which it cannot, since scanStaged pins the diff's prefixes so the path it flags is the path the unstage names")
+
+# A2 (round 2): `git reset` refreshes the index, and the refresh hashes the worktree through
+# the vault's clean filters (measured, git 2.50.1). The three index-only resets carry
+# --no-refresh, which suppresses that and still unstages.
+NO_REFRESH = "runs no clean filter"
+mutate(CY, '["reset", "-q", "--no-refresh", "--", literal(file)]', '["reset", "-q", "--", literal(file)]', C, pattern=NO_REFRESH)
+mutate(CY, '    // --no-refresh, as at the unstage above: this rollback is index-only.\n    await gitOk(["reset", "-q", "--no-refresh"], { cwd: dir });\n    result.outcome = "aborted";\n    result.reason = identity;',
+       '    await gitOk(["reset", "-q"], { cwd: dir });\n    result.outcome = "aborted";\n    result.reason = identity;', C, pattern=NO_REFRESH)
+mutate(CY, '    // --no-refresh, as at the unstage above: this rollback is index-only.\n    await gitOk(["reset", "-q", "--no-refresh"], { cwd: dir });\n    result.outcome = "aborted";\n    result.reason = `the secret scan could not hold back',
+       '    await gitOk(["reset", "-q"], { cwd: dir });\n    result.outcome = "aborted";\n    result.reason = `the secret scan could not hold back', C,
+       pattern="a held-back file stays dirty and does not block", survives=("linux", "darwin"),
+       why="the rollback it guards is behind the stillDirty branch, which nothing can make fire (see the declared survivor above); the same flag on the sibling rollback is caught")

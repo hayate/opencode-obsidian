@@ -252,8 +252,15 @@ async function timedOut(stateDir: string, ladder: Ladder, result: CycleResult, n
   result.timedOut = { nextLimitMs: limitOf(next), ceiling: ladder.level === MAX_LEVEL, note };
 }
 
+// --no-refresh: `git reset` refreshes the index, and the refresh hashes the worktree
+// through the vault's clean filters (measured, git 2.50.1: this form and the pathless one
+// below both run them; --no-refresh suppresses them in both and still unstages). This
+// call is index-only by intent, so the filter has no business here at all: with it, a
+// filter slower than git.ts's fixed limit aborted every cycle that held a note back,
+// outside the ladder's reach. Not running it beats running it with a bigger limit.
+// git 2.37 and later have the flag; the plugin requires 2.47.
 async function unstage(cwd: string, file: string): Promise<void> {
-  await gitOk(["reset", "-q", "--", literal(file)], { cwd });
+  await gitOk(["reset", "-q", "--no-refresh", "--", literal(file)], { cwd });
 }
 
 async function rev(cwd: string, ref: string): Promise<string | null> {
@@ -356,7 +363,8 @@ async function snapshot(input: CycleInput, ladder: Ladder, result: CycleResult):
   // pins the diff's prefixes; this should never trigger.
   const stillDirty = await scanStaged(dir);
   if (stillDirty.size) {
-    await gitOk(["reset", "-q"], { cwd: dir });
+    // --no-refresh, as at the unstage above: this rollback is index-only.
+    await gitOk(["reset", "-q", "--no-refresh"], { cwd: dir });
     result.outcome = "aborted";
     result.reason = `the secret scan could not hold back ${[...stillDirty.keys()]
       .sort()
@@ -370,7 +378,8 @@ async function snapshot(input: CycleInput, ladder: Ladder, result: CycleResult):
 
   const identity = await identityProblem(dir);
   if (identity) {
-    await gitOk(["reset", "-q"], { cwd: dir });
+    // --no-refresh, as at the unstage above: this rollback is index-only.
+    await gitOk(["reset", "-q", "--no-refresh"], { cwd: dir });
     result.outcome = "aborted";
     result.reason = identity;
     return { ok: false, pushAllowed: false };

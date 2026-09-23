@@ -2291,6 +2291,50 @@ test("the snapshot's `git add -A` under a clean filter slower than the base limi
   assert.equal(await rung(b), "2", "no live update ran, so the limit is left where it was");
 });
 
+// A2 (round 2, 2026-09-23): `git reset` refreshes the index, and the refresh hashes the
+// worktree through the vault's clean filters. Measured with real git 2.50.1: both
+// `git reset -q -- <path>` and a pathless `git reset -q` run them, and `--no-refresh`
+// suppresses them in both forms while still unstaging. The plugin's three index-only
+// resets ran on git.ts's fixed limit, outside the ladder, so a filter slower than it
+// aborted the cycle there every time, one call past the two the ladder now covers.
+
+// A clean filter that records every time it runs, on the paths `attribute` names, and the
+// way to read how many times that was.
+async function countingFilter(x: Machine, attribute: string): Promise<() => Promise<number>> {
+  const marker = join(await tempDir(), "runs");
+  await writeFile(marker, "");
+  await gitOk(["config", "filter.count.clean", `echo ran >> '${marker}'; cat`], { cwd: x.projects });
+  await writeFile(join(x.projects, ".git", "info", "attributes"), `${attribute} filter=count\n`);
+  return async () => (await readFile(marker, "utf8")).split("\n").filter(Boolean).length;
+}
+
+test("the unstage of a held-back note runs no clean filter: the index-only resets are index-only", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  const runs = await countingFilter(a, "x/t.md");
+  await writeRel(a.projects, "x/t.md", `t0\ntoken ${TOKEN}\n`);
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "synced", r.reason ?? "");
+  assert.deepEqual(r.heldBack, [{ file: "x/t.md", rules: ["github-token"] }]);
+  assert.equal(await runs(), 1, "`git add -A` hashed the note once, and the unstage never hashed it again");
+  assert.equal(await gitOk(["diff", "--cached", "--name-only"], { cwd: a.projects }), "", "and the note is unstaged");
+  assert.equal(await read(a, "x/t.md"), `t0\ntoken ${TOKEN}\n`, "left where the user wrote it");
+});
+
+test("the rollback that a missing identity forces runs no clean filter either, and still unstages", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  const runs = await countingFilter(a, "x/t.md");
+  await writeRel(a.projects, "x/t.md", "edited on a\n");
+  await gitOk(["config", "user.name", ""], { cwd: a.projects });
+  await gitOk(["config", "user.email", ""], { cwd: a.projects });
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "aborted", r.reason ?? "");
+  assert.match(r.reason ?? "", /user\.name/);
+  assert.equal(await runs(), 1, "`git add -A` hashed the note once, and the rollback never hashed it again");
+  assert.equal(await gitOk(["diff", "--cached", "--name-only"], { cwd: a.projects }), "", "and the rollback still unstaged everything");
+});
+
 // Spec 5.4 step 5 (fix round 1, 2026-09-23): git runs in its own process group, and its
 // kill timer lives in this process, so an update outlives the session that started it.
 // A cycle that repaired and snapshotted while it ran would set its notes back under it
