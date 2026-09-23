@@ -12,14 +12,14 @@ test("parseModel splits at the first slash, and refuses a value with no provider
 test("the journal model is the option, else small_model, else the default model, else none named", async () => {
   const client = new FakeClient();
   client.cfg = { model: "a/default", small_model: "a/small" };
-  assert.deepEqual(await new OpenCodeHarness(client, "b/option").model(), { name: "b/option", ref: { providerID: "b", modelID: "option" } });
-  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "a/small", ref: { providerID: "a", modelID: "small" } });
+  assert.deepEqual(await new OpenCodeHarness(client, "b/option").model(), { name: "b/option", ref: { providerID: "b", modelID: "option" }, problem: null });
+  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "a/small", ref: { providerID: "a", modelID: "small" }, problem: null });
   client.cfg = { model: "a/default" };
-  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "a/default", ref: { providerID: "a", modelID: "default" } });
+  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "a/default", ref: { providerID: "a", modelID: "default" }, problem: null });
   client.cfg = {};
-  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "the default model", ref: null });
-  client.cfg = null; // the config cannot be read: OpenCode's default, never a failure (D7)
-  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "the default model", ref: null });
+  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "the default model", ref: null, problem: null });
+  client.cfg = null; // the config cannot be read: OpenCode's default, never a failure (D7), and told
+  assert.equal((await new OpenCodeHarness(client, undefined).model()).ref, null);
 });
 
 test("callModel runs in a child session with every tool off (by wildcard and by id), returns the text, and deletes the helper", async () => {
@@ -100,12 +100,13 @@ test("readTranscript keeps everything after the given message in order: text, an
 });
 
 test("a tool still running in the last message is left for the next read, so its result is journaled when it arrives", async () => {
-  const running = { info: { id: "m2", role: "assistant", time: { created: 2 } }, parts: [{ type: "tool", tool: "bash", state: { status: "running", input: { command: "make" } } }] as PartLike[] };
+  const running = { info: { id: "m2", role: "assistant", time: { created: 2 } as { created: number; completed?: number } }, parts: [{ type: "tool", tool: "bash", state: { status: "running", input: { command: "make" } } }] as PartLike[] };
   const client = new FakeClient([{ id: "ses_a", directory: "/code", messages: [{ info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "build it" }] }, running] }]);
   const harness = new OpenCodeHarness(client, undefined);
   const first = await harness.readTranscript("ses_a");
   assert.deepEqual(first.messages.map((m) => m.id), ["m1"], "the checkpoint stays before the running call");
   running.parts[0] = { type: "tool", tool: "bash", state: { status: "completed", input: { command: "make" }, output: "built" } };
+  running.info.time.completed = 3; // the step ended
   assert.deepEqual((await harness.readTranscript("ses_a", "m1")).messages.map((m) => m.text), ['bash {"command":"make"}: built']);
 });
 
@@ -121,4 +122,41 @@ test("listSessions maps a missing parent to null, and notify shows an error toas
   ]);
   await harness.notify("sync stopped: x");
   assert.deepEqual(client.toasts, [{ message: "sync stopped: x", variant: "error" }]);
+});
+
+test("a last assistant message still streaming is left for the next read; its whole text is journaled once complete", async () => {
+  const streaming = { info: { id: "m2", role: "assistant", time: { created: 2 } as { created: number; completed?: number } }, parts: [{ type: "text", text: "Starting" }] as PartLike[] };
+  const client = new FakeClient([{ id: "ses_a", directory: "/code", messages: [{ info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: "decide" }] }, streaming] }]);
+  const harness = new OpenCodeHarness(client, undefined);
+  assert.deepEqual((await harness.readTranscript("ses_a")).messages.map((m) => m.id), ["m1"]);
+  streaming.info.time.completed = 3;
+  streaming.parts = [{ type: "text", text: "Starting. Decided: ship it" }];
+  assert.deepEqual((await harness.readTranscript("ses_a", "m1")).messages.map((m) => m.text), ["Starting. Decided: ship it"]);
+});
+
+test("an SDK failure names the HTTP status, even with an empty body", async () => {
+  const client = new FakeClient();
+  client.session.list = () => Promise.resolve({ error: {}, response: { status: 503 } });
+  await assert.rejects(new OpenCodeHarness(client, undefined).listSessions(), /listing sessions failed: HTTP 503/);
+});
+
+test("a journal model that is not provider/model is told, and the entry does not claim it ran", async () => {
+  const client = new FakeClient();
+  const chosen = await new OpenCodeHarness(client, "haiku").model();
+  assert.equal(chosen.ref, null);
+  assert.match(chosen.name, /^haiku \(not provider\/model: OpenCode's default model ran\)$/);
+  assert.match(chosen.problem ?? "", /journalModel "haiku" is not provider\/model/);
+  client.cfg = { small_model: "nomodel" };
+  assert.match((await new OpenCodeHarness(client, undefined).model()).problem ?? "", /small_model "nomodel" is not provider\/model/);
+});
+
+test("a config that cannot be read is told, and read again next time", async () => {
+  const client = new FakeClient();
+  client.cfg = null;
+  const harness = new OpenCodeHarness(client, undefined);
+  const first = await harness.model();
+  assert.equal(first.ref, null);
+  assert.match(first.problem ?? "", /the OpenCode config could not be read/);
+  client.cfg = { small_model: "p/small" };
+  assert.deepEqual(await harness.model(), { name: "p/small", ref: { providerID: "p", modelID: "small" }, problem: null });
 });

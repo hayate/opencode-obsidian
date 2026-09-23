@@ -5,7 +5,7 @@ import { errorText } from "../../core/store.ts";
 
 // What an SDK call resolves to when it does not throw: data, or an error (the SDK's
 // default). Only the fields the adapter reads are named.
-type Result<T> = Promise<{ data?: T; error?: unknown }>;
+type Result<T> = Promise<{ data?: T; error?: unknown; response?: { status: number } }>;
 
 export type PartLike = { type: string; text?: string; tool?: string; state?: { status: string; input?: unknown; output?: string; error?: string } };
 export type ModelRef = { providerID: string; modelID: string };
@@ -16,7 +16,7 @@ export interface OpenCodeClient {
   session: {
     get(o: { path: { id: string } }): Result<{ id: string; directory: string; parentID?: string }>;
     list(): Result<Array<{ id: string; directory: string; parentID?: string; time: { updated: number } }>>;
-    messages(o: { path: { id: string } }): Result<Array<{ info: { id: string; role: string; time: { created: number } }; parts: PartLike[] }>>;
+    messages(o: { path: { id: string } }): Result<Array<{ info: { id: string; role: string; time: { created: number; completed?: number } }; parts: PartLike[] }>>;
     create(o: { body: { parentID: string; title: string } }): Result<{ id: string }>;
     prompt(o: {
       path: { id: string };
@@ -33,7 +33,9 @@ async function data<T>(call: Result<T>, what: string): Promise<T> {
   const r = await call;
   if (r.error !== undefined || r.data === undefined) {
     const why = r.error === undefined ? "no data" : typeof r.error === "object" ? JSON.stringify(r.error) : errorText(r.error);
-    throw new Error(`${what} failed: ${why}`);
+    // An empty-bodied failure reads as {}: the status is what says anything then.
+    const status = r.response?.status === undefined ? "" : `HTTP ${r.response.status} `;
+    throw new Error(`${what} failed: ${status}${why}`);
   }
   return r.data;
 }
@@ -45,6 +47,20 @@ export function parseModel(value: string | undefined): ModelRef | null {
   return { providerID: value.slice(0, at), modelID: value.slice(at + 1) };
 }
 
+// The journal's model: its name as the entries record it, the reference the prompt names
+// (null: OpenCode's default), and what is wrong with the setting, if anything.
+export type Chosen = { name: string; ref: ModelRef | null; problem: string | null };
+
+function named(setting: string, value: string): Chosen {
+  const ref = parseModel(value);
+  if (ref !== null) return { name: value, ref, problem: null };
+  return {
+    name: `${value} (not provider/model: OpenCode's default model ran)`,
+    ref: null,
+    problem: `${setting} "${value}" is not provider/model, so OpenCode's default model writes the journal`,
+  };
+}
+
 export class OpenCodeHarness implements Harness {
   // The summarizer's own sessions: never initialized, never journaled (spec 7.1). Each
   // also has its parentID set, which is how sessions.ts skips task children; this set is
@@ -52,7 +68,7 @@ export class OpenCodeHarness implements Harness {
   readonly helpers = new Set<string>();
   private readonly client: OpenCodeClient;
   private readonly option: string | undefined;
-  private chosen: Promise<{ name: string; ref: ModelRef | null }> | null = null;
+  private chosen: Promise<Chosen> | null = null;
 
   constructor(client: OpenCodeClient, journalModelOption: string | undefined) {
     this.client = client;
@@ -60,17 +76,25 @@ export class OpenCodeHarness implements Harness {
   }
 
   // D7: the journalModel option, else OpenCode's small_model, else its default model, all
-  // read from the resolved config (a value such as "{env:X}/m" is substituted there).
-  // None of them set is not a failure: the prompt then names no model and OpenCode uses
-  // its own default. Read once per process.
-  model(): Promise<{ name: string; ref: ModelRef | null }> {
-    this.chosen ??= (async () => {
-      if (this.option !== undefined) return { name: this.option, ref: parseModel(this.option) };
-      // A config that cannot be read leaves OpenCode's own default, which the entry then
-      // names: the journal is best effort and never fails for lack of a model (D7).
-      const cfg = await data(this.client.config.get(), "reading the OpenCode config").catch(() => ({ model: undefined, small_model: undefined }));
-      const name = cfg.small_model ?? cfg.model;
-      return name === undefined ? { name: "the default model", ref: null } : { name, ref: parseModel(name) };
+  // read from the resolved config (a value such as "{env:X}/m" is substituted there). None of
+  // them set is not a failure: the prompt then names no model and OpenCode uses its own
+  // default. A value that is not provider/model is told (`problem`), and the name the journal
+  // records says OpenCode's default ran. Read once per process, unless the config could not be
+  // read: that is told and read again next time.
+  model(): Promise<Chosen> {
+    this.chosen ??= (async (): Promise<Chosen> => {
+      if (this.option !== undefined) return named("journalModel", this.option);
+      const read = await data(this.client.config.get(), "reading the OpenCode config").then(
+        (cfg) => ({ cfg, problem: null }),
+        (err: unknown) => ({ cfg: { model: undefined, small_model: undefined }, problem: `the OpenCode config could not be read (${errorText(err)}); the journal uses OpenCode's default model this time` }),
+      );
+      if (read.problem !== null) {
+        this.chosen = null;
+        return { name: "the default model", ref: null, problem: read.problem };
+      }
+      if (read.cfg.small_model !== undefined) return named("small_model", read.cfg.small_model);
+      if (read.cfg.model !== undefined) return named("model", read.cfg.model);
+      return { name: "the default model", ref: null, problem: null };
     })();
     return this.chosen;
   }
@@ -108,8 +132,9 @@ export class OpenCodeHarness implements Harness {
       if (text.trim() === "") throw new Error("the summarizer returned no text");
       return text;
     } finally {
-      // Housekeeping only: a helper left behind is a child session, which catch-up and
-      // initialization both skip. Its id is kept until the session is gone.
+      // Housekeeping only: a helper left behind (the delete failed, or its answer did) is a
+      // child session, which catch-up and initialization both skip by its parentID, so its
+      // id is let go once the delete was tried.
       await this.client.session.delete({ path: { id: created.id } }).catch(() => undefined);
       this.helpers.delete(created.id);
     }
@@ -122,10 +147,12 @@ export class OpenCodeHarness implements Harness {
   async readTranscript(sessionId: string, afterMessageId?: string): Promise<TranscriptChunk> {
     const all = await data(this.client.session.messages({ path: { id: sessionId } }), `reading session ${sessionId}`);
     const from = afterMessageId === undefined ? 0 : all.findIndex((m) => m.info.id === afterMessageId) + 1;
-    // A tool still running in the session's last message is left for the next read: the
-    // journal keeps its place by message, so reading it now would move past a result that
-    // has not arrived. One in an earlier message never will (the conversation went on).
+    // The session's last message is left for the next read while it is still going (an
+    // assistant message not completed, still streaming, or a tool still running): the journal
+    // keeps its place by message, so reading it now would move past what has not arrived. An
+    // earlier message never will finish (the conversation went on).
     const running = (m: (typeof all)[number]): boolean =>
+      (m.info.role === "assistant" && m.info.time.completed === undefined) ||
       m.parts.some((p) => p.type === "tool" && p.state !== undefined && p.state.status !== "completed" && p.state.status !== "error");
     const last = all.at(-1);
     const to = last !== undefined && running(last) ? all.length - 1 : all.length;

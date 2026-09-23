@@ -672,7 +672,13 @@ mutate(OH, "      await this.client.session.delete({ path: { id: created.id } })
 mutate(OH, "      if (reply.info.error !== undefined) throw", "      if (false) throw", AH, pattern="provider's failure")
 mutate(OH, '      if (text.trim() === "") throw', "      if (false) throw", AH, pattern="provider's failure")
 # D7's order.
-mutate(OH, "const name = cfg.small_model ?? cfg.model;", "const name = cfg.model ?? cfg.small_model;", AH)
+mutate(OH, '      if (read.cfg.small_model !== undefined) return named("small_model", read.cfg.small_model);\n', "", AH, pattern="the option, else small_model")
+# A setting that is not provider/model is told, and a config read that failed is read again.
+mutate(OH, "    name: `${value} (not provider/model: OpenCode's default model ran)`,", "    name: value,", AH, pattern="not provider/model")
+mutate(OH, "        this.chosen = null;\n", "", AH, pattern="read again next time")
+# A last message still going is read later; SDK failures name their HTTP status.
+mutate(OH, '      (m.info.role === "assistant" && m.info.time.completed === undefined) ||\n', "", AH, pattern="still streaming")
+mutate(OH, '    const status = r.response?.status === undefined ? "" : `HTTP ${r.response.status} `;', '    const status = "";', AH, pattern="HTTP status")
 # The transcript after the last journaled message: in order, failures and unfinished calls kept.
 mutate(OH, 'all.findIndex((m) => m.info.id === afterMessageId) + 1', "0", AH, pattern="readTranscript")
 mutate(OH, '            : p.state.status === "error"', '            : false', AH, pattern="readTranscript")
