@@ -417,7 +417,7 @@ async function prepare(vault: Vault, cfg: SyncConfig, timezone: string): Promise
   if (await vaultTracksProjects(vault.root)) {
     return {
       kind: "stopped",
-      reason: "the vault's own git repository tracks Projects/; follow the README migration steps before enabling sync",
+      reason: "the vault's own git repository tracks Projects/; follow the README's procedure \"The vault's own repository tracks Projects/\" before enabling sync",
     };
   }
 

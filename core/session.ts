@@ -653,13 +653,17 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
   }
 }
 
-// Spec 8: remember_sync, and the sync half of idle. One prepared cycle now; `adoptRewrite`
-// is the tool's "adopt the rewritten remote". Never to a remote this session's privacy
-// check found public, and never throws: a failure is a status line.
-export async function syncSession(ctx: SessionContext, opts: { adoptRewrite?: boolean } = {}): Promise<StatusItem[]> {
+// Spec 8: remember_sync, and the sync half of idle. One prepared cycle, once the quiet window
+// has passed: the cycle defers a file written in the last QUIET_MS as a write in progress, and
+// what this session just wrote (the fix remember_sync follows, the note of a session's last
+// turn) is what it must send. `adoptRewrite` is the tool's "adopt the rewritten remote". Never
+// to a remote this session's privacy check found public, and never throws: a failure is a
+// status line.
+export async function syncSession(ctx: SessionContext, opts: { adoptRewrite?: boolean; quietMs?: number } = {}): Promise<StatusItem[]> {
   try {
     const vis = await ctx.privacy;
     if (ctx.remote && vis?.visibility === "public") return statusFromPrivacy(ctx.remote, vis);
+    await new Promise((resolve) => setTimeout(resolve, opts.quietMs ?? QUIET_MS + 500));
     const run = await prepareAndCycle({
       vault: ctx.vault,
       cfg: { remote: ctx.remote },
@@ -681,7 +685,7 @@ export const JOURNAL_WAIT_MS = 120_000;
 // (journal.ts's cooldown applies, so most idles write none), then, where sync is on, a sync
 // once the quiet window has passed, so the entry and the note the session wrote in its last
 // turn both go with it rather than wait, deferred as writes in progress, for the next
-// session start. The journal is a model call, and one that never answers must not hold the
+// session start (syncSession waits that window). The journal is a model call, and one that never answers must not hold the
 // sync: past JOURNAL_WAIT_MS the sync goes ahead, and the entry is written whenever the call
 // ends. Never throws: a failure is a status line.
 export async function idleSession(
@@ -721,6 +725,5 @@ export async function idleSession(
     clearTimeout(timer);
   }
   if (ctx.remote === null) return out;
-  await new Promise((resolve) => setTimeout(resolve, opts.quietMs ?? QUIET_MS + 500));
-  return [...out, ...(await syncSession(ctx))];
+  return [...out, ...(await syncSession(ctx, { quietMs: opts.quietMs }))];
 }

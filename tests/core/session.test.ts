@@ -546,6 +546,12 @@ test(
     });
     assert.match(r.status.map((s) => s.text).join("\n"), /sync refused/);
     await assert.rejects(stat(join(vaultRoot, "Projects", ".git")));
+    // The session still has a context (a non-git session directory is a project too), and no
+    // later sync in it may go where initialization refused to.
+    if (r.context) {
+      assert.match((await syncSession(r.context, { quietMs: 0 })).map((s) => s.text).join("\n"), /sync refused/);
+      await assert.rejects(stat(join(vaultRoot, "Projects", ".git")));
+    }
   },
 );
 
@@ -1138,7 +1144,7 @@ test("idleSession journals this session once per cooldown, then syncs the entry 
   const w = await world();
   const harness = new ListedHarness([]);
   const ctx = await initialized(w, { harness });
-  await writeEarlier(join(w.vaultRoot, "Projects"), "kabin-api/notes/idle.md", "written before idle\n");
+  await writeRel(join(w.vaultRoot, "Projects"), "kabin-api/notes/idle.md", "written in the session's last turn\n");
   const now = () => new Date("2026-09-21T07:00:00Z");
   const items = await idleSession(ctx, { harness, sessionId: "ses_current", journalModel: "fake/model", now });
   assert.deepEqual(items.filter((s) => s.level !== "info"), [], items.map((s) => s.text).join("\n"));
@@ -1218,4 +1224,22 @@ test("a journal call that fails after the idle stopped waiting for it is let go,
   } finally {
     process.off("unhandledRejection", onRejection);
   }
+});
+
+test("the session's context carries the privacy check initialization made, for its later syncs", async () => {
+  const w = await world();
+  const r = await initializeSession(opts(w));
+  assert.ok(r.context);
+  const verdict = await r.context.privacy;
+  assert.equal(verdict?.visibility, "not-github", "the one check, not a stand-in");
+  assert.deepEqual(verdict, await remoteVisibility(w.remote));
+});
+
+test("remember_sync right after a note is written sends it: the sync waits past the quiet window", async () => {
+  const w = await world();
+  const ctx = await initialized(w);
+  await writeRel(join(w.vaultRoot, "Projects"), "kabin-api/notes/just-written.md", "fixed a moment ago\n");
+  const items = await syncSession(ctx);
+  assert.deepEqual(items.filter((s) => s.level !== "info"), [], items.map((s) => s.text).join("\n"));
+  assert.ok(await remoteHas(w.remote, "kabin-api/notes/just-written.md"), "not deferred as a write in progress");
 });

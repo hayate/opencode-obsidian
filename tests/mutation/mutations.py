@@ -653,7 +653,8 @@ mutate("core/session.ts", "  if (ctx.remote === null) return out;\n", "", SE, pa
 mutate("core/session.ts", "    opts.sessionId,\n  );\n  try {", "    `${opts.sessionId}-x`,\n  );\n  try {", SE, pattern="once per cooldown")
 # The journal is bounded: past the wait the sync goes ahead, says so, and a late failure is let go.
 mutate("core/session.ts", "      out.push({ level: \"warn\", text: `journal: the model did not answer within", "      void ({ level: \"warn\", text: `journal: the model did not answer within", SE, pattern="never answers syncs anyway")
-mutate("core/session.ts", "  await new Promise((resolve) => setTimeout(resolve, opts.quietMs ?? QUIET_MS + 500));\n", "", SE, pattern="past the quiet window")
+mutate("core/session.ts", "    await new Promise((resolve) => setTimeout(resolve, opts.quietMs ?? QUIET_MS + 500));\n", "", SE, pattern="right after a note is written|past the quiet window")
+mutate("core/session.ts", "      remote: cfg.remote,\n      privacy,\n", "      remote: cfg.remote,\n      privacy: Promise.resolve(null),\n", SE, pattern="carries the privacy check")
 mutate("core/session.ts", "later.kind === \"ok\" && later.name === ctx.project ? { ...ctx", "later.kind === \"ok\" ? { ...ctx", SE, pattern="maps to another folder")
 mutate("core/session.ts", "    shared.resolved = project;\n    markPulled();\n", "    shared.resolved = project;\n", SE, pattern="does not wait for the journal")
 mutate("core/session.ts", "? { ...ctx, timezone: started.shared.timezone } : null", "? ctx : null", SE, pattern="settled context carries the zone")
