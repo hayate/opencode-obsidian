@@ -3,6 +3,7 @@
 import type { Handoff, Heads } from "./store.ts";
 import { MALFORMED_BRANCH, vaultName } from "./store.ts";
 import type { JournalEntry } from "./journal.ts";
+import { escapeTag, tagPattern } from "./tags.ts";
 
 export const PAYLOAD_MARKER = "<!-- superpower-remember-obsidian:memory -->";
 export const DEFAULT_BUDGET = 24_000;
@@ -30,15 +31,13 @@ export interface PayloadInput {
   budgetChars?: number;
 }
 
-// Any spelling a reader could take for the data block's own tags (case, spaces,
-// invisible characters, "_" for "-", look-alike angle brackets).
-const BLOCK_TAG = /[<\uFE64\uFF1C][\s\p{Cf}]*\/?[\s\p{Cf}]*recorded[\s\p{Cf}_-]*project[\s\p{Cf}_-]*memory/giu;
+const BLOCK_TAG = tagPattern("recorded", "project", "memory");
 
 // The block's tags appear only where buildPayload writes them. Anywhere else the
 // tag's "<" is escaped, so recorded text can neither end the block early nor
 // open one of its own; the text stays readable.
 export function escapeBlockTags(text: string): string {
-  return text.replace(BLOCK_TAG, (tag) => `&lt;${tag.slice(1)}`);
+  return escapeTag(text, BLOCK_TAG);
 }
 
 // Escaped before it is cut: a cut through the middle of a tag would leave a
