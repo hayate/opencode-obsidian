@@ -111,6 +111,19 @@ async function gitVersionProblem(cwd: string): Promise<string | null> {
   return `sync needs git ${MIN_GIT_TEXT} or newer, and this machine has ${major}.${minor}: upgrade git, then start a new session`;
 }
 
+// Case twins (Note.md and note.md, a case-only rename) are one file where the disk
+// ignores case, which git records at init as core.ignorecase (unset: case matters).
+// Exit 1 is git's own answer that the setting is not there; every other failure is a
+// failure, and throws. Read as "case matters", a failed lookup would make the cycle miss
+// every case-only rename in silence and suppress the collision warning with it, and would
+// make the repair judge case twins as separate files.
+export async function ignoresCase(dir: string): Promise<boolean> {
+  const r = await git(["config", "--type=bool", "--get", "core.ignorecase"], { cwd: dir });
+  if (r.code === 1 && !r.timedOut) return false;
+  if (r.code !== 0 || r.timedOut) throw new Error(`git config core.ignorecase failed: ${r.stderr.trim() || (r.timedOut ? "timed out" : `exit ${r.code}`)}`);
+  return r.stdout.trim() === "true";
+}
+
 export async function identityProblem(repo: string): Promise<string | null> {
   const name = await git(["config", "user.name"], { cwd: repo });
   const email = await git(["config", "user.email"], { cwd: repo });

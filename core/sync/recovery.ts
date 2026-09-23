@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { git, GitError, gitOk, literal, type GitResult } from "../git.ts";
 import { writeAtomic } from "../store.ts";
 import { fold } from "./copies.ts";
-import { isEffectivelyEmpty, isFinderLitter } from "./state.ts";
+import { ignoresCase, isEffectivelyEmpty, isFinderLitter } from "./state.ts";
 
 const RECORD = "interrupted-update.json";
 
@@ -146,15 +146,6 @@ async function treeOf(dir: string, commit: string): Promise<Map<string, Entry>> 
     entries.set(line.slice(tab + 1), { mode, oid });
   }
   return entries;
-}
-
-// Case twins (Note.md and note.md, a case-only rename) are one file where the disk
-// ignores case, which git records at init as core.ignorecase (unset: case matters).
-async function ignoresCase(dir: string): Promise<boolean> {
-  const r = await git(["config", "--type=bool", "--get", "core.ignorecase"], { cwd: dir });
-  if (r.code === 1 && !r.timedOut) return false;
-  if (r.code !== 0 || r.timedOut) throw new Error(`git config core.ignorecase failed: ${r.stderr.trim() || (r.timedOut ? "timed out" : `exit ${r.code}`)}`);
-  return r.stdout.trim() === "true";
 }
 
 // The changed paths as the disk holds them: case twins are one file, judged and set

@@ -13,7 +13,7 @@ import { ensureStateClone } from "./clone.ts";
 import { conflictStamp } from "./copies.ts";
 import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, RepairTimedOut, runningUpdate, type Finished } from "./recovery.ts";
 import { mergeAndResolve, type Conflict } from "./resolve.ts";
-import { identityProblem } from "./state.ts";
+import { identityProblem, ignoresCase } from "./state.ts";
 
 export interface CycleInput {
   projectsDir: string;
@@ -151,7 +151,7 @@ async function onDisk(dir: string, rel: string, listings: Map<string, string[]>)
 // runs the note's clean filter, so it takes the live update's limit like the snapshot's
 // own `add -A` (the caller classifies a timeout of either).
 async function stageCaseRenames(dir: string, timeoutMs: number): Promise<string[]> {
-  if ((await git(["config", "--bool", "core.ignorecase"], { cwd: dir })).stdout.trim() !== "true") return [];
+  if (!(await ignoresCase(dir))) return [];
   const tracked = await zList(dir, ["ls-files"]);
   const { ambiguous, collisions } = caseAmbiguous(tracked);
   const listings = new Map<string, string[]>();
@@ -177,9 +177,25 @@ async function dropEmbeddedRepos(dir: string): Promise<string[]> {
   return links;
 }
 
-// Spec 5.4 step 5 escalates after 3 blocked live updates in a row.
+// Spec 5.4 step 5 escalates after this many blocked live updates in a row (session.ts
+// says it louder at the threshold).
+export const ESCALATE_AT = 3;
+
+// The streak, or 0 when there is none yet. Only a count this code wrote reads as itself:
+// digits, nothing else, as readLadder reads its own file. A file that is not there is
+// "never blocked yet"; one that is there but cannot be read, or holds anything else, is
+// not, and reading it as 0 would silence the escalation the user needs for as long as it
+// stays that way. It counts as the rung below the threshold instead, so the next blocked
+// cycle escalates; every cycle that runs rewrites the file, so it costs at most that one.
 async function readBlocked(stateDir: string): Promise<number> {
-  return Number(await readFile(join(stateDir, "blocked-cycles"), "utf8").catch(() => "0")) || 0;
+  let text: string;
+  try {
+    text = await readFile(join(stateDir, "blocked-cycles"), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    return ESCALATE_AT - 1;
+  }
+  return /^[0-9]{1,9}$/.test(text) ? Number(text) : ESCALATE_AT - 1;
 }
 
 async function writeBlocked(stateDir: string, count: number): Promise<void> {
@@ -462,8 +478,17 @@ async function outboundHits(clone: string, from: string, to: string, built: bool
     remoteObjects ??= zList(clone, ["ls-tree", "-r", from]).then(
       (lines) => new Set(lines.map((line) => line.slice(0, line.indexOf("\t")).split(" ")[2])),
     );
-    const oid = (await git(["rev-parse", "-q", "--verify", `${commit}:${file}`], { cwd: clone })).stdout.trim();
-    return (await remoteObjects).has(oid);
+    // The lookup must answer: `file` is in `commit` (the scan found it added there), so a
+    // non-zero exit is git's failure, never an absent path. Read as "not exempt" it would
+    // tell the user to rewrite history for a secret the remote already holds; read as
+    // "exempt" it would let one through. Neither: the cycle stops, saying which lookup
+    // failed, and nothing is pushed.
+    const r = await git(["rev-parse", "-q", "--verify", `${commit}:${file}`], { cwd: clone });
+    if (r.code !== 0 || r.timedOut) {
+      const detail = firstLines(r.stderr) || (r.timedOut ? "timed out" : `git exited ${r.code}`);
+      throw new Error(`the secret scan could not look up ${quoted(file)} in a commit this sync would send (${detail}): nothing was pushed`);
+    }
+    return (await remoteObjects).has(r.stdout.trim());
   };
   const inCommits: OutboundHits["inCommits"] = [];
   let generatedMessage = false;
@@ -649,6 +674,9 @@ async function updateLive(clone: string, input: CycleInput, live: string, next: 
     // cycle finishes it before its snapshot (recovery.ts), with the next rung.
     await recordInterrupted(input.stateDir, dir, live, next);
     await timedOut(input.stateDir, ladder, result);
+    // git.ts removed, or could not remove, the index.lock this killed reset left (spec
+    // 5.6). Without it the status promises a retry that would abort at `git add -A`.
+    if (reset.lockNote) result.notices.push(reset.lockNote);
     return;
   }
   // git's check before it writes anything refuses the whole update and nothing changed.

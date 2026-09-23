@@ -9,6 +9,10 @@ export interface GitResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  // Spec 5.6: set when this call was killed on its timeout and left an index.lock that
+  // git() then removed, or could not remove. The caller shows it: a retry the user is
+  // promised would otherwise abort at the next `git add`, with no hint of why.
+  lockNote?: string;
 }
 
 export interface GitOptions {
@@ -261,6 +265,7 @@ export async function git(args: string[], opts: GitOptions): Promise<GitResult> 
         (err: Error) => `could not remove ${lock}, which this command left when it was stopped: ${err.message}`,
       );
       result.stderr += `${result.stderr && !result.stderr.endsWith("\n") ? "\n" : ""}${note}\n`;
+      result.lockNote = note;
     }
     if (attempt >= INDEX_LOCK_RETRIES || !(await metIndexLock(result, paths?.lock ?? null))) return result;
     await new Promise((resolve) => setTimeout(resolve, INDEX_LOCK_DELAY_MS));

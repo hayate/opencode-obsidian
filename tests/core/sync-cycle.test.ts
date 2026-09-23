@@ -1071,6 +1071,57 @@ test("a blocked live update counts consecutive cycles, for the escalation at 3",
 // Spec 5.4 step 5 counts blocked cycles in a row: any other cycle that runs breaks the streak.
 const streak = (x: Machine): Promise<string> => readFile(join(x.state, "blocked-cycles"), "utf8");
 
+// C3 (the gauntlet fix wave): the streak's file read as 0 whenever it could not be read at
+// all, so the escalation the user needs could never fire while it stayed that way. A file
+// that is not there is "never blocked yet"; one that is there and unreadable is not.
+test("a blocked-cycle count that cannot be read escalates rather than silently starting the streak again", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(b.projects, "x/t.md", `t0\ntoken ${TOKEN}\n`);
+  await writeRel(a.projects, "x/t.md", "t-from-a\n");
+  await cycle(remote, a);
+  // Nothing there yet: this cycle is the first of the streak.
+  const first = await cycle(remote, b);
+  assert.deepEqual(first.blockedBy, ["x/t.md"], first.reason ?? "");
+  assert.equal(first.blockedCycles, 1);
+  assert.equal(statusFromCycle(first).at(-1)?.level, "warn");
+  for (const garbled of ["", "x", "-1", "2.5", " 2", "2\n", "12345678901"]) {
+    await writeRel(b.state, "blocked-cycles", garbled);
+    const r = await cycle(remote, b);
+    assert.equal(r.blockedCycles, 3, JSON.stringify(garbled));
+    assert.equal(statusFromCycle(r).at(-1)?.level, "error", JSON.stringify(garbled));
+    assert.match(statusFromCycle(r).at(-1)?.text ?? "", /\(3 cycles in a row\)$/);
+  }
+  // A count this code wrote still reads as itself.
+  for (const [written, reads] of [["0", 1], ["4", 5], ["999999999", 1000000000]] as Array<[string, number]>) {
+    await writeRel(b.state, "blocked-cycles", written);
+    assert.equal((await cycle(remote, b)).blockedCycles, reads, written);
+  }
+});
+
+test(
+  "a blocked-cycle count that is there but cannot be opened escalates too",
+  { skip: process.getuid?.() === 0 ? "root ignores file permissions" : false },
+  async () => {
+    const { remote, m } = await setup(["a", "b"]);
+    const [a, b] = m as [Machine, Machine];
+    await writeRel(b.projects, "x/t.md", `t0\ntoken ${TOKEN}\n`);
+    await writeRel(a.projects, "x/t.md", "t-from-a\n");
+    await cycle(remote, a);
+    await writeRel(b.state, "blocked-cycles", "1");
+    await chmod(join(b.state, "blocked-cycles"), 0o000);
+    let r: CycleResult;
+    try {
+      r = await cycle(remote, b);
+    } finally {
+      await chmod(join(b.state, "blocked-cycles"), 0o644).catch(() => undefined);
+    }
+    assert.deepEqual(r.blockedBy, ["x/t.md"], r.reason ?? "");
+    assert.equal(r.blockedCycles, 3, "an unreadable count is not 'never blocked yet'");
+    assert.equal(statusFromCycle(r).at(-1)?.level, "error");
+  },
+);
+
 test("an aborted cycle breaks the blocked-cycle streak", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];
@@ -1132,7 +1183,13 @@ test("a live update killed on its timeout is not the user's block, and the next 
   const first = await runCycle(slow);
   assert.equal(first.outcome, "unsynced", first.reason ?? "");
   assert.match(first.reason ?? "", /updating the vault timed out/);
-  assert.deepEqual(statusFromCycle(first), [{ level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 1 s" }]);
+  // The killed reset left an index.lock; git.ts removed it and says so, so the retry this
+  // line promises is not one that would abort at the next `git add -A` (spec 5.6).
+  const removedLock = `removed ${await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "index.lock"], { cwd: b.projects })}, which this command left when it was stopped`;
+  assert.deepEqual(statusFromCycle(first), [
+    { level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 1 s" },
+    { level: "info", text: removedLock },
+  ]);
   assert.deepEqual(first.blockedBy, []);
   assert.equal(await streak(b), "0", "a timeout never counts toward the escalation");
   await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });
@@ -1465,6 +1522,55 @@ test("an unsent commit that adds only what the remote's tree already holds passe
   const r = await cycle(remote, a);
   assert.equal(r.outcome, "synced", r.reason ?? "");
   assert.equal(await remoteFile(remote, "x/t-copy.md"), `t0\ntoken ${TOKEN}`);
+});
+
+// C2 (the gauntlet fix wave): any failure of the core.ignorecase lookup read as "case
+// matters", so on a case-insensitive disk a case-only rename would silently not sync and
+// the collision warning would be suppressed with it. Exit 1 is git's own answer that the
+// setting is not there; every other failure is a failure. recovery.ts read it this way
+// already, and both now share the one function.
+test("a core.ignorecase lookup that fails is a failure, never read as 'case matters'", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  await writeRel(a.projects, "x/first.md", "1\n");
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  let r: CycleResult | undefined;
+  await withGitFailing("core.ignorecase", async () => { r = await cycle(remote, a); }, "fatal: bad config line 1 in file .git/config");
+  assert.equal(r?.outcome, "aborted", r?.reason ?? "");
+  assert.equal(r?.reason, "git config core.ignorecase failed: fatal: bad config line 1 in file .git/config");
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
+  // And the reason says what happened even when git printed nothing at all.
+  await withGitFailing("core.ignorecase", async () => { r = await cycle(remote, a); }, "");
+  assert.equal(r?.reason, "git config core.ignorecase failed: exit 128");
+  assert.ok((await cycle(remote, a)).pushed, "and the next cycle runs normally");
+});
+
+// C1 (the gauntlet fix wave): the exemption looks up the flagged file's object in the
+// commit that adds it. Read as "not exempt", a failed lookup tells the user to rewrite
+// history for a secret the remote already holds; read as "exempt", it would let one
+// through. A scan that cannot answer stops the cycle saying which lookup failed.
+test("an exemption lookup that fails stops the cycle saying so, never telling the user to rewrite history for a secret that is there", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  const other = join(await tempDir(), "other");
+  await gitOk(["clone", "-q", remote, other], { cwd: await tempDir() });
+  await commitFile(other, "x/t.md", `t0\ntoken ${TOKEN}\n`, "an older client");
+  await gitOk(["push", "-q", "origin", "HEAD"], { cwd: other });
+  assert.ok((await cycle(remote, a)).liveUpdated);
+  await commitFile(a.projects, "x/t-copy.md", `t0\ntoken ${TOKEN}\n`, "a copy by hand");
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  let r: CycleResult | undefined;
+  // `<commit>:x/` is the exemption lookup's alone; a corrupt object store answers so.
+  await withGitFailing(":x/", async () => { r = await cycle(remote, a); }, "fatal: unable to read object");
+  assert.equal(r?.outcome, "aborted", r?.reason ?? "");
+  assert.equal(
+    r?.reason,
+    'the secret scan could not look up "x/t-copy.md" in a commit this sync would send (fatal: unable to read object): nothing was pushed',
+  );
+  assert.doesNotMatch(r?.reason ?? "", /rewrite/, "a lookup that failed is never read as a secret the remote does not hold");
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
+  const again = await cycle(remote, a);
+  assert.equal(again.outcome, "synced", again.reason ?? "");
 });
 
 test("a conflict is reported only once its copy is on the remote: a refused push reports none", async () => {
@@ -1834,7 +1940,11 @@ test("a live update slower than the base limit completes once its limit has doub
   assert.equal(first.outcome, "unsynced", first.reason ?? "");
   assert.equal(first.reason, "updating the vault timed out");
   assert.deepEqual(first.timedOut, { nextLimitMs: 800, ceiling: false, note: null }, "git names no path when reset --keep is killed");
-  assert.deepEqual(statusFromCycle(first), [{ level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 800 ms" }]);
+  assert.deepEqual(statusFromCycle(first), [
+    { level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 800 ms" },
+    // The killed reset left an index.lock, which git.ts removed and says so (spec 5.6).
+    { level: "info", text: `removed ${await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "index.lock"], { cwd: b.projects })}, which this command left when it was stopped` },
+  ]);
   assert.equal(await rung(b), "1");
   // The repair rewrites the note through the same filter, with the same limit.
   const second = await runCycle(slow);
@@ -2243,4 +2353,21 @@ test("an update still running after the longest limit a live update gets is hung
   assert.equal(fresh.waiting?.runningMs, 0);
   assert.equal(statusFromCycle(fresh)[0]?.level, "warn");
   await endHelper(alive, "group");
+});
+
+// C4 (the gauntlet fix wave): git.ts appends a note when it removed, or could not remove,
+// the index.lock a killed `add` or `reset` left (spec 5.6). The timeout branch never read
+// it, so the user was promised a retry that would abort at the next `git add -A`.
+test("the note about the index.lock a killed live update left reaches the user with the timeout", async () => {
+  const { b, slow } = await behindSlowFilter("sleep 10; cat", 300);
+  const lock = await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "index.lock"], { cwd: b.projects });
+  const r = await runCycle(slow);
+  assert.equal(r.outcome, "unsynced", r.reason ?? "");
+  assert.equal(r.reason, "updating the vault timed out");
+  assert.deepEqual(r.notices, [`removed ${lock}, which this command left when it was stopped`]);
+  assert.deepEqual(statusFromCycle(r).at(-1), { level: "info", text: `removed ${lock}, which this command left when it was stopped` });
+  await stat(lock).then(
+    () => assert.fail("the lock this cycle removed is still there"),
+    () => undefined,
+  );
 });

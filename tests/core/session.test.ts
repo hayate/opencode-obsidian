@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { access, constants, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, constants, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { initializeSession, statusFromCycle, statusFromPrivacy, vaultId, type SessionOptions } from "../../core/session.ts";
 import type { Harness, SessionRef, TranscriptChunk } from "../../core/harness.ts";
@@ -916,3 +916,52 @@ test("a session that timed out before the sync learns in the background why memo
     assert.match(later, /after sync memory and sync are disabled: .*claimed by several folders/);
   });
 });
+
+// C5 (the gauntlet fix wave): the prepare lock was released in a `finally`, so a release
+// that threw replaced the reason the session needed with its own. runCycle already keeps
+// both for the sync lock; this does the same.
+const ownedLockDir = (w: { stateRoot: string; vaultRoot: string }): string => join(w.stateRoot, vaultId(w.vaultRoot), "prepare.lock");
+
+test(
+  "a prepare lock that cannot be released is reported beside what preparation did, never instead of it",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const w = await world();
+    const lockDir = ownedLockDir(w);
+    // While the clone runs, and so while the lock is held: release() then cannot unlink
+    // its owner entry.
+    const wedge = `for a in "$@"; do if [ "$a" = clone ]; then chmod 555 ${JSON.stringify(lockDir)} 2>/dev/null; fi; done`;
+    let r: Awaited<ReturnType<typeof initializeSession>>;
+    try {
+      r = await withGitWrapper(wedge, () => initializeSession(opts(w)));
+    } finally {
+      await chmod(lockDir, 0o755).catch(() => undefined);
+    }
+    const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+    assert.equal(r.context?.project, "kabin-api", lines);
+    assert.match(lines, /\[warn\] releasing the prepare lock failed: .*(EACCES|permission denied)/i);
+  },
+);
+
+test(
+  "a prepare that fails while the lock cannot be released keeps its own reason, with the release's appended",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const w = await world();
+    // One session prepares Projects/ so the next takes the already-a-repository path.
+    assert.equal((await initializeSession(opts(w, { sessionId: "s1" }))).context?.project, "kabin-api");
+    const lockDir = ownedLockDir(w);
+    const projects = join(w.vaultRoot, "Projects");
+    // checkRepo's --git-path lookup fails, and the lock is wedged on the way in.
+    const wedge = `if [ "$here" = ${JSON.stringify(projects)} ]; then for a in "$@"; do if [ "$a" = "--git-path" ]; then chmod 555 ${JSON.stringify(lockDir)} 2>/dev/null; echo "fatal: injected failure" >&2; exit 128; fi; done; fi`;
+    let r: Awaited<ReturnType<typeof initializeSession>>;
+    try {
+      r = await withGitWrapper(wedge, () => initializeSession(opts(w, { sessionId: "s2" })));
+    } finally {
+      await chmod(lockDir, 0o755).catch(() => undefined);
+    }
+    const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+    assert.match(lines, /\[error\] sync failed: .*injected failure/, lines);
+    assert.match(lines, /injected failure.*; releasing the prepare lock failed: /, lines);
+  },
+);

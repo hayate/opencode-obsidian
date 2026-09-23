@@ -523,3 +523,25 @@ mutate("core/store.ts", "return BUG_KINDS.has(err.name) ? `${err.name}: ${err.me
 mutate("core/store.ts", 'const BUG_KINDS = new Set(["TypeError", "RangeError",', 'const BUG_KINDS = new Set(["TypeError",', "tests/core/store.test.ts", pattern="errorText renders")
 mutate("core/store.ts", "return BUG_KINDS.has(err.name)", "return !BUG_KINDS.has(err.name)", "tests/core/store.test.ts", pattern="errorText renders")
 mutate(CY, "    result.reason = errorText(err);\n", "    result.reason = (err as Error).message;\n", C, pattern="names the kind of a built-in")
+
+# Group C (the gauntlet fix wave): wrong verdicts and lost escalations. A scan that cannot
+# answer stops the cycle, a failed core.ignorecase lookup is a failure and not "case
+# matters", a streak that cannot be read still escalates, the note about a killed update's
+# index.lock reaches the user, and a failing lock release never replaces the real reason.
+mutate(CY, "      throw new Error(`the secret scan could not look up ${quoted(file)} in a commit this sync would send (${detail}): nothing was pushed`);\n", "", C,
+       pattern="an exemption lookup that fails")
+mutate(CY, "  if (!(await ignoresCase(dir))) return [];", '  if ((await git(["config", "--bool", "core.ignorecase"], { cwd: dir })).stdout.trim() !== "true") return [];', C,
+       pattern="a core.ignorecase lookup that fails")
+mutate("core/sync/state.ts", '  if (r.code !== 0 || r.timedOut) throw new Error(`git config core.ignorecase failed: ${r.stderr.trim() || (r.timedOut ? "timed out" : `exit ${r.code}`)}`);\n', "", C,
+       pattern="a core.ignorecase lookup that fails")
+mutate("core/sync/state.ts", 'throw new Error(`git config core.ignorecase failed: ${r.stderr.trim() || (r.timedOut ? "timed out" : `exit ${r.code}`)}`);',
+       "throw new Error(`git config core.ignorecase failed: ${r.stderr.trim()}`);", C, pattern="a core.ignorecase lookup that fails")
+mutate(CY, '    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;\n    return ESCALATE_AT - 1;\n', "    return 0;\n", C, pattern="blocked-cycle count that")
+mutate(CY, "return /^[0-9]{1,9}$/.test(text) ? Number(text) : ESCALATE_AT - 1;", "return Number(text) || 0;", C, pattern="blocked-cycle count that cannot be read")
+mutate("core/session.ts", 'level: r.blockedCycles >= ESCALATE_AT ? "error" : "warn",', 'level: r.blockedCycles > ESCALATE_AT ? "error" : "warn",', SE,
+       pattern="statusFromCycle turns every non-clean outcome")
+mutate(CY, "    if (reset.lockNote) result.notices.push(reset.lockNote);\n", "", C, pattern="the note about the index.lock")
+mutate("core/git.ts", "      result.lockNote = note;\n", "", C, pattern="the note about the index.lock")
+mutate("core/session.ts", "      if (released !== null && prepared.err instanceof Error) prepared.err.message = `${prepared.err.message}; ${released}`;\n", "", SE,
+       pattern="prepare that fails while the lock")
+mutate("core/session.ts", '    if (released !== null) out.push({ level: "warn", text: released });\n', "", SE, pattern="prepare lock that cannot be released")

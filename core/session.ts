@@ -13,7 +13,7 @@ import { legacyReappeared, schemaVersion, SCHEMA_VERSION } from "./migrate.ts";
 import { normalizeOrigin, recordOrigin, resolveProject, type ProjectResolution } from "./project.ts";
 import { acquireLock } from "./lock.ts";
 import { branchKey, computeHeads, errorText, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
-import { runCycle, STILL_RUNNING, TIMED_OUT, type CycleResult } from "./sync/cycle.ts";
+import { ESCALATE_AT, runCycle, STILL_RUNNING, TIMED_OUT, type CycleResult } from "./sync/cycle.ts";
 import type { Conflict } from "./sync/resolve.ts";
 import { remoteVisibility, type Visibility } from "./sync/privacy.ts";
 import { prepareProjects, syncConfig, type SyncConfig, type SyncState } from "./sync/state.ts";
@@ -233,9 +233,9 @@ export function statusFromCycle(r: CycleResult): StatusItem[] {
     });
   }
   if (r.blockedBy.length) {
-    // Spec 5.4 step 5: after 3 blocked cycles in a row the status escalates (the adapter notifies on errors).
+    // Spec 5.4 step 5: after ESCALATE_AT blocked cycles in a row the status escalates (the adapter notifies on errors).
     out.push({
-      level: r.blockedCycles >= 3 ? "error" : "warn",
+      level: r.blockedCycles >= ESCALATE_AT ? "error" : "warn",
       text: `live update blocked by local edits to: ${files(r.blockedBy)}${r.blockedCycles > 1 ? ` (${r.blockedCycles} cycles in a row)` : ""}`,
     });
   }
@@ -363,12 +363,24 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
       out.push({ level: "warn", text: "another session is still preparing Projects/; run remember_sync shortly" });
       return { items: out, project: early };
     }
-    let state: SyncState;
-    try {
-      state = await prepareProjects(vault, cfg, shared.timezone);
-    } finally {
-      await prep.release();
+    // The lock is released whatever preparation did, and a failing release never replaces
+    // the reason the session needed: it is appended to what prepareProjects threw, or
+    // reported beside what it returned. runCycle does the same with the sync lock.
+    type Prepared = { kind: "ok"; state: SyncState } | { kind: "failed"; err: unknown };
+    const prepared: Prepared = await prepareProjects(vault, cfg, shared.timezone).then(
+      (ready): Prepared => ({ kind: "ok", state: ready }),
+      (err: unknown): Prepared => ({ kind: "failed", err }),
+    );
+    const released = await prep.release().then(
+      () => null,
+      (err: unknown) => `releasing the prepare lock failed: ${errorText(err)}`,
+    );
+    if (prepared.kind === "failed") {
+      if (released !== null && prepared.err instanceof Error) prepared.err.message = `${prepared.err.message}; ${released}`;
+      throw prepared.err;
     }
+    if (released !== null) out.push({ level: "warn", text: released });
+    const state = prepared.state;
     out.push(...statusFromSync(state));
     if (state.kind === "ready" && cfg.remote) {
       out.push(...statusFromCycle(await runCycle({ projectsDir: vault.projectsDir, remote: cfg.remote, branch: state.branch, stateDir, machine, timezone: shared.timezone })));
