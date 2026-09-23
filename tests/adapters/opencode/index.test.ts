@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { PluginInput } from "@opencode-ai/plugin";
-import plugin, { BOOTSTRAP, rememberSync, SuperpowerRememberObsidian } from "../../../adapters/opencode/index.ts";
+import plugin, { assemble, BOOTSTRAP, rememberSync, SuperpowerRememberObsidian } from "../../../adapters/opencode/index.ts";
 import { PAYLOAD_MARKER } from "../../../core/inject.ts";
 import { FakeClient } from "./fake-client.ts";
 import type { Message } from "../../../adapters/opencode/sessions.ts";
@@ -89,4 +89,19 @@ test("a deleted session's memory is let go", async () => {
 test("remember_sync that fails while the toast fails too still answers with the failure", async () => {
   const sync = rememberSync({ sync: async () => Promise.reject(new Error("lock stranded")) }, async () => Promise.reject(new Error("no TUI")));
   assert.equal(await sync.execute({}, { sessionID: "ses_top" } as never), "remember_sync failed: lock stranded");
+});
+
+test("the journalModel option reaches the journal's model, and one that is not a string is told", async () => {
+  const client = new FakeClient();
+  assert.deepEqual(await assemble({ client, directory: "/code" }, { journalModel: "p/m" }).harness.model(), { name: "p/m", ref: { providerID: "p", modelID: "m" }, problem: null });
+  assert.match((await assemble({ client, directory: "/code" }, { journalModel: 42 }).harness.model()).problem ?? "", /journalModel "42" is not provider\/model/);
+  client.cfg = { small_model: "a/small" };
+  assert.equal((await assemble({ client, directory: "/code" }, {}).harness.model()).name, "a/small");
+});
+
+test("a malformed session.deleted event never throws into OpenCode", async () => {
+  const client = new FakeClient();
+  const h = await hooks(client);
+  await h.event?.({ event: { type: "session.deleted", properties: {} } } as never);
+  assert.deepEqual(client.toasts.map((t) => t.message).filter((m) => !/failed/.test(m)), []);
 });

@@ -16,11 +16,17 @@ export const BOOTSTRAP = [
   "- A status line tagged [error] needs the user: tell them what it says.",
 ].join("\n");
 
+// The plugin's working parts, from what OpenCode passes in. A journalModel option that is not
+// a string is not ignored: it becomes text, which the harness tells is not provider/model.
+export function assemble(input: { client: OpenCodeClient; directory: string }, options?: Record<string, unknown>): { harness: OpenCodeHarness; sessions: Sessions } {
+  const option = options?.journalModel;
+  const harness = new OpenCodeHarness(input.client, option === undefined ? undefined : String(option));
+  const sessions = new Sessions({ client: input.client, harness, directory: input.directory, bootstrap: BOOTSTRAP, env: process.env });
+  return { harness, sessions };
+}
+
 export const SuperpowerRememberObsidian: Plugin = async (input, options) => {
-  const client: OpenCodeClient = input.client;
-  const journalModel = typeof options?.journalModel === "string" ? options.journalModel : undefined;
-  const harness = new OpenCodeHarness(client, journalModel);
-  const sessions = new Sessions({ client, harness, directory: input.directory, bootstrap: BOOTSTRAP, env: process.env });
+  const { harness, sessions } = assemble(input, options);
   const report = (what: string, err: unknown): void => {
     void harness.notify(`${what} failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => undefined);
   };
@@ -33,12 +39,11 @@ export const SuperpowerRememberObsidian: Plugin = async (input, options) => {
       }
     },
     event: async ({ event }) => {
-      if (event.type === "session.deleted") sessions.forget(event.properties.info.id);
-      if (event.type !== "session.idle") return;
       try {
-        await sessions.idle(event.properties.sessionID);
+        if (event.type === "session.deleted") sessions.forget(event.properties.info.id);
+        if (event.type === "session.idle") await sessions.idle(event.properties.sessionID);
       } catch (err) {
-        report("the idle sync", err);
+        report(`handling ${event.type}`, err);
       }
     },
     tool: { remember_sync: rememberSync(sessions, (message) => harness.notify(message)) },
