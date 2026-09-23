@@ -571,8 +571,13 @@ mutate(CY, "      if (!(await stillHeld())) return result;\n      const integrat
        pattern=LOST_LOCK)
 mutate(CY, "    if (!(await stillHeld())) return result;\n    await updateLive(", "    await updateLive(", C, pattern=LOST_LOCK)
 mutate(CY, '      result.reason = "lost the sync lock";\n      return false;', '      result.reason = "lost the sync lock";\n      return true;', C, pattern=LOST_LOCK)
-mutate(CY, "const MAX_PUSH_ATTEMPTS = 3;", "const MAX_PUSH_ATTEMPTS = 300;", C, pattern="keeps moving ends at the cap")
-mutate(CY, "      if (attempt >= MAX_PUSH_ATTEMPTS) {\n", "      if (false) {\n", C, pattern="keeps moving ends at the cap")
+mutate(CY, "const MAX_PUSH_ATTEMPTS = 3;", "const MAX_PUSH_ATTEMPTS = 2;", C, pattern="keeps moving ends at the cap")
+# `if (false)` here, which is what an unbounded loop looks like, is deliberately not run:
+# the only thing that catches a loop with no exit is the gate's own 600 s timeout, and
+# every gate run on every platform would pay it. The guard is mutated by its threshold
+# instead, and an unbounded loop is caught by the test itself hanging, under ci.yml's job
+# timeout.
+mutate(CY, "      if (attempt >= MAX_PUSH_ATTEMPTS) {\n", "      if (attempt >= 1) {\n", C, pattern="keeps moving ends at the cap")
 mutate(CY, '  if (exists.timedOut) return { kind: "unknown", detail: "timed out" };\n', "", C, pattern="a read of remote-seen that has to be killed")
 mutate(CY, '  if (r.timedOut) return { kind: "unknown", detail: "timed out" };\n  return r.code === 0 ? { kind: "seen"', '  return r.code === 0 ? { kind: "seen"', C,
        pattern="a read of remote-seen that has to be killed")

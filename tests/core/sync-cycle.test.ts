@@ -942,8 +942,11 @@ test("a read of remote-seen that has to be killed is 'could not tell', never 'th
   // show-ref hangs, then rev-parse does: the first is the presence check, the second the
   // one that says a present ref names a commit.
   for (const at of ["--exists", "^{commit}"]) {
+    // 2 s is a hundred times a ref read and a fifteenth of the hang: only the call this
+    // shim holds can reach it, however loaded the machine is. A limit a plain read could
+    // also reach would answer "timed out" for the wrong call, which reads as the right one.
     await withGitDoing(at, "  sleep 30", async () => {
-      assert.deepEqual(await remoteSeen(a.projects, 200), { kind: "unknown", detail: "timed out" }, at);
+      assert.deepEqual(await remoteSeen(a.projects, 2_000), { kind: "unknown", detail: "timed out" }, at);
     });
   }
   assert.equal((await cycle(remote, a)).outcome, "synced", "and the next cycle runs normally");
@@ -2006,6 +2009,10 @@ test("a cycle whose sync lock was taken from it stops at the next check, and nev
     await writeRel(b.projects, "x/t.md", "from b\n");
     assert.ok((await cycle(remote, b)).pushed);
     const lockDir = await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "sro-sync.lock"], { cwd: a.projects });
+    // The first check sits before the state clone is ensured: with the clone deleted,
+    // whether it comes back says which check stopped this cycle.
+    const clone = join(a.state, "sync.git");
+    if (at === "-A") await rm(clone, { recursive: true, force: true });
     await writeRel(a.projects, "x/mine.md", "m\n");
     let r: CycleResult | undefined;
     await withGitDoing(at, `  rm -f '${lockDir}'/owner.*`, async () => {
@@ -2019,6 +2026,12 @@ test("a cycle whose sync lock was taken from it stops at the next check, and nev
     assert.equal(await gitOk(["rev-parse", "HEAD"], { cwd: a.projects }), r?.committed, `${at}: the vault is at its own snapshot, never at the merge`);
     // Only the last of the three is past the push, which is what the third check guards.
     assert.equal(r?.pushed, at === "--exists", at);
+    if (at === "-A") {
+      await stat(clone).then(
+        () => assert.fail("the cycle went past the check that comes before the state clone"),
+        () => undefined,
+      );
+    }
   }
 });
 
