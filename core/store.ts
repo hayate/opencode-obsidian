@@ -176,11 +176,15 @@ async function flush(path: string): Promise<void> {
 // Only for a file whose absence would lose work that is already on disk. On this branch
 // that is recovery.ts's intent record alone, written before `reset --keep` changes a
 // single note: lose it and the notes are changed with nothing saying so, and the next
-// snapshot publishes a half-applied update as the user's own change. Every other caller
-// of writeAtomic was checked and none has that property: the blocked-cycle count, the
-// live-update level and .gitignore are rebuilt by the next cycle, and a handoff, a
-// journal entry and the vault config are the work rather than a record of it, so losing
-// the write loses nothing that happened.
+// snapshot publishes a half-applied update as the user's own change. Every other caller of
+// writeAtomic was checked and none has that property. The blocked-cycle count and the
+// live-update level (cycle.ts), Projects/.gitignore (state.ts), the journal's positions
+// and its digest cache (journal.ts) are all regenerable: the next cycle or the next
+// session writes them again, and each says so where it is read. The migration marker
+// (migrate.ts) is written after a migration that is idempotent by construction, so losing
+// it costs one re-run that finds nothing left to move. And recovery.ts's two other writes
+// of the record replace one that is already there, so a lost rename leaves the older
+// record, which errs toward keeping the user's files.
 export async function writeDurable(path: string, content: string): Promise<void> {
   const dir = dirname(path);
   await mkdir(dir, { recursive: true });
