@@ -1761,6 +1761,75 @@ test("a repair gets the live update's current limit: one that needs longer than 
   assert.equal(await remoteFile(remote, "x/t.md"), "from a");
 });
 
+// Spec 5.4 step 5 (the gauntlet fix wave, 2026-09-23): the adaptive limit covers every git
+// call that runs the vault's filters, not only the two that write. Two ran with git.ts's
+// fixed 30 s, which the ladder cannot raise: the repair's content check
+// (`hash-object --path=`, the one check a record with no fingerprints always reaches) and
+// the snapshot's `git add -A`. A filter needing longer than the fixed limit made each of
+// them a plain failure that aborts the cycle, repeated identically for ever.
+
+// The record a session that died, or a `reset --keep` that stopped partway, leaves: the
+// update's two commits and no fingerprint for any path, so every path is judged by
+// content, through the note's own clean filter. The target is fetched into the vault
+// first, exactly as updateLive does before it records the intent.
+async function fingerprintFree(remote: string, x: Machine): Promise<void> {
+  const from = await gitOk(["rev-parse", "HEAD"], { cwd: x.projects });
+  await gitOk(["fetch", "-q", remote, "main"], { cwd: x.projects });
+  const to = await gitOk(["rev-parse", "FETCH_HEAD"], { cwd: x.projects });
+  await writeRel(x.state, RECORD, JSON.stringify({ from, to }));
+}
+
+test("a repair's content check under a clean filter slower than the base limit climbs its limit, and the cycle ends by completing instead of aborting for ever", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/t.md", "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  await fingerprintFree(remote, b);
+  // Longer than twice the base, shorter than four times it (git adds about 0.1 s).
+  await gitOk(["config", "filter.slow.clean", "sleep 0.85; cat"], { cwd: b.projects });
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "x/t.md filter=slow\n");
+  const slow = { timezone: TZ, projectsDir: b.projects, remote, branch: "main", stateDir: b.state, machine: "b", quietMs: 0, liveUpdateTimeoutMs: 400 };
+  const first = await runCycle(slow);
+  assert.equal(first.outcome, "unsynced", first.reason ?? "");
+  assert.equal(first.reason, "updating the vault timed out", "classified as the update's timeout, not a bare failure");
+  assert.deepEqual(first.timedOut, { nextLimitMs: 800, ceiling: false, note: "x/t.md" }, "the check knows the note whose filter it was running");
+  assert.equal(first.committed, null, "nothing is snapshotted while the update is unfinished");
+  assert.equal(await rung(b), "1");
+  const second = await runCycle(slow);
+  assert.deepEqual(second.timedOut, { nextLimitMs: 1600, ceiling: false, note: "x/t.md" }, second.reason ?? "");
+  assert.equal(await rung(b), "2");
+  const third = await runCycle(slow);
+  assert.equal(third.outcome, "synced", third.reason ?? "");
+  assert.deepEqual(third.notices, ["finished an interrupted vault update; 1 file set back to update again"]);
+  assert.equal(await read(b, "x/t.md"), "from a\n");
+  assert.equal(await rung(b), "0", "the completed update sets the limit back to the base");
+});
+
+test("the snapshot's `git add -A` under a clean filter slower than the base limit climbs it too, instead of aborting the cycle", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [, b] = m as [Machine, Machine];
+  await gitOk(["config", "filter.slow.clean", "sleep 0.85; cat"], { cwd: b.projects });
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "x/n.md filter=slow\n");
+  await writeRel(b.projects, "x/n.md", "note from b\n");
+  const slow = { timezone: TZ, projectsDir: b.projects, remote, branch: "main", stateDir: b.state, machine: "b", quietMs: 0, liveUpdateTimeoutMs: 400 };
+  const first = await runCycle(slow);
+  assert.equal(first.outcome, "unsynced", first.reason ?? "");
+  assert.equal(first.reason, "updating the vault timed out");
+  assert.deepEqual(first.timedOut, { nextLimitMs: 800, ceiling: false, note: null }, "staging names no note, as `reset --keep` names none");
+  assert.equal(first.committed, null, "nothing was committed");
+  assert.equal(first.pushed, false);
+  assert.equal(await rung(b), "1");
+  const second = await runCycle(slow);
+  assert.equal(second.outcome, "unsynced", second.reason ?? "");
+  assert.deepEqual(second.timedOut, { nextLimitMs: 1600, ceiling: false, note: null });
+  assert.equal(await rung(b), "2");
+  const third = await runCycle(slow);
+  assert.equal(third.outcome, "synced", third.reason ?? "");
+  assert.ok(third.pushed);
+  assert.equal(await remoteFile(remote, "x/n.md"), "note from b");
+  assert.equal(await rung(b), "2", "no live update ran, so the limit is left where it was");
+});
+
 // Spec 5.4 step 5 (fix round 1, 2026-09-23): git runs in its own process group, and its
 // kill timer lives in this process, so an update outlives the session that started it.
 // A cycle that repaired and snapshotted while it ran would set its notes back under it

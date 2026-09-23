@@ -5,7 +5,7 @@
 // and a conflict never pauses sync (both versions are kept, resolve.ts).
 import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { git, gitOk, literal, LOCAL_TIMEOUT_MS, NETWORK_TIMEOUT_MS } from "../git.ts";
+import { git, GitError, gitOk, literal, LOCAL_TIMEOUT_MS, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock, type LockHandle } from "../lock.ts";
 import { EMPTY_TREE, redactUrlCredentials, scanRange, scanStaged, scanText } from "../secrets.ts";
 import { quoted, writeAtomic } from "../store.ts";
@@ -143,8 +143,10 @@ async function onDisk(dir: string, rel: string, listings: Map<string, string[]>)
 }
 
 // On a case-insensitive filesystem git does not see Note.md -> note.md or
-// Dir/ -> dir/; stage it. Returns the tracked files that collide by case.
-async function stageCaseRenames(dir: string): Promise<string[]> {
+// Dir/ -> dir/; stage it. Returns the tracked files that collide by case. The `add`
+// runs the note's clean filter, so it takes the live update's limit like the snapshot's
+// own `add -A` (the caller classifies a timeout of either).
+async function stageCaseRenames(dir: string, timeoutMs: number): Promise<string[]> {
   if ((await git(["config", "--bool", "core.ignorecase"], { cwd: dir })).stdout.trim() !== "true") return [];
   const tracked = await zList(dir, ["ls-files"]);
   const { ambiguous, collisions } = caseAmbiguous(tracked);
@@ -154,7 +156,7 @@ async function stageCaseRenames(dir: string): Promise<string[]> {
     const actual = await onDisk(dir, rel, listings);
     if (actual === null || actual === rel) continue;
     await gitOk(["rm", "-q", "--cached", "--", literal(rel)], { cwd: dir });
-    await gitOk(["add", "--", literal(actual)], { cwd: dir });
+    await gitOk(["add", "--", literal(actual)], { cwd: dir, timeoutMs });
   }
   return collisions;
 }
@@ -275,10 +277,24 @@ function emptyResult(): CycleResult {
   };
 }
 
-async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: boolean; pushAllowed: boolean }> {
+async function snapshot(input: CycleInput, ladder: Ladder, result: CycleResult): Promise<{ ok: boolean; pushAllowed: boolean }> {
   const dir = input.projectsDir;
-  await gitOk(["add", "-A"], { cwd: dir });
-  result.caseCollisions = await stageCaseRenames(dir);
+  // Spec 5.4 step 5: `git add -A` runs the vault's clean filters over every note that
+  // changed, so it takes the live update's own adaptive limit rather than git.ts's fixed
+  // one, which the ladder cannot raise. A timeout here is classified like the update's
+  // own, so the next cycle stages with twice the time instead of aborting identically for
+  // ever. It names no note, as `reset --keep` names none.
+  const limit = limitOf(ladder);
+  try {
+    await gitOk(["add", "-A"], { cwd: dir, timeoutMs: limit });
+    result.caseCollisions = await stageCaseRenames(dir, limit);
+  } catch (err) {
+    if (!(err instanceof GitError) || !err.result.timedOut) throw err;
+    // The index is left exactly as the killed command left it: the next cycle stages
+    // from scratch anyway, and nothing is committed or pushed from a cycle that ends here.
+    await timedOut(input.stateDir, ladder, result);
+    return { ok: false, pushAllowed: false };
+  }
 
   // Deferred while its mtime is within the quiet period of now, on either side. A
   // fresh write's sub-millisecond mtime is usually just ahead of Date.now()'s whole
@@ -669,7 +685,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       return result;
     }
     if (finished && (finished.restored.length || finished.kept.length)) result.notices.push(describeFinished(finished));
-    const snap = await snapshot(input, result);
+    const snap = await snapshot(input, ladder, result);
     if (!snap.ok || !(await stillHeld())) return result;
     if (!snap.pushAllowed) {
       result.outcome = "unsynced";

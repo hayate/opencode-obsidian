@@ -187,8 +187,11 @@ function units(changed: string[], old: Map<string, Entry>, twins: boolean): stri
 // new version, so absence is what an interrupted rewrite leaves; a folder holds no
 // file here either). Case twins are one file: any twin's version counts. Anything
 // else is someone's edit. hash-object --path applies the path's clean filter, as
-// git add does.
-async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[]): Promise<boolean> {
+// git add does, so it takes the live update's own limit like every other call that
+// runs the vault's filters: this is the one check a record with no fingerprints always
+// reaches, and with git.ts's fixed limit a slower filter would abort every cycle
+// identically, with a limit that can never grow (spec 5.4 step 5).
+async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[], timeoutMs: number | undefined): Promise<boolean> {
   const path = await onDisk(dir, rel);
   if (path === null) return true;
   let info;
@@ -204,7 +207,12 @@ async function updatesWork(dir: string, rel: string, unit: string[], versions: E
     now.push({ mode: "120000", oid: await gitOk(["hash-object", "--stdin", "--no-filters"], { cwd: dir, input: await readlink(path) }) });
   } else if (info.isFile()) {
     const mode = info.mode & 0o100 ? "100755" : "100644";
-    for (const twin of unit) now.push({ mode, oid: await gitOk(["hash-object", `--path=${twin}`, "--", path], { cwd: dir }) });
+    for (const twin of unit) {
+      const oid = await gitOk(["hash-object", `--path=${twin}`, "--", path], { cwd: dir, timeoutMs }).catch((err: unknown) => {
+        throw err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result, twin) : err;
+      });
+      now.push({ mode, oid });
+    }
   } else {
     return false;
   }
@@ -627,7 +635,7 @@ export async function finishInterrupted(stateDir: string, dir: string, opts: Fin
       // is stale they are separate files, and each must be the update's to be set back.
       const untouched = async (): Promise<boolean> => {
         for (const rel of unit) {
-          const work = printed(rel) ? (await fingerprint(dir, rel)) === prints[rel] : await updatesWork(dir, rel, unit, versions);
+          const work = printed(rel) ? (await fingerprint(dir, rel)) === prints[rel] : await updatesWork(dir, rel, unit, versions, opts.timeoutMs);
           if (!work) return false;
         }
         return true;

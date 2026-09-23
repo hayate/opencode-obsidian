@@ -58,12 +58,13 @@ mutate("core/sync/cycle.ts", "if (s && Math.abs(Date.now() - s.mtimeMs) < quietM
 mutate("core/sync/cycle.ts", "Math.abs(Date.now() - s.mtimeMs) < quietMs", "Date.now() - s.mtimeMs < quietMs", C, pattern='far in the future')
 mutate("core/sync/cycle.ts", "  result.embedded = await dropEmbeddedRepos(dir);\n", "", C, pattern='is reported and never committed as a gitlink|a gitlink an old client committed')
 mutate("core/sync/cycle.ts",
-       ("  result.caseCollisions = await stageCaseRenames(dir);\n",
+       ("  // Deferred while its mtime is within the quiet period of now, on either side. A\n",
         "  // After the quiet pass: unstaging a freshly written nested repository would\n  // otherwise restore the gitlink an older client committed.\n  result.embedded = await dropEmbeddedRepos(dir);\n"),
-       ("  result.caseCollisions = await stageCaseRenames(dir);\n  result.embedded = await dropEmbeddedRepos(dir);\n", ""), C, pattern='a gitlink an old client committed')
+       ("  result.embedded = await dropEmbeddedRepos(dir);\n  // Deferred while its mtime is within the quiet period of now, on either side. A\n", ""), C,
+       pattern='a gitlink an old client committed')
 mutate("core/sync/cycle.ts", "    await writeBlocked(input.stateDir, 0);\n", "", C, pattern='an aborted cycle breaks the blocked-cycle streak|a stopped cycle breaks the blocked-cycle streak')
 # Case handling (caught only on a case-insensitive filesystem such as macOS).
-mutate("core/sync/cycle.ts", "  result.caseCollisions = await stageCaseRenames(dir);\n", "", C, pattern='a case-only rename reaches the remote|a case-only directory rename reaches the remote', **CASE)
+mutate("core/sync/cycle.ts", "    result.caseCollisions = await stageCaseRenames(dir, limit);\n", "", C, pattern='a case-only rename reaches the remote|a case-only directory rename reaches the remote', **CASE)
 mutate("core/sync/cycle.ts", "    if (ambiguous.has(rel)) continue;\n", "", C, pattern='differing only by case are never', **CASE)
 mutate("core/sync/cycle.ts", "const found = exact ? part : names.find((n) => fold(n) === fold(part));",
        'const found = exact ? part : part === rel.split("/").at(-1) ? names.find((n) => fold(n) === fold(part)) : undefined;', C, pattern='a case-only directory rename reaches the remote', **CASE)
@@ -182,7 +183,7 @@ mutate(K, "  await rm(old, { recursive: true, force: true });\n}", "}", CL)
 # recovery
 mutate(F_RC, "    if (absent(err)) return true;\n    throw err;\n  }\n  if (info.isDirectory()) return true;", "    if (absent(err)) return false;\n    throw err;\n  }\n  if (info.isDirectory()) return true;", RC, pattern="fingerprints were never taken")
 mutate(F_RC, "unit.flatMap((rel) => [old.get(rel), target.get(rel)])", "unit.flatMap((rel) => [old.get(rel)])", RC, pattern="fingerprints were never taken")
-mutate(F_RC, ": await updatesWork(dir, rel, unit, versions);", ": true;", RC, pattern="fingerprints were never taken")
+mutate(F_RC, ": await updatesWork(dir, rel, unit, versions, opts.timeoutMs);", ": true;", RC, pattern="fingerprints were never taken")
 mutate(F_RC, 'const head = await gitOk(["rev-parse", "-q", "--verify", "HEAD^{commit}"], { cwd: dir });', 'const head = (await git(["rev-parse", "-q", "--verify", "HEAD^{commit}"], { cwd: dir })).stdout.trim();', RC, pattern="HEAD that cannot be read")
 mutate(F_RC, "    if (!(await untouched())) return false;\n    // A folder of the note", "    // A folder of the note", RC, pattern="saves while a slow repair")
 mutate(F_RC, "  return [...all.filter((unit) => !restores(unit)), ...all.filter(restores)];", "  return all;", RC, pattern="turned a note into a folder")
@@ -254,8 +255,8 @@ mutate(F_RC, "  let folder = dir;\n  for (const part of names) {", "  let folder
        pattern="a case-only rename of a folder the update had made|the first spelling never stops a repair")
 mutate(F_RC, "if (twin !== undefined && (await oneEntry(join(folder, twin), wanted))) await rename", "if (twin !== undefined) await rename", RC,
        pattern="never renames a different file over the note", **CASE_SENSITIVE)
-mutate(F_RC, "        for (const rel of unit) {\n          const work = printed(rel) ? (await fingerprint(dir, rel)) === prints[rel] : await updatesWork(dir, rel, unit, versions);\n          if (!work) return false;\n        }\n        return true;",
-       '        for (const rel of unit.filter(printed)) if ((await fingerprint(dir, rel)) !== prints[rel]) return false;\n        return unit.every(printed) || updatesWork(dir, unit[0] ?? "", unit, versions);', RC,
+mutate(F_RC, "        for (const rel of unit) {\n          const work = printed(rel) ? (await fingerprint(dir, rel)) === prints[rel] : await updatesWork(dir, rel, unit, versions, opts.timeoutMs);\n          if (!work) return false;\n        }\n        return true;",
+       '        for (const rel of unit.filter(printed)) if ((await fingerprint(dir, rel)) !== prints[rel]) return false;\n        return unit.every(printed) || updatesWork(dir, unit[0] ?? "", unit, versions, opts.timeoutMs);', RC,
        pattern="never sets an unchanged note back over the user's edit", **CASE_SENSITIVE)
 # A set-back refuses a note behind a symlink before respell runs (onDisk), so where the disk
 # ignores case respell walks only folders the set-back just went through: its guard is left to
@@ -311,8 +312,8 @@ mutate(F_RC, "      if (absent(err)) break;", "      if (absent(err)) return nul
 mutate(F_RC, "  const path = await onDisk(root, rel);\n  if (path === null) return null;\n", "  const path = join(root, rel);\n", RC, pattern="never written or read through|turned a folder into a note, killed after writing")
 mutate(F_RC, "async function missing(dir: string, rel: string): Promise<boolean> {\n  const path = await onDisk(dir, rel);\n  if (path === null) return true;\n",
        "async function missing(dir: string, rel: string): Promise<boolean> {\n  const path = join(dir, rel);\n", RC, pattern="never started, turning a note into a folder")
-mutate(F_RC, "async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[]): Promise<boolean> {\n  const path = await onDisk(dir, rel);\n  if (path === null) return true;\n",
-       "async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[]): Promise<boolean> {\n  const path = join(dir, rel);\n", RC, pattern="replaced with a file, after an update that never ran")
+mutate(F_RC, "async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[], timeoutMs: number | undefined): Promise<boolean> {\n  const path = await onDisk(dir, rel);\n  if (path === null) return true;\n",
+       "async function updatesWork(dir: string, rel: string, unit: string[], versions: Entry[], timeoutMs: number | undefined): Promise<boolean> {\n  const path = join(dir, rel);\n", RC, pattern="replaced with a file, after an update that never ran")
 mutate(F_RC, "async function remove(dir: string, rel: string): Promise<void> {\n  const path = await onDisk(dir, rel);\n  if (path === null) return;\n",
        "async function remove(dir: string, rel: string): Promise<void> {\n  const path = join(dir, rel);\n", RC, pattern="swapped for a symlink between")
 mutate(F_RC, "    if ((await fingerprint(dir, source)) !== print) {", "    if (true) {", RC, pattern="intent alone was recorded")
@@ -467,3 +468,16 @@ mutate(F_RC, "    await sweepScratch(dir);\n", "", RC, pattern="sweeps the scrat
 mutate(F_RC, "await rm(join(gitDir, name), { recursive: true, force: true }).catch(() => undefined);", "await rm(join(gitDir, name), { recursive: true, force: true });", RC,
        pattern="leftover the sweep cannot remove never stops a repair")
 mutate(F_RC, "  return Math.round((Date.now() - uptime() * 1000) / 1000) * 1000;", "  return Date.now();", RC, pattern="the boot instant is the same number")
+
+# The gauntlet fix wave: every git call that runs the vault's filters takes the live
+# update's adaptive limit, and a timeout of one is classified so the ladder climbs. Two ran
+# with git.ts's fixed limit, which the ladder cannot raise: the repair's content check
+# (the one check a record with no fingerprints always reaches) and the snapshot's staging.
+FILTERED = "clean filter slower than the base limit"
+mutate(CY, '    await gitOk(["add", "-A"], { cwd: dir, timeoutMs: limit });\n', '    await gitOk(["add", "-A"], { cwd: dir });\n', C, pattern=FILTERED)
+mutate(CY, "    if (!(err instanceof GitError) || !err.result.timedOut) throw err;\n", "    throw err;\n", C, pattern=FILTERED)
+mutate(CY, '    await gitOk(["add", "--", literal(actual)], { cwd: dir, timeoutMs });\n', '    await gitOk(["add", "--", literal(actual)], { cwd: dir });\n', C,
+       pattern='a case-only rename reaches the remote', survives=("linux", "darwin"),
+       why="the same hazard as the snapshot's own `add -A`, one note at a time: no test stages a case-only rename whose clean filter is slower than the limit, and on Linux no case-only rename is staged at all")
+mutate(F_RC, '["hash-object", `--path=${twin}`, "--", path], { cwd: dir, timeoutMs })', '["hash-object", `--path=${twin}`, "--", path], { cwd: dir })', C, pattern=FILTERED)
+mutate(F_RC, "        throw err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result, twin) : err;\n", "        throw err;\n", C, pattern=FILTERED)
