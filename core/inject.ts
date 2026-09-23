@@ -48,7 +48,10 @@ export function escapeBlockTags(text: string): string {
 function cut(text: string, max: number, where: string): string {
   const t = escapeBlockTags(text.trim());
   if (t.length <= max) return t;
-  return `${t.slice(0, Math.max(0, max)).trimEnd()}\n...(truncated; full text: ${where})`;
+  // The pointer counts against max: an absolute path can be long, and a section that overran its
+  // share would leave the final budget cut to land inside the path.
+  const pointer = `\n...(truncated; full text: ${where})`;
+  return `${t.slice(0, Math.max(0, max - pointer.length)).trimEnd()}${pointer}`;
 }
 
 function firstLine(h: Handoff): string {
@@ -92,9 +95,10 @@ export function selectHandoffs(
   return { title, list, others };
 }
 
-// A path whole, however long (the model's file tools need all of it): in backticks when plain, as a
-// JSON string when it holds a line break, an invisible character or a backtick. The folder name in
-// it comes from the vault, synced from other machines, and must not add lines to the status block.
+// A path whole, however long (the model's file tools need all of it): exact, in backticks, when
+// plain; escaped as a JSON string when it holds a line break, an invisible character or a backtick,
+// readable but not always exact (a folder named like the memory block's tag is escaped too). The
+// folder name in it comes from the vault, synced from other machines, and must never add lines.
 function pathShown(path: string): string {
   return /^[^\p{Cc}\p{Cf}\u2028\u2029`]+$/u.test(path) ? `\`${path}\`` : quoted(path, Infinity);
 }

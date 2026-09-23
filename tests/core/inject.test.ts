@@ -180,3 +180,14 @@ test("a plain project path is shown whole, however long", () => {
   const q = buildPayload(base({ projectDir: odd }));
   assert.ok(q.includes(`in the Obsidian vault at "/Users/someone/${"deep/".repeat(40)}Va\\u200bult/Projects/kabin-api" (not in the working directory)`), "an odd one is escaped, never cut");
 });
+
+test("every truncation pointer survives whole, even with a long absolute project path", () => {
+  // Codex's case: five long handoffs and a very long (valid on Linux) project path, default budget.
+  const projectDir = `/${"d".repeat(60)}/`.repeat(36) + "Projects/kabin-api";
+  const heads = computeHeads(Array.from({ length: 5 }, (_, i) => h(`h${i}`, "feat/x", "2026-09-21T10:00:00+09:00", "x".repeat(10_000))));
+  const p = buildPayload(base({ heads, projectDir, identity: "I am Maya. ".repeat(500), recent: "# Recent\n" + "r".repeat(20_000) }));
+  const pointers = [...p.matchAll(/\(truncated; full text: ([^)]*)\)/g)].map((m) => m[1]);
+  assert.ok(pointers.length >= 5, `pointers: ${pointers.length}`);
+  for (const ptr of pointers) assert.match(ptr ?? "", new RegExp(`^\`${projectDir}/remember/[^\`]+\\.md\`$`));
+  assert.ok(p.length <= 24_000, `payload is ${p.length} chars`);
+});

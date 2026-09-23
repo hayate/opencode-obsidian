@@ -95,6 +95,7 @@ mutate("core/inject.ts", '  const where = input.projectDir === null ? "" :', '  
 mutate("core/inject.ts", "`${shown} (a folder in Projects/)${where}`", "`${shown} (a folder in Projects/)`", "tests/core/inject.test.ts", pattern="line break cannot add lines")
 mutate("core/inject.ts", "u.test(path) ? `\\`${path}\\`` : quoted(path, Infinity);", "u.test(path) ? `\\`${path}\\`` : `\\`${path}\\``;", "tests/core/inject.test.ts", pattern="line break cannot add lines")
 mutate("core/inject.ts", "quoted(path, Infinity)", "quoted(path)", "tests/core/inject.test.ts", pattern="shown whole, however long")
+mutate("core/inject.ts", "t.slice(0, Math.max(0, max - pointer.length))", "t.slice(0, Math.max(0, max))", "tests/core/inject.test.ts", pattern="survives whole")
 mutate("core/inject.ts", "input.projectDir === null ? `Projects/${vaultName(input.project ?? \"\")}/${rel}` : pathShown(`${input.projectDir}/${rel}`)", "`Projects/${input.project}/${rel}`", "tests/core/inject.test.ts", pattern="truncated with a pointer")
 mutate("core/vault.ts", '    if (code === "ENOENT" || code === "ENOTDIR") return false;\n', "    return false;\n", "tests/core/vault.test.ts", pattern="cannot be read says so")
 mutate("core/session.ts", "      project: project.name,\n      projectDir: project.dir,\n      status,", "      project: project.name,\n      projectDir: null,\n      status,", SE, pattern="happy path: clone")

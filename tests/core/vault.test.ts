@@ -105,7 +105,7 @@ test(
     await mkdir(join(root, ".obsidian"));
     await chmod(root, 0o000);
     try {
-      await assert.rejects(resolveVault({ OBSIDIAN_VAULT_PATH: root }), (err: unknown) => err instanceof VaultError && /^OBSIDIAN_VAULT_PATH ".*" cannot be read \(EACCES\)$/.test(err.message));
+      await assert.rejects(resolveVault({ OBSIDIAN_VAULT_PATH: root }), (err: unknown) => err instanceof VaultError && /^the vault at OBSIDIAN_VAULT_PATH cannot be read: ".*\/\.obsidian" \(EACCES\)$/.test(err.message));
     } finally {
       await chmod(root, 0o755);
     }

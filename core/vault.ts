@@ -30,7 +30,7 @@ async function isDirectory(path: string): Promise<boolean> {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return false;
-    throw new VaultError(`OBSIDIAN_VAULT_PATH "${path}" cannot be read (${code ?? (err as Error).message})`);
+    throw new VaultError(`the vault at OBSIDIAN_VAULT_PATH cannot be read: "${path}" (${code ?? (err as Error).message})`);
   }
 }
 
