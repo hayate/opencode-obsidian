@@ -657,3 +657,23 @@ mutate("core/session.ts", "  await new Promise((resolve) => setTimeout(resolve, 
 mutate("core/session.ts", "later.kind === \"ok\" && later.name === ctx.project ? { ...ctx", "later.kind === \"ok\" ? { ...ctx", SE, pattern="maps to another folder")
 mutate("core/session.ts", "    shared.resolved = project;\n    markPulled();\n", "    shared.resolved = project;\n", SE, pattern="does not wait for the journal")
 mutate("core/session.ts", "? { ...ctx, timezone: started.shared.timezone } : null", "? ctx : null", SE, pattern="settled context carries the zone")
+
+# The OpenCode adapter (spec 8): its harness.
+OH = "adapters/opencode/harness.ts"; AH = "tests/adapters/opencode/harness.test.ts"
+# D10: the summarizer gets no tools (by wildcard, which is what reaches MCP tools, and by id),
+# and its sessions are known before they are prompted, and let go once deleted.
+mutate(OH, '{ "*": false, ...Object.fromEntries(', "{ ...Object.fromEntries(", AH, pattern="every tool off")
+mutate(OH, ".map((id) => [id, false])", ".map((id) => [id, true])", AH, pattern="every tool off")
+mutate(OH, "    this.helpers.add(created.id);\n", "", AH, pattern="known before its first prompt")
+mutate(OH, "      this.helpers.delete(created.id);\n", "", AH, pattern="every tool off")
+mutate(OH, "      await this.client.session.delete({ path: { id: created.id } }).catch(() => undefined);\n", "", AH, pattern="deletes the helper when the prompt fails")
+# A failed or empty reply is a failure, never an empty summary.
+mutate(OH, "      if (reply.info.error !== undefined) throw", "      if (false) throw", AH, pattern="provider's failure")
+mutate(OH, '      if (text.trim() === "") throw', "      if (false) throw", AH, pattern="provider's failure")
+# D7's order.
+mutate(OH, "const name = cfg.small_model ?? cfg.model;", "const name = cfg.model ?? cfg.small_model;", AH)
+# The transcript after the last journaled message: in order, failures and unfinished calls kept.
+mutate(OH, 'all.findIndex((m) => m.info.id === afterMessageId) + 1', "0", AH, pattern="readTranscript")
+mutate(OH, '            : p.state.status === "error"', '            : false', AH, pattern="readTranscript")
+mutate(OH, '        const call = `${p.tool ?? "tool"} ${JSON.stringify(p.state.input ?? {})}`;', '        const call = `${p.tool ?? "tool"}`;', AH, pattern="readTranscript")
+mutate(OH, "    const to = last !== undefined && running(last) ? all.length - 1 : all.length;", "    const to = all.length;", AH, pattern="still running in the last message")
