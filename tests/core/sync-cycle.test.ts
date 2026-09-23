@@ -1577,6 +1577,65 @@ test("adopting a rewritten remote scans what it carries over: a secret there ask
   assert.ok(!(await gitOk(["log", "-p", "--all"], { cwd: remote })).includes(TOKEN));
 });
 
+// Spec 5.4 step 3 (the gauntlet fix wave, 2026-09-23): the commit this cycle builds in the
+// state clone skipped the message scan along with the tree diff its first parent makes
+// redundant. That message interpolates the machine name and the project folder names, and
+// unlike a hand commit it is not one the user can amend in Projects/, so it needs its own
+// wording: what the message is made of, and what to rename.
+test("the message of the merge commit this cycle builds is scanned too: a machine name the scan flags stops the cycle, naming what that message is made of", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/t.md", "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  // B diverges through a commit of its own, made by hand so that its message is clean and
+  // only the generated one can be flagged; the cycle must then merge.
+  await commitFile(b.projects, "x/s.md", "from b\n", "by hand");
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  const r = await runCycle({ timezone: TZ, projectsDir: b.projects, remote, branch: "main", stateDir: b.state, machine: TOKEN, quietMs: 0 });
+  assert.equal(r.outcome, "stopped", r.reason ?? "");
+  assert.equal(
+    r.reason,
+    `the secret scan flags the message of the commit this sync would build: nothing was pushed. That message is made only of this machine's name (${JSON.stringify(TOKEN)}) and the folders it would send ("x"), never of anything inside a note, so rewriting a commit is not the fix: rename whichever of those the scan flags, then sync again`,
+  );
+  assert.equal(stoppedMentions(r), 1, statusFromCycle(r)[0]?.text);
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
+  assert.ok(!(await gitOk(["log", "-p", "--all"], { cwd: remote })).includes(TOKEN));
+  // Renamed, the same cycle merges and pushes both machines' notes.
+  const again = await runCycle({ timezone: TZ, projectsDir: b.projects, remote, branch: "main", stateDir: b.state, machine: "b", quietMs: 0 });
+  assert.equal(again.outcome, "synced", again.reason ?? "");
+  assert.ok(again.pushed);
+  assert.equal(await remoteFile(remote, "x/s.md"), "from b");
+  assert.equal(await remoteFile(remote, "x/t.md"), "from a");
+});
+
+test("the message the adopt path builds is scanned too: a project folder the scan flags stops the cycle, and nothing is pushed", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  const before = await gitOk(["rev-parse", "main"], { cwd: remote });
+  await writeRel(a.projects, "x/dropped.md", "sent, then dropped by the rewrite\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  await forcePushBack(remote, before);
+  // A folder whose own name the scan flags, carried over by the adopt: the generated
+  // message lists it, and no commit of the vault is sent for the per-commit scan to catch.
+  await commitFile(a.projects, `${TOKEN}/note.md`, "kept\n", "by hand, never sent");
+  const adopt = { timezone: TZ, projectsDir: a.projects, remote, branch: "main", stateDir: a.state, machine: "a", quietMs: 0, adoptRewrite: true };
+  const r = await runCycle(adopt);
+  assert.equal(r.outcome, "stopped", r.reason ?? "");
+  assert.equal(
+    r.reason,
+    `the secret scan flags the message of the commit this sync would build: nothing was pushed. That message is made only of this machine's name ("a") and the folders it would send (${JSON.stringify(TOKEN)}), never of anything inside a note, so rewriting a commit is not the fix: rename whichever of those the scan flags, then sync again`,
+  );
+  assert.equal(stoppedMentions(r), 1, statusFromCycle(r)[0]?.text);
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
+  assert.ok(!(await gitOk(["log", "-p", "--all"], { cwd: remote })).includes(TOKEN));
+  // Renamed, the adopt carries the note over under its new folder.
+  await gitOk(["mv", TOKEN, "renamed"], { cwd: a.projects });
+  await gitOk(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "renamed by hand"], { cwd: a.projects });
+  const again = await runCycle(adopt);
+  assert.equal(again.outcome, "synced", again.reason ?? "");
+  assert.ok((await remoteNames(remote)).includes("renamed/note.md"));
+});
+
 test("a temporary index a killed cycle left in the state clone is swept away", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];

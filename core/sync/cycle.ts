@@ -421,6 +421,9 @@ interface OutboundHits {
   inCommits: Array<{ file: string | null; commit: string }>;
   // Flagged in what the push leaves on the remote (from..to as two trees).
   inTree: string[];
+  // Flagged in the message of the commit this cycle built (`built`). It is not in the
+  // vault's history and the user cannot amend it, so it has its own stop.
+  generatedMessage: boolean;
 }
 
 // Spec 5.4 step 3: nothing unscanned leaves the machine. The push sends every commit
@@ -431,7 +434,10 @@ interface OutboundHits {
 // the remote's tree already holds (a copy of a remote version is inside the trusted
 // remote already, and would otherwise block every cycle). `built` is the commit this
 // cycle made in the state clone, if `to` is one: its first parent is `from`, so its
-// own additions are the tree's, and it is in no history the user can rewrite.
+// own additions are the tree's, and it is in no history the user can rewrite. Only that
+// redundant diff is skipped for it: its message is built here, from the machine name and
+// the project folder names, and a credential-shaped name in either would otherwise reach
+// the remote inside a commit the user cannot amend in Projects/.
 async function outboundHits(clone: string, from: string, to: string, built: boolean): Promise<OutboundHits> {
   let remoteObjects: Promise<Set<string | undefined>> | undefined;
   const exempt = async (commit: string, file: string): Promise<boolean> => {
@@ -442,23 +448,37 @@ async function outboundHits(clone: string, from: string, to: string, built: bool
     return (await remoteObjects).has(oid);
   };
   const inCommits: OutboundHits["inCommits"] = [];
+  let generatedMessage = false;
   // Oldest first, each with its parents; a root commit adds all it holds.
   const commits = (await gitOk(["rev-list", "--reverse", "--topo-order", "--parents", `${from}..${to}`], { cwd: clone })).split("\n");
   for (const line of commits.filter(Boolean)) {
     const [commit = "", parent = EMPTY_TREE] = line.split(" ");
-    if (built && commit === to) continue;
-    if (scanText(await gitOk(["log", "-1", "--format=%B", commit], { cwd: clone })).length) inCommits.push({ file: null, commit });
+    const own = built && commit === to;
+    if (scanText(await gitOk(["log", "-1", "--format=%B", commit], { cwd: clone })).length) {
+      if (own) generatedMessage = true;
+      else inCommits.push({ file: null, commit });
+    }
+    if (own) continue;
     for (const file of [...(await scanRange(clone, parent, commit)).keys()].sort()) {
       if (!(await exempt(commit, file))) inCommits.push({ file, commit });
     }
   }
   const inTree: string[] = [];
   for (const file of (await scanRange(clone, from, to)).keys()) if (!(await exempt(to, file))) inTree.push(file);
-  return { inCommits, inTree: inTree.sort() };
+  return { inCommits, inTree: inTree.sort(), generatedMessage };
 }
 
 async function outbound(clone: string, input: CycleInput, from: string, to: string, built: boolean, conflicts: Conflict[]): Promise<Integration> {
-  const { inCommits, inTree } = await outboundHits(clone, from, to, built);
+  const { inCommits, inTree, generatedMessage } = await outboundHits(clone, from, to, built);
+  // First: this one recurs every cycle whatever the user does to their own commits, and
+  // rewriting a commit is not what fixes it.
+  if (generatedMessage) {
+    const projects = [...new Set((await changedBetween(clone, from, to)).map((f) => f.split("/")[0] ?? ""))].sort();
+    return {
+      kind: "stopped",
+      reason: `the secret scan flags the message of the commit this sync would build: nothing was pushed. That message is made only of this machine's name (${quoted(input.machine)}) and the folders it would send (${joinNames(projects)}), never of anything inside a note, so rewriting a commit is not the fix: rename whichever of those the scan flags, then sync again`,
+    };
+  }
   if (inCommits.length) {
     // The short hash as git abbreviates it in the vault, where the user rewrites.
     const shown: string[] = [];

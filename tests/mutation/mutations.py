@@ -144,7 +144,8 @@ mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit-tree", merged.tree, "-p", ups
 mutate("core/sync/cycle.ts", '    if (kept === "no") {', "    if (false) {", C, pattern='a rewritten remote stops the cycle: nothing is merged')
 mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-m", message]', '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-p", live, "-m", message]', C, pattern='adopting a rewritten remote carries over only the changes')
 mutate("core/sync/cycle.ts", "if (!(await exempt(to, file))) inTree.push(file);", "inTree.push(file);", C, pattern="what the remote already holds never blocks")
-mutate("core/sync/cycle.ts", "  const { inCommits, inTree } = await outboundHits(clone, from, to, built);", "  const { inCommits, inTree } = { inCommits: [], inTree: [] };", C,
+mutate("core/sync/cycle.ts", "  const { inCommits, inTree, generatedMessage } = await outboundHits(clone, from, to, built);",
+       "  const { inCommits, inTree, generatedMessage } = { inCommits: [], inTree: [], generatedMessage: false };", C,
        pattern="reached a local commit without the snapshot scan")
 mutate("core/sync/cycle.ts", "  await gitOk([\"update-ref\", REMOTE_SEEN, next], { cwd: dir });\n", "", C, pattern='a rewritten remote stops the cycle: nothing is merged')
 mutate("core/sync/cycle.ts", "  if (reset.timedOut) {\n    // Not the user's block", "  if (false) {\n    // Not the user's block", C, pattern="a live update killed on its timeout is not the user's block")
@@ -271,7 +272,7 @@ mutate(CY, "would be (?:overwritten|removed) by merge", "would be (?:overwritten
 mutate(CY, r"|Updating '([\s\S]+?)' would lose untracked files in it)$/gm", r")$/gm", C, pattern="a held-back note in a folder the remote replaces")
 mutate(CY, "for (const line of commits.filter(Boolean)) {", "for (const line of commits.filter(Boolean).slice(0, 0)) {", C, pattern="a secret one hand commit added")
 mutate(CY, "if (!(await exempt(commit, file))) inCommits.push({ file, commit });", "inCommits.push({ file, commit });", C, pattern="adds only what the remote's tree already holds")
-mutate(CY, "    if (built && commit === to) continue;\n", "", C, pattern="scans what it carries over")
+mutate(CY, "    if (own) continue;\n", "", C, pattern="scans what it carries over")
 mutate(CY, "  for (const file of (await scanRange(clone, from, to)).keys()) if (!(await exempt(to, file))) inTree.push(file);\n", "", C, pattern="scans what it carries over")
 mutate(CY, "      conflicts = integration.conflicts;\n", "      conflicts = integration.conflicts;\n      result.conflicts = conflicts;\n", C, pattern="only once its copy is on the remote")
 mutate(CY, "(a force-push): nothing the rewrite", "(a force-push): sync stopped, so nothing the rewrite", C, pattern="a rewritten remote stops the cycle")
@@ -335,7 +336,7 @@ mutate(CY, r"(?:Entry '([\s\S]+?)' (?:not uptodate", r"(?:Entry '(.+?)' (?:not u
 # Both scans read renames as git does by default, whatever diff.renames says.
 mutate("core/secrets.ts", '      "--find-renames",\n', "", SEC, pattern="read renames as git does")
 # The outbound scan reads each unsent commit's message too.
-mutate(CY, '    if (scanText(await gitOk(["log", "-1", "--format=%B", commit], { cwd: clone })).length) inCommits.push({ file: null, commit });\n', "", C,
+mutate(CY, '''    if (scanText(await gitOk(["log", "-1", "--format=%B", commit], { cwd: clone })).length) {\n      if (own) generatedMessage = true;\n      else inCommits.push({ file: null, commit });\n    }\n''', "", C,
        pattern="in the message of an unsent commit")
 # A repository in another object format than sha1 is refused where sync meets it, and the
 # plugin's own init makes sha1.
@@ -481,3 +482,13 @@ mutate(CY, '    await gitOk(["add", "--", literal(actual)], { cwd: dir, timeoutM
        why="the same hazard as the snapshot's own `add -A`, one note at a time: no test stages a case-only rename whose clean filter is slower than the limit, and on Linux no case-only rename is staged at all")
 mutate(F_RC, '["hash-object", `--path=${twin}`, "--", path], { cwd: dir, timeoutMs })', '["hash-object", `--path=${twin}`, "--", path], { cwd: dir })', C, pattern=FILTERED)
 mutate(F_RC, "        throw err instanceof GitError && err.result.timedOut ? new RepairTimedOut(err.args, err.result, twin) : err;\n", "        throw err;\n", C, pattern=FILTERED)
+
+# The gauntlet fix wave: the commit this cycle builds skips only the tree diff its first
+# parent makes redundant, never the message scan. That message interpolates the machine
+# name and the project folder names, and the user cannot amend it in Projects/, so a hit
+# in it has its own stop and its own wording.
+GENERATED = "is scanned too"
+mutate(CY, "  if (generatedMessage) {", "  if (false) {", C, pattern=GENERATED)
+mutate(CY, "      if (own) generatedMessage = true;\n      else inCommits.push({ file: null, commit });\n", "      inCommits.push({ file: null, commit });\n", C, pattern=GENERATED)
+mutate(CY, "and the folders it would send (${joinNames(projects)})", 'and the folders it would send (${projects.join(", ")})', C, pattern=GENERATED)
+mutate(CY, "this machine's name (${quoted(input.machine)})", "this machine's name (${input.machine})", C, pattern=GENERATED)
