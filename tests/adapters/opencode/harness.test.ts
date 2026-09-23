@@ -76,6 +76,33 @@ test("every way the summarizer fails names the model setting it ran on, so a wro
   await assert.rejects(call(new OpenCodeHarness(client, undefined)), /^Error: the summarizer \(OpenCode's default model\) returned no text$/);
 });
 
+test("a call that rejects keeps its cause, and a rejected value that is not an Error reads as its JSON, as an error answer does", async () => {
+  const client = new FakeClient();
+  const call = () => new OpenCodeHarness(client, "p/m").callModel({ system: "S", prompt: "P", parentSessionId: "ses_p" });
+  const refused = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:4096"), { code: "ECONNREFUSED" });
+  const fetchFailed = new TypeError("fetch failed", { cause: refused });
+  client.replyReject = { value: fetchFailed };
+  await assert.rejects(call(), (err: Error) => err.message === 'the summarizer (journalModel "p/m") failed: TypeError: fetch failed' && err.cause === fetchFailed);
+  client.replyReject = { value: { name: "APIError", data: { message: "overloaded" } } };
+  await assert.rejects(call(), /^Error: the summarizer \(journalModel "p\/m"\) failed: \{"name":"APIError","data":\{"message":"overloaded"\}\}$/);
+  const bare = Object.assign(Object.create(null), { name: "Bare" });
+  client.replyReject = { value: bare };
+  await assert.rejects(call(), /^Error: the summarizer \(journalModel "p\/m"\) failed: \{"name":"Bare"\}$/);
+});
+
+test("readTranscript skips a text part whose text is not a string, as the reply does, and the journal still gets the rest", async () => {
+  const client = new FakeClient([
+    {
+      id: "ses_a",
+      directory: "/code",
+      messages: [
+        { info: { id: "m1", role: "user", time: { created: 1 } }, parts: [{ type: "text", text: { odd: true } as unknown as string }, { type: "text", text: "hello" }] },
+      ],
+    },
+  ]);
+  assert.deepEqual((await new OpenCodeHarness(client, undefined).readTranscript("ses_a")).messages, [{ id: "m1", role: "user", text: "hello", time: 1 }]);
+});
+
 test("callModel names no model when none is configured, and deletes the helper when the prompt fails", async () => {
   const client = new FakeClient();
   client.reply = new Error("provider down");
@@ -167,6 +194,10 @@ test("a journal model that is not provider/model is told, and the entry does not
   assert.match(chosen.problem ?? "", /journalModel "haiku" is not provider\/model/);
   client.cfg = { small_model: "nomodel" };
   assert.match((await new OpenCodeHarness(client, undefined).model()).problem ?? "", /small_model "nomodel" is not provider\/model/);
+  // Its failure names the model that ran, OpenCode's default, and the setting that sent it there.
+  assert.equal(chosen.source, `OpenCode's default model, as journalModel "haiku" is not provider/model`);
+  client.replyError = { name: "APIError", data: { message: "overloaded" } };
+  await assert.rejects(new OpenCodeHarness(client, "haiku").callModel({ system: "S", prompt: "P", parentSessionId: "ses_p" }), /^Error: the summarizer \(OpenCode's default model, as journalModel "haiku" is not provider\/model\) failed: /);
 });
 
 test("a config that cannot be read is told, and read again next time", async () => {
@@ -175,7 +206,9 @@ test("a config that cannot be read is told, and read again next time", async () 
   const harness = new OpenCodeHarness(client, undefined);
   const first = await harness.model();
   assert.equal(first.ref, null);
-  assert.match(first.problem ?? "", /the OpenCode config could not be read/);
+  assert.equal(first.source, "OpenCode's default model");
+  // Said once: the error already says what was being read.
+  assert.match(first.problem ?? "", /^reading the OpenCode config failed: .*unreadable.*; the journal uses OpenCode's default model this time$/);
   client.cfg = { small_model: "p/small" };
   assert.deepEqual(await harness.model(), { name: "p/small", ref: { providerID: "p", modelID: "small" }, source: 'small_model "p/small"', problem: null });
 });

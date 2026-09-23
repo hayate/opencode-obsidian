@@ -29,14 +29,25 @@ export interface OpenCodeClient {
   tui: { showToast(o: { body: { title?: string; message: string; variant: "info" | "success" | "warning" | "error" } }): Result<unknown> };
 }
 
+// A failure as text: an Error as its message; any other object (the error body the SDK parsed,
+// or a value a client threw) as its JSON, which says more than "[object Object]".
+function described(err: unknown): string {
+  if (err instanceof Error || typeof err !== "object" || err === null) return errorText(err);
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return Object.prototype.toString.call(err);
+  }
+}
+
 async function data<T>(call: Result<T>, what: string): Promise<T> {
   // A call that throws (the server cannot be reached) is labelled like one that answers with an
-  // error: either way the message says what was being done.
+  // error: either way the message says what was being done. The original stays as the cause.
   const r = await call.catch((err: unknown) => {
-    throw new Error(`${what} failed: ${errorText(err)}`);
+    throw new Error(`${what} failed: ${described(err)}`, { cause: err });
   });
   if (r.error !== undefined || r.data === undefined) {
-    const why = r.error === undefined ? "no data" : typeof r.error === "object" ? JSON.stringify(r.error) : errorText(r.error);
+    const why = r.error === undefined ? "no data" : described(r.error);
     // An empty-bodied failure reads as {}: the status is what says anything then.
     const status = r.response?.status === undefined ? "" : `HTTP ${r.response.status} `;
     throw new Error(`${what} failed: ${status}${why}`);
@@ -60,12 +71,12 @@ const DEFAULT_SOURCE = "OpenCode's default model";
 
 function named(setting: string, value: string): Chosen {
   const ref = parseModel(value);
-  const source = `${setting} "${value}"`;
-  if (ref !== null) return { name: value, ref, source, problem: null };
+  if (ref !== null) return { name: value, ref, source: `${setting} "${value}"`, problem: null };
   return {
     name: `${value} (not provider/model: OpenCode's default model ran)`,
     ref: null,
-    source,
+    // The model that ran, and so the one a failure is about, is OpenCode's default.
+    source: `${DEFAULT_SOURCE}, as ${setting} "${value}" is not provider/model`,
     problem: `${setting} "${value}" is not provider/model, so OpenCode's default model writes the journal`,
   };
 }
@@ -95,7 +106,7 @@ export class OpenCodeHarness implements Harness {
       if (this.option !== undefined) return named("journalModel", this.option);
       const read = await data(this.client.config.get(), "reading the OpenCode config").then(
         (cfg) => ({ cfg, problem: null }),
-        (err: unknown) => ({ cfg: { model: undefined, small_model: undefined }, problem: `the OpenCode config could not be read (${errorText(err)}); the journal uses OpenCode's default model this time` }),
+        (err: unknown) => ({ cfg: { model: undefined, small_model: undefined }, problem: `${errorText(err)}; the journal uses OpenCode's default model this time` }),
       );
       if (read.problem !== null) {
         this.chosen = null;
@@ -171,7 +182,7 @@ export class OpenCodeHarness implements Harness {
       const role = m.info.role === "user" ? "user" : "assistant";
       const time = m.info.time.created;
       for (const p of m.parts) {
-        if (p.type === "text" && p.text) messages.push({ id: m.info.id, role, text: p.text, time });
+        if (p.type === "text" && typeof p.text === "string" && p.text) messages.push({ id: m.info.id, role, text: p.text, time });
         if (p.type !== "tool" || p.state === undefined) continue;
         const call = `${p.tool ?? "tool"} ${JSON.stringify(p.state.input ?? {})}`;
         const text =
