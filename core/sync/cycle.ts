@@ -180,6 +180,11 @@ async function dropEmbeddedRepos(dir: string): Promise<string[]> {
   return links;
 }
 
+// A file modified this recently may be another session's write still in progress: the
+// snapshot leaves it for the next cycle. An adapter that syncs right after its own session
+// wrote waits this long first, or that write waits for the next cycle.
+export const QUIET_MS = 2000;
+
 // Spec 5.4 step 5 escalates after this many blocked live updates in a row (session.ts
 // says it louder at the threshold).
 export const ESCALATE_AT = 3;
@@ -353,7 +358,7 @@ async function snapshot(input: CycleInput, ladder: Ladder, result: CycleResult):
   // pass is never far "ahead". An mtime further in the future (the clock was
   // corrected backwards) is quiet: deferring it would defer the file every cycle,
   // silently, for as long as the skew lasts.
-  const quietMs = input.quietMs ?? 2000;
+  const quietMs = input.quietMs ?? QUIET_MS;
   for (const file of await stagedFiles(dir)) {
     const s = await stampOf(join(dir, file));
     if (s && Math.abs(Date.now() - s.mtimeMs) < quietMs) {

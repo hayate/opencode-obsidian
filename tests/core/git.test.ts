@@ -370,7 +370,10 @@ test("a session that exits normally takes the git it started with it, and instal
     try {
       process.kill(-group, 0);
     } catch (err) {
-      assert.equal((err as NodeJS.ErrnoException).code, "ESRCH");
+      // ESRCH: the group is gone. EPERM: the id already belongs to another user's processes
+      // (the OS reused it within this poll, seen once on macOS): the git this test started
+      // runs as this user, so none of it is left in that group either.
+      assert.ok(["ESRCH", "EPERM"].includes((err as NodeJS.ErrnoException).code ?? ""), String(err));
       break;
     }
     assert.ok(Date.now() - started < 10_000, "the git the session started outlived it");

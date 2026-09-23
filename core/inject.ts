@@ -1,8 +1,9 @@
 // Spec 7.2-7.3: the session-start payload, built once and frozen. Everything
 // recorded (handoffs, journal, identity) sits inside a block framed as data.
 import type { Handoff, Heads } from "./store.ts";
-import { MALFORMED_BRANCH, vaultName } from "./store.ts";
+import { MALFORMED_BRANCH, quoted, vaultName } from "./store.ts";
 import type { JournalEntry } from "./journal.ts";
+import { escapeTag, tagPattern } from "./tags.ts";
 
 export const PAYLOAD_MARKER = "<!-- superpower-remember-obsidian:memory -->";
 export const DEFAULT_BUDGET = 24_000;
@@ -20,6 +21,9 @@ export interface StatusItem {
 export interface PayloadInput {
   bootstrap: string;
   project: string | null;
+  // Where the project's folder is, absolute (null with no project): the model's file tools take
+  // literal paths, and "Projects/<name>" alone reads as a folder of the working directory.
+  projectDir: string | null;
   status: StatusItem[];
   branch: string | null;
   heads: Heads | null;
@@ -30,15 +34,13 @@ export interface PayloadInput {
   budgetChars?: number;
 }
 
-// Any spelling a reader could take for the data block's own tags (case, spaces,
-// invisible characters, "_" for "-", look-alike angle brackets).
-const BLOCK_TAG = /[<\uFE64\uFF1C][\s\p{Cf}]*\/?[\s\p{Cf}]*recorded[\s\p{Cf}_-]*project[\s\p{Cf}_-]*memory/giu;
+const BLOCK_TAG = tagPattern("recorded", "project", "memory");
 
 // The block's tags appear only where buildPayload writes them. Anywhere else the
 // tag's "<" is escaped, so recorded text can neither end the block early nor
 // open one of its own; the text stays readable.
 export function escapeBlockTags(text: string): string {
-  return text.replace(BLOCK_TAG, (tag) => `&lt;${tag.slice(1)}`);
+  return escapeTag(text, BLOCK_TAG);
 }
 
 // Escaped before it is cut: a cut through the middle of a tag would leave a
@@ -46,7 +48,10 @@ export function escapeBlockTags(text: string): string {
 function cut(text: string, max: number, where: string): string {
   const t = escapeBlockTags(text.trim());
   if (t.length <= max) return t;
-  return `${t.slice(0, Math.max(0, max)).trimEnd()}\n...(truncated; full text: ${where})`;
+  // The pointer counts against max: an absolute path can be long, and a section that overran its
+  // share would leave the final budget cut to land inside the path.
+  const pointer = `\n...(truncated; full text: ${where})`;
+  return `${t.slice(0, Math.max(0, max - pointer.length)).trimEnd()}${pointer}`;
 }
 
 function firstLine(h: Handoff): string {
@@ -90,11 +95,26 @@ export function selectHandoffs(
   return { title, list, others };
 }
 
+// A path whole, however long (the model's file tools need all of it): exact, in backticks, when
+// plain; escaped as a JSON string when it holds a line break, an invisible character or a backtick,
+// readable but not always exact (a folder named like the memory block's tag is escaped too). The
+// folder name in it comes from the vault, synced from other machines, and must never add lines.
+function pathShown(path: string): string {
+  return /^[^\p{Cc}\p{Cf}\u2028\u2029`]+$/u.test(path) ? `\`${path}\`` : quoted(path, Infinity);
+}
+
+// Where a truncated memory file is in full: absolute when the project's folder is known, like the
+// Project line, since a relative pointer reads as a path in the working directory.
+function fileOf(input: PayloadInput, rel: string): string {
+  return input.projectDir === null ? `Projects/${vaultName(input.project ?? "")}/${rel}` : pathShown(`${input.projectDir}/${rel}`);
+}
+
 export function buildPayload(input: PayloadInput): string {
   const budget = input.budgetChars ?? DEFAULT_BUDGET;
   const status = input.status.length ? input.status.map((s) => `- [${s.level}] ${escapeBlockTags(s.text)}`) : ["- [info] all good"];
   const shown = input.project === null ? null : vaultName(input.project);
-  const project = shown === null ? "none" : shown === input.project ? `\`${shown}\` (Projects/${shown})` : `${shown} (a folder in Projects/)`;
+  const where = input.projectDir === null ? "" : `, in the Obsidian vault at ${pathShown(input.projectDir)} (not in the working directory)`;
+  const project = shown === null ? "none" : shown === input.project ? `\`${shown}\`${where}` : `${shown} (a folder in Projects/)${where}`;
   const head = [PAYLOAD_MARKER, input.bootstrap.trim(), "", "## Project and status", `- Project: ${escapeBlockTags(project)}`, ...status].join("\n");
   if (!input.project) return head;
 
@@ -117,7 +137,7 @@ export function buildPayload(input: PayloadInput): string {
       const share = Math.max(0, Math.floor((remaining * 0.5) / full.length) - HEAD_OVERHEAD);
       const block = [`\n### ${sel.title}`];
       for (const h of full) {
-        block.push(full.length > 1 ? `\n#### ${h.id}` : "", cut(h.body, share, `Projects/${input.project}/remember/handoffs/${h.id}.md`));
+        block.push(full.length > 1 ? `\n#### ${h.id}` : "", cut(h.body, share, fileOf(input, `remember/handoffs/${h.id}.md`)));
       }
       const rest = sel.list.slice(MAX_FULL_HEADS);
       if (rest.length) {
@@ -135,7 +155,7 @@ export function buildPayload(input: PayloadInput): string {
     for (const p of parts) remaining -= p.length;
   }
 
-  const identity = input.identity ? `\n### Identity\n${cut(input.identity, IDENTITY_CAP, `Projects/${input.project}/remember/identity.md`)}` : "";
+  const identity = input.identity ? `\n### Identity\n${cut(input.identity, IDENTITY_CAP, fileOf(input, "remember/identity.md"))}` : "";
   remaining -= identity.length;
 
   const today = [...input.todayEntries].sort((a, b) => b.id.localeCompare(a.id));
@@ -151,7 +171,7 @@ export function buildPayload(input: PayloadInput): string {
     remaining -= block.length;
   }
   if (input.recent?.trim() && remaining > 200) {
-    const block = `\n### Journal: recent\n${cut(input.recent.replace(/^# .*\n/, ""), remaining - 40, `Projects/${input.project}/remember/recent.md`)}`;
+    const block = `\n### Journal: recent\n${cut(input.recent.replace(/^# .*\n/, ""), remaining - 40, fileOf(input, "remember/recent.md"))}`;
     parts.push(block);
   }
   if (identity) parts.push(identity);

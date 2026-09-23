@@ -40,13 +40,15 @@ subfolders) if they do not already exist.
 - `Projects/<project>/archive/` - dated copies of superseded handoffs and plans.
 - `Agents/<machine>/` - per-machine working notes.
 
-The project folder is named after the repo/project. A session working in a
-repo maps its state to `Projects/<that-name>/`.
+The project folder is the one the session's memory names: the `Project:`
+line at the top of the session. The plugin finds it by the repository's
+recorded origin first, so it can differ from the clone's folder name; never
+derive it from the repository name yourself. If the memory says memory is
+disabled, do not write into `Projects/` at all.
 
-Create the `Projects/` directory (and the `<project>/` folder plus its
-subfolders) with `bash mkdir -p` if they do not already exist inside the vault
-before writing any handoff, spec, plan, decision, or note. The user does not
-create these; opencode does.
+Create the project folder's subfolders (`specs/`, `plans/`, `decisions/`,
+`notes/`, `archive/`) with `bash mkdir -p` when one you need does not exist yet.
+The user does not create these; opencode does.
 
 ## Handoff lifecycle
 
@@ -123,42 +125,29 @@ related content (e.g. link a HANDOFF to its plan with
 
 ## Sync
 
-`Projects/` is its own git repository. Syncing is governed by the
-`OBSIDIAN_PROJECTS_REMOTE` environment variable, which doubles as the on/off
-switch. The rule is the same everywhere: if it is unset or empty, sync is off;
-if it is nonempty, sync is on and its value is the remote URL or path. Treat an
-exported empty string the same as unset - both mean off.
+`Projects/` is its own git repository, and the plugin keeps it in sync: at the
+start of every OpenCode session and whenever a session goes idle, it commits
+what changed under `Projects/`, integrates what other machines pushed, and
+pushes. `OBSIDIAN_PROJECTS_REMOTE` is the on/off switch: unset or empty means
+sync is off; a URL or path means sync is on, to that remote.
 
-When sync is off: create `Projects/` and its subfolders with `mkdir -p` as
-needed, and do no git operations at all.
+**Never run git in `Projects/`** - no pull, commit, push, stash, or reset. Git
+commands there race the plugin's own and can strand changes. Write notes with the
+file tools; the plugin sends them.
 
-When sync is on, follow this ordered procedure on first use and on every session:
+The plugin reports what it did as status lines at the top of the session, and
+later ones as notes in the conversation, only when they have something new:
 
-1. Determine the `Projects/` state and act accordingly:
-   - Absent or empty directory: clone `OBSIDIAN_PROJECTS_REMOTE` into
-     `Projects/`. If the remote is an empty repo (no commits yet), bootstrap it:
-     create the first commit locally and `git push -u origin main` (use the
-     remote's default branch name if it differs).
-   - Nonempty but not a git repo: stop and tell the user - their existing notes
-     need an explicit import or migration; do not overwrite them with a clone.
-   - Already a git repo: verify `origin` matches `OBSIDIAN_PROJECTS_REMOTE`
-     before any pull or push. Fail loudly on a mismatch rather than silently
-     changing it or pushing to a stale remote. After the first clone, `origin` -
-     not the env var - governs pull/push; the env var is only re-read to confirm
-     the remote has not changed.
-2. On session start, pull before reading or writing anything: `git -C
-   <vault>/Projects pull --rebase --autostash`.
-3. After edits under `Projects/`, commit noninteractively and push. First confirm
-   `user.name` and `user.email` are configured (fail with instructions if not),
-   then check `git status`, stage the intended files (`git add -A` only when the
-   whole tree is the intended change), `git commit -m "..."`, and `git push`.
-4. If the push is rejected as non-fast-forward, fetch and rebase, then retry a
-   bounded number of times. If rebasing conflicts, stop, preserve both versions,
-   and ask the user to resolve. Simultaneous edits to the same file (a shared
-   HANDOFF.md, for example) are not automatically merge-safe.
+- A note changed on two machines keeps both versions: yours at the path, the
+  other beside it as a conflict copy. The status line names both. Merge what you
+  need into the note, then delete the copy.
+- A file the secret scan held back is not synced until the secret is gone. Fix
+  the file, then run `remember_sync`.
+- A line tagged `[error]` needs the user: tell them what it says.
+- A line saying the remote's history was rewritten stops sync until the user
+  decides. Only when they confirm the rewrite was intended, run
+  `remember_sync` with `adopt_rewrite: true`.
 
-Because `Projects/` is its own repo, the vault repo (if it is one) must not also
-track it. Add `Projects/` to the vault repo's root `.gitignore`. If the vault
-already tracks it, remove it from the index without deleting the files
-(`git rm -r --cached Projects`), commit that removal, and only then establish
-the nested repo.
+Because `Projects/` is its own repository, the vault's own repository (if the
+vault is one) must not also track it. The plugin refuses to sync while it does;
+the README's procedure "The vault's own repository tracks `Projects/`" fixes it.

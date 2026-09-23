@@ -103,3 +103,14 @@ export async function endHelper(child: ChildProcess, kill: "child" | "group" = "
   }
   await once(child, "exit");
 }
+
+// Text as a reader takes it: compatibility forms folded (fullwidth letters and brackets become
+// ASCII), invisible characters gone, dash and slash look-alikes plain. Tests count a fence's tags
+// in this view, independently of the pattern the code escapes them with.
+export function asRead(text: string): string {
+  return text
+    .normalize("NFKC")
+    .replace(/\p{Cf}/gu, "")
+    .replace(/[\u2010-\u2015\u2212]/g, "-")
+    .replace(/[\u2215\u2044]/g, "/");
+}

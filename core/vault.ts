@@ -22,18 +22,22 @@ export class VaultError extends Error {
   }
 }
 
+// Only a path that is not there, or not a directory on the way, is "not a directory": any other
+// failure (EACCES, ELOOP, EIO) says what it is, never that the vault does not exist.
 async function isDirectory(path: string): Promise<boolean> {
   try {
     return (await stat(path)).isDirectory();
-  } catch {
-    return false;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    throw new VaultError(`the vault at OBSIDIAN_VAULT_PATH cannot be read: "${path}" (${code ?? (err as Error).message})`);
   }
 }
 
 export async function resolveVault(env: Record<string, string | undefined> = process.env): Promise<Vault> {
   const raw = env.OBSIDIAN_VAULT_PATH?.trim();
   if (!raw) {
-    throw new VaultError("OBSIDIAN_VAULT_PATH is not set: set it to the absolute path of your Obsidian vault");
+    throw new VaultError("OBSIDIAN_VAULT_PATH is not set: this plugin needs it set to the absolute path of your Obsidian vault");
   }
   if (!isAbsolute(raw)) throw new VaultError(`OBSIDIAN_VAULT_PATH must be absolute, got "${raw}"`);
   if (!(await isDirectory(raw))) throw new VaultError(`OBSIDIAN_VAULT_PATH "${raw}" does not exist or is not a directory`);
@@ -44,8 +48,11 @@ export async function resolveVault(env: Record<string, string | undefined> = pro
   return { root, projectsDir: join(root, "Projects") };
 }
 
+// This machine's zone as Intl reports it, or UTC when Intl reports one it then refuses (an
+// exported but empty TZ reads as "Etc/Unknown"): every stamp would throw on it.
 export function systemTimezone(): string {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return isValidTimezone(zone) ? zone : "UTC";
 }
 
 export function isValidTimezone(timeZone: string): boolean {

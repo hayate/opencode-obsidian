@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveVault, readVaultConfig, systemTimezone, VaultError, CONFIG_FILE } from "../../core/vault.ts";
 import { addDays, dayStamp, fileStamp, isoWithOffset, monthStamp, timeStamp } from "../../core/time.ts";
@@ -24,7 +24,7 @@ test("resolveVault returns the real path and its Projects dir", async () => {
 test("resolveVault fails loudly: unset, relative, missing, not a vault", async () => {
   const notVault = await tempDir();
   const cases: Array<[Record<string, string | undefined>, RegExp]> = [
-    [{}, /is not set/],
+    [{}, /^OBSIDIAN_VAULT_PATH is not set: this plugin needs it set to the absolute path of your Obsidian vault$/],
     [{ OBSIDIAN_VAULT_PATH: "   " }, /is not set/],
     [{ OBSIDIAN_VAULT_PATH: "relative/vault" }, /must be absolute/],
     [{ OBSIDIAN_VAULT_PATH: join(notVault, "missing") }, /does not exist/],
@@ -82,3 +82,32 @@ test("addDays crosses month and year boundaries", () => {
   assert.equal(addDays("2026-01-01", -1), "2025-12-31");
   assert.equal(addDays("2026-09-21", -7), "2026-09-14");
 });
+
+// An exported but empty TZ makes node report "Etc/Unknown", a zone Intl itself refuses:
+// every stamp the cycle writes would throw, and every sync would abort.
+test("a system zone Intl refuses (an empty TZ reads as Etc/Unknown) falls back to UTC", () => {
+  const saved = process.env.TZ;
+  try {
+    process.env.TZ = "";
+    assert.equal(Intl.DateTimeFormat().resolvedOptions().timeZone, "Etc/Unknown", "the premise: node reads an empty TZ so");
+    assert.equal(systemTimezone(), "UTC");
+  } finally {
+    if (saved === undefined) delete process.env.TZ;
+    else process.env.TZ = saved;
+  }
+});
+
+test(
+  "a vault that cannot be read says so, never that it does not exist",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const root = await tempDir();
+    await mkdir(join(root, ".obsidian"));
+    await chmod(root, 0o000);
+    try {
+      await assert.rejects(resolveVault({ OBSIDIAN_VAULT_PATH: root }), (err: unknown) => err instanceof VaultError && /^the vault at OBSIDIAN_VAULT_PATH cannot be read: ".*\/\.obsidian" \(EACCES\)$/.test(err.message));
+    } finally {
+      await chmod(root, 0o755);
+    }
+  },
+);

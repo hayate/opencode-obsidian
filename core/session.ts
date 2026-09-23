@@ -8,12 +8,12 @@ import { join } from "node:path";
 import { git } from "./git.ts";
 import type { Harness, SessionRef } from "./harness.ts";
 import { buildPayload, PAYLOAD_MARKER, type StatusItem } from "./inject.ts";
-import { buildRollups, catchUp, listEntries, type JournalContext, type JournalEntry } from "./journal.ts";
+import { buildRollups, catchUp, journalSession, listEntries, type JournalContext, type JournalEntry } from "./journal.ts";
 import { legacyReappeared, schemaVersion, SCHEMA_VERSION } from "./migrate.ts";
 import { normalizeOrigin, recordOrigin, resolveProject, type ProjectResolution } from "./project.ts";
 import { acquireLock } from "./lock.ts";
 import { branchKey, computeHeads, errorText, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
-import { ESCALATE_AT, runCycle, STILL_RUNNING, TIMED_OUT, type CycleResult } from "./sync/cycle.ts";
+import { ESCALATE_AT, QUIET_MS, runCycle, STILL_RUNNING, TIMED_OUT, type CycleResult } from "./sync/cycle.ts";
 import type { Conflict } from "./sync/resolve.ts";
 import { remoteVisibility, type Visibility } from "./sync/privacy.ts";
 import { prepareProjects, syncConfig, type SyncConfig, type SyncState } from "./sync/state.ts";
@@ -43,13 +43,26 @@ export interface SessionContext {
   branchKey: string;
   machine: string;
   remote: string | null;
+  // Spec 5.7: the one privacy check this session made of the remote (null when sync is
+  // off). It may still be running when the context is built; syncSession waits for it,
+  // and never syncs to a remote it found public.
+  privacy: Promise<Checked | null>;
 }
+
+type Checked = { visibility: Visibility; detail: string };
 
 export interface InitResult {
   payload: string;
   status: StatusItem[];
   context: SessionContext | null;
   background: Promise<StatusItem[]>;
+  // The context once the pull has resolved the project (never waiting for the journal's
+  // model calls): what the session's later syncs and journal use. It is `context` when
+  // initialization finished in time; after a timeout it carries the zone the vault's config
+  // gave once pulled, and it is null when the pull disabled memory or mapped the repository
+  // to another folder (the background's lines tell the session to restart). A sync failure
+  // keeps the context: memory still works.
+  settled: Promise<SessionContext | null>;
 }
 
 export const DEFAULT_STATE_ROOT = join(homedir(), ".local", "state", "superpower-remember-obsidian");
@@ -228,7 +241,7 @@ export function statusFromCycle(r: CycleResult): StatusItem[] {
   if (r.outcome === "stopped") out.push({ level: "error", text: `sync stopped: ${r.reason ?? ""}` });
   if (r.outcome === "unsynced") out.push(unsynced(r));
   if (r.outcome === "aborted") out.push({ level: "error", text: `sync aborted: ${r.reason ?? ""}` });
-  if (r.outcome === "busy") out.push({ level: "info", text: "another session is syncing; this one will sync when idle" });
+  if (r.outcome === "busy") out.push({ level: "info", text: "another session is syncing Projects/ right now; what it does not send goes with the next sync" });
   // runCycle records a problem that did not stop the sync (a failed lock release) here.
   if (r.outcome === "synced" && r.reason) out.push({ level: "warn", text: r.reason });
   for (const h of r.heldBack) out.push({ level: "warn", text: `held back by the secret scan (${h.rules.join(", ")}): ${quoted(h.file)}` });
@@ -265,6 +278,7 @@ function statusOnly(bootstrap: string, status: StatusItem[], background: Promise
     status,
     context: null,
     background,
+    settled: Promise.resolve(null),
   };
 }
 
@@ -314,6 +328,65 @@ async function sessionsOfProject(vault: Vault, project: string, sessions: Sessio
   return mine;
 }
 
+export interface SyncRunInput {
+  vault: Vault;
+  cfg: SyncConfig;
+  stateDir: string;
+  machine: string;
+  timezone: string;
+  // remember_sync's "adopt the rewritten remote" (spec 5.4 step 3).
+  adoptRewrite?: boolean;
+}
+
+// What one run reports, and the state preparation found: null when another session
+// held the prepare lock past the wait, and nothing ran.
+export interface SyncRun {
+  items: StatusItem[];
+  state: SyncState | null;
+}
+
+// Spec 5.2-5.4: Projects/ prepared, then one cycle. Initialization, idle and remember_sync
+// all sync through here. It throws what prepareProjects throws.
+export async function prepareAndCycle(input: SyncRunInput): Promise<SyncRun> {
+  const { vault, cfg, stateDir, machine, timezone } = input;
+  const out: StatusItem[] = [];
+  // Two sessions starting at once on a fresh vault must not race the clone:
+  // one machine-wide lock around preparation (the sync lock lives in Projects/.git,
+  // which may not exist yet).
+  const prep = await acquireLock(join(stateDir, "prepare.lock"), { waitMs: 60_000 });
+  if (!prep) {
+    out.push({ level: "warn", text: "another session is still preparing Projects/; run remember_sync shortly" });
+    return { items: out, state: null };
+  }
+  // The lock is released whatever preparation did, and a failing release never replaces
+  // the reason the session needed: it is appended to what prepareProjects threw, or
+  // reported beside what it returned. runCycle does the same with the sync lock.
+  type Prepared = { kind: "ok"; state: SyncState } | { kind: "failed"; err: unknown };
+  const prepared: Prepared = await prepareProjects(vault, cfg, timezone).then(
+    (ready): Prepared => ({ kind: "ok", state: ready }),
+    (err: unknown): Prepared => ({ kind: "failed", err }),
+  );
+  const released = await prep.release().then(
+    () => null,
+    (err: unknown) => `releasing the prepare lock failed: ${errorText(err)}`,
+  );
+  if (prepared.kind === "failed") {
+    if (released !== null && prepared.err instanceof Error) prepared.err.message = `${prepared.err.message}; ${released}`;
+    throw prepared.err;
+  }
+  if (released !== null) out.push({ level: "warn", text: released });
+  const state = prepared.state;
+  out.push(...statusFromSync(state));
+  if (state.kind === "ready" && cfg.remote) {
+    out.push(
+      ...statusFromCycle(
+        await runCycle({ projectsDir: vault.projectsDir, remote: cfg.remote, branch: state.branch, stateDir, machine, timezone, adoptRewrite: input.adoptRewrite }),
+      ),
+    );
+  }
+  return { items: out, state };
+}
+
 type WorkOutcome = { items: StatusItem[]; project: ProjectResolution };
 
 // What runs before the sync work: either a final answer (no vault, a bare
@@ -331,6 +404,11 @@ type Start =
       code: { branch: string | null; sha: string | null };
       machine: string;
       shared: { timezone: string; resolved: ProjectResolution };
+      privacy: Promise<Checked | null>;
+      // Settles once the work knows the project it syncs for (after the pull, or at an early
+      // return or a failure before it), not after the journal's model calls: a later sync
+      // never waits on those.
+      pulled: Promise<void>;
       work: Promise<WorkOutcome>;
     };
 
@@ -362,45 +440,24 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
   const code = await codeBranch(opts.sessionDir);
   const machine = machineName();
   const shared: { timezone: string; resolved: ProjectResolution } = { timezone, resolved: early };
+  // Spec 5.7: one check per session, begun before anything touches Projects/. The work
+  // waits for it here, and the session's later syncs (syncSession) wait for the same one.
+  const privacy: Promise<Checked | null> = cfg.remote === null ? Promise.resolve(null) : remoteVisibility(cfg.remote);
+  let markPulled: () => void = () => undefined;
+  const pulled = new Promise<void>((resolve) => (markPulled = resolve));
   const work = (async (): Promise<WorkOutcome> => {
     const out: StatusItem[] = [];
-    // Spec 5.7: checked before anything touches Projects/, so a public remote is
-    // refused before prepareProjects can clone it (or bootstrap/import push to it).
-    if (cfg.remote) {
-      const vis = await remoteVisibility(cfg.remote);
+    // A public remote is refused before prepareProjects can clone it (or bootstrap/import
+    // push to it).
+    const vis = await privacy;
+    if (cfg.remote && vis) {
       out.push(...statusFromPrivacy(cfg.remote, vis));
       if (vis.visibility === "public") return { items: out, project: early };
     }
-    // Two sessions starting at once on a fresh vault must not race the clone:
-    // one machine-wide lock around preparation (the sync lock lives in Projects/.git,
-    // which may not exist yet).
-    const prep = await acquireLock(join(stateDir, "prepare.lock"), { waitMs: 60_000 });
-    if (!prep) {
-      out.push({ level: "warn", text: "another session is still preparing Projects/; run remember_sync shortly" });
-      return { items: out, project: early };
-    }
-    // The lock is released whatever preparation did, and a failing release never replaces
-    // the reason the session needed: it is appended to what prepareProjects threw, or
-    // reported beside what it returned. runCycle does the same with the sync lock.
-    type Prepared = { kind: "ok"; state: SyncState } | { kind: "failed"; err: unknown };
-    const prepared: Prepared = await prepareProjects(vault, cfg, shared.timezone).then(
-      (ready): Prepared => ({ kind: "ok", state: ready }),
-      (err: unknown): Prepared => ({ kind: "failed", err }),
-    );
-    const released = await prep.release().then(
-      () => null,
-      (err: unknown) => `releasing the prepare lock failed: ${errorText(err)}`,
-    );
-    if (prepared.kind === "failed") {
-      if (released !== null && prepared.err instanceof Error) prepared.err.message = `${prepared.err.message}; ${released}`;
-      throw prepared.err;
-    }
-    if (released !== null) out.push({ level: "warn", text: released });
-    const state = prepared.state;
-    out.push(...statusFromSync(state));
-    if (state.kind === "ready" && cfg.remote) {
-      out.push(...statusFromCycle(await runCycle({ projectsDir: vault.projectsDir, remote: cfg.remote, branch: state.branch, stateDir, machine, timezone: shared.timezone })));
-    }
+    const run = await prepareAndCycle({ vault, cfg, stateDir, machine, timezone: shared.timezone });
+    out.push(...run.items);
+    if (run.state === null) return { items: out, project: early };
+    const state = run.state;
     // The top-level read above ran before Projects/ existed on a fresh machine,
     // so it could only ever see this machine's own zone. Now that Projects/ is
     // prepared (and, when sync ran, pulled), .sro-config.json is the vault's,
@@ -417,6 +474,7 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
     // already claimed, or it would claim a duplicate one under its own clone name.
     const project = await resolveSafely(vault, opts.sessionDir);
     shared.resolved = project;
+    markPulled();
     if (project.kind === "disabled") return { items: out, project };
     if (project.origin && state.kind !== "stopped") await recordOrigin(project.dir, project.origin);
     const projectStateDir = join(stateDir, project.name);
@@ -461,7 +519,8 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
     }
     return { items: out, project };
   })();
-  return { kind: "started", vault, status, cfg, stateDir, code, machine, shared, work };
+  void work.then(markPulled, markPulled);
+  return { kind: "started", vault, status, cfg, stateDir, code, machine, shared, privacy, pulled, work };
 }
 
 const NOT_SHOWN: ProjectResolution = { kind: "disabled", reason: "memory initialization timed out", bare: false };
@@ -520,7 +579,7 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
         : Promise.resolve([]);
     if (project.kind === "disabled") return disabled(opts.bootstrap, project.reason, status, background);
 
-    const { vault, cfg, stateDir, code, machine } = started;
+    const { vault, cfg, stateDir, code, machine, privacy } = started;
     const timezone = started.shared.timezone;
     const ctx: SessionContext = {
       vault,
@@ -533,6 +592,7 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       branchKey: branchKey(code.branch, code.sha),
       machine,
       remote: cfg.remote,
+      privacy,
     };
     if (await legacyReappeared(vault.projectsDir, project.name)) {
       status.push({ level: "warn", text: `Projects/${vaultName(project.name)}/HANDOFF.md reappeared after migration (an old client?); it is not read` });
@@ -570,6 +630,7 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
     const payload = buildPayload({
       bootstrap: opts.bootstrap,
       project: project.name,
+      projectDir: project.dir,
       status,
       branch: code.branch,
       heads,
@@ -578,10 +639,92 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
       identity,
       now: now(),
     });
-    return { payload, status, context: ctx, background };
+    const settled: Promise<SessionContext | null> =
+      first.kind === "timeout"
+        ? started.pulled.then(() => {
+            const later = started.shared.resolved;
+            return later.kind === "ok" && later.name === ctx.project ? { ...ctx, timezone: started.shared.timezone } : null;
+          })
+        : Promise.resolve(ctx);
+    return { payload, status, context: ctx, background, settled };
   } catch (err) {
     return disabled(opts.bootstrap, `unexpected error: ${errorText(err)}`);
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Spec 8: remember_sync, and the sync half of idle. One prepared cycle, once the quiet window
+// has passed: the cycle defers a file written in the last QUIET_MS as a write in progress, and
+// what this session just wrote (the fix remember_sync follows, the note of a session's last
+// turn) is what it must send. `adoptRewrite` is the tool's "adopt the rewritten remote". Never
+// to a remote this session's privacy check found public, and never throws: a failure is a
+// status line.
+export async function syncSession(ctx: SessionContext, opts: { adoptRewrite?: boolean; quietMs?: number } = {}): Promise<StatusItem[]> {
+  try {
+    const vis = await ctx.privacy;
+    if (ctx.remote && vis?.visibility === "public") return statusFromPrivacy(ctx.remote, vis);
+    await new Promise((resolve) => setTimeout(resolve, opts.quietMs ?? QUIET_MS + 500));
+    const run = await prepareAndCycle({
+      vault: ctx.vault,
+      cfg: { remote: ctx.remote },
+      stateDir: ctx.stateDir,
+      machine: ctx.machine,
+      timezone: ctx.timezone,
+      adoptRewrite: opts.adoptRewrite,
+    });
+    return run.items;
+  } catch (err) {
+    return [{ level: "error", text: `sync failed: ${errorText(err)}` }];
+  }
+}
+
+// How long an idle waits for its journal entry before it syncs without it.
+export const JOURNAL_WAIT_MS = 120_000;
+
+// Spec 8: what a session does when it goes idle, best effort: this session's journal entry
+// (journal.ts's cooldown applies, so most idles write none), then, where sync is on, a sync
+// once the quiet window has passed, so the entry and the note the session wrote in its last
+// turn both go with it rather than wait, deferred as writes in progress, for the next
+// session start (syncSession waits that window). The journal is a model call, and one that never answers must not hold the
+// sync: past JOURNAL_WAIT_MS the sync goes ahead, and the entry is written whenever the call
+// ends. Never throws: a failure is a status line.
+export async function idleSession(
+  ctx: SessionContext,
+  opts: { harness: Harness; sessionId: string; journalModel: string; now?: () => Date; quietMs?: number; journalWaitMs?: number },
+): Promise<StatusItem[]> {
+  const out: StatusItem[] = [];
+  const waitMs = opts.journalWaitMs ?? JOURNAL_WAIT_MS;
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<"late">((resolve) => {
+    timer = setTimeout(() => resolve("late"), waitMs);
+  });
+  const journal = journalSession(
+    {
+      harness: opts.harness,
+      projectDir: ctx.projectDir,
+      stateFile: join(ctx.projectStateDir, "journal.json"),
+      machine: ctx.machine,
+      branch: ctx.branch ?? ctx.branchKey,
+      model: opts.journalModel,
+      timezone: ctx.timezone,
+      now: opts.now ?? (() => new Date()),
+    },
+    opts.sessionId,
+  );
+  try {
+    if ((await Promise.race([journal, late])) === "late") {
+      // Promise.race has subscribed to the journal, so its failure after the wait is not an
+      // unhandled rejection: it is let go, with no one left to tell.
+      out.push({ level: "warn", text: `journal: the model did not answer within ${duration(waitMs)}; the entry is written when it does, and this sync went ahead without it` });
+    }
+  } catch (err) {
+    // errorText: journalSession calls the adapter's readTranscript and callModel, which are
+    // the host's code and can reject with anything.
+    out.push({ level: "warn", text: `journal: ${errorText(err)}` });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (ctx.remote === null) return out;
+  return [...out, ...(await syncSession(ctx, { quietMs: opts.quietMs }))];
 }

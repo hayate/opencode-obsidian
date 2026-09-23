@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { access, chmod, constants, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, constants, mkdir, readFile, realpath, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
-import { initializeSession, statusFromCycle, statusFromPrivacy, vaultId, type SessionOptions } from "../../core/session.ts";
+import { idleSession, initializeSession, statusFromCycle, statusFromPrivacy, syncSession, vaultId, type SessionContext, type SessionOptions } from "../../core/session.ts";
 import type { Harness, SessionRef, TranscriptChunk } from "../../core/harness.ts";
 import { PAYLOAD_MARKER } from "../../core/inject.ts";
-import { gitOk } from "../../core/git.ts";
+import { git, gitOk } from "../../core/git.ts";
 import { systemTimezone } from "../../core/vault.ts";
 import { listEntries, writeJournalEntry } from "../../core/journal.ts";
 import { acquireLock, type LockHandle } from "../../core/lock.ts";
@@ -86,6 +86,7 @@ test("happy path: clone, sync, record the origin, inject this branch's handoff",
   const r = await initializeSession(opts(w));
   assert.ok(r.payload.startsWith(PAYLOAD_MARKER));
   assert.match(r.payload, /Project: `kabin-api`/);
+  assert.ok(r.payload.includes(`in the Obsidian vault at \`${join(await realpath(w.vaultRoot), "Projects", "kabin-api")}\``), r.payload.slice(0, 900));
   assert.match(r.payload, /Handoff for this branch \(`feat\/x`\)/);
   assert.match(r.payload, /PR #222 open; next: triage CodeRabbit/);
   assert.deepEqual(r.status.filter((s) => s.level !== "info"), []);
@@ -507,7 +508,11 @@ test("a timeout during the journal step builds the payload for the identity reso
   await commitFile(seed, "different-local-name/HANDOFF.md", "WRONG PROJECT MEMORY\n", "unclaimed folder");
   await gitOk(["push", "-q", "origin", "HEAD"], { cwd: seed });
   const harness = new GatedHarness();
-  const r = await initializeSession(opts(w, { harness, waitMs: 2_000 }));
+  // The deadline counts from entry, and only the journal step is held: the clone, pull and identity
+  // steps before it must finish inside waitMs. 2 s was not enough on a loaded machine (four suites
+  // at once failed this assertion every time, alone it passed 5/5), so the budget sits far above
+  // what those git steps take; the test lasts waitMs, since the gate holds until the deadline.
+  const r = await initializeSession(opts(w, { harness, waitMs: 10_000 }));
   const reached = harness.reachedJournal;
   harness.release();
   const later = await r.background;
@@ -546,6 +551,12 @@ test(
     });
     assert.match(r.status.map((s) => s.text).join("\n"), /sync refused/);
     await assert.rejects(stat(join(vaultRoot, "Projects", ".git")));
+    // The session still has a context (a non-git session directory is a project too), and no
+    // later sync in it may go where initialization refused to.
+    if (r.context) {
+      assert.match((await syncSession(r.context, { quietMs: 0 })).map((s) => s.text).join("\n"), /sync refused/);
+      await assert.rejects(stat(join(vaultRoot, "Projects", ".git")));
+    }
   },
 );
 
@@ -921,6 +932,34 @@ test("a sync that outlives the wait warns in the background that this repository
   assert.match(r.payload, /sync still running/);
   const later = (await r.background).map((s) => s.text).join("\n");
   assert.match(later, /after sync this repository maps to Projects\/canonical, not different-local-name; restart the session/);
+  assert.equal(await r.settled, null, "no later sync or journal writes into the folder the session was shown");
+});
+
+test("after a timeout, the settled context carries the zone the pulled config gives, and the project it was shown", async () => {
+  const zone = systemTimezone() === "Pacific/Kiritimati" ? "UTC" : "Pacific/Kiritimati";
+  const w = await world();
+  const seed = join(await tempDir(), "seed");
+  await gitOk(["clone", "-q", w.remote, seed], { cwd: await tempDir() });
+  await commitFile(seed, ".sro-config.json", JSON.stringify({ timezone: zone }), "another zone");
+  await gitOk(["push", "-q", "origin", "HEAD"], { cwd: seed });
+  const lock = await holdPrepareLock(w);
+  let r;
+  try {
+    r = await initializeSession(opts(w, { waitMs: 1_500 }));
+  } finally {
+    await lock.release();
+  }
+  assert.equal(r.context?.timezone, systemTimezone(), "shown before the pull: this machine's zone");
+  await r.background;
+  const settled = await r.settled;
+  assert.equal(settled?.project, "kabin-api");
+  assert.equal(settled?.timezone, zone);
+});
+
+test("a session initialized in time settles on the context it was given", async () => {
+  const r = await initializeSession(opts(await world()));
+  assert.ok(r.context);
+  assert.equal(await r.settled, r.context);
 });
 
 test("a git call that hangs before the sync starts still returns within the wait, saying initialization timed out", async () => {
@@ -1043,4 +1082,191 @@ test("a harness that rejects with something that is not an Error still says what
     assert.equal(r.status.filter((s) => s.text.startsWith("journal ")).length, 2, lines);
     assert.equal(r.context?.project, "kabin-api", "and the session still starts");
   }
+});
+
+// Spec 8: the session's later syncs (remember_sync, idle) go through syncSession.
+async function initialized(w: { vaultRoot: string; remote: string; code: string; stateRoot: string }, over: Partial<SessionOptions> = {}): Promise<SessionContext> {
+  const r = await initializeSession(opts(w, over));
+  assert.ok(r.context, r.status.map((s) => s.text).join("\n"));
+  return r.context;
+}
+
+// A note written earlier in the session: its mtime is past the cycle's quiet window, which
+// defers a file modified in the last QUIET_MS as another session's write in progress.
+async function writeEarlier(root: string, rel: string, content: string): Promise<void> {
+  await writeRel(root, rel, content);
+  const past = new Date(Date.now() - 60_000);
+  await utimes(join(root, rel), past, past);
+}
+
+async function remoteHas(remote: string, rel: string): Promise<boolean> {
+  return (await git(["cat-file", "-e", `main:${rel}`], { cwd: remote })).code === 0;
+}
+
+test("syncSession sends what changed since initialization, and a clean sync reports nothing", async () => {
+  const w = await world();
+  const ctx = await initialized(w);
+  await writeEarlier(join(w.vaultRoot, "Projects"), "kabin-api/notes/later.md", "written mid-session\n");
+  assert.deepEqual((await syncSession(ctx)).filter((s) => s.level !== "info"), []);
+  assert.ok(await remoteHas(w.remote, "kabin-api/notes/later.md"));
+  assert.deepEqual((await syncSession(ctx)).filter((s) => s.level !== "info"), [], "nothing to report the second time");
+});
+
+test("syncSession never syncs to a remote this session's privacy check found public", async () => {
+  const w = await world();
+  const ctx = await initialized(w);
+  await writeEarlier(join(w.vaultRoot, "Projects"), "kabin-api/notes/secret.md", "must not leave\n");
+  const pub: SessionContext = { ...ctx, privacy: Promise.resolve({ visibility: "public", detail: "https://github.com/acme/p.git is readable without credentials" }) };
+  const items = await syncSession(pub);
+  assert.deepEqual(items.map((i) => i.level), ["error"]);
+  assert.match(items[0]?.text ?? "", /^sync refused: .*make the repository private$/);
+  assert.equal(await remoteHas(w.remote, "kabin-api/notes/secret.md"), false);
+});
+
+test("syncSession passes remember_sync's adopt option to the cycle: a rewritten remote stops, adopting it syncs", async () => {
+  const w = await world();
+  const before = await gitOk(["rev-parse", "main"], { cwd: w.remote });
+  const ctx = await initialized(w);
+  await writeEarlier(join(w.vaultRoot, "Projects"), "kabin-api/notes/sent.md", "sent, then dropped by the rewrite\n");
+  await syncSession(ctx);
+  assert.ok(await remoteHas(w.remote, "kabin-api/notes/sent.md"));
+  await gitOk(["update-ref", "refs/heads/main", before], { cwd: w.remote }); // a force-push back
+  const stopped = await syncSession(ctx);
+  assert.ok(stopped.some((s) => s.level === "error" && /history was rewritten/.test(s.text)), stopped.map((s) => s.text).join("\n"));
+  const adopted = await syncSession(ctx, { adoptRewrite: true });
+  assert.deepEqual(adopted.filter((s) => s.level !== "info"), [], adopted.map((s) => s.text).join("\n"));
+  assert.equal(await remoteHas(w.remote, "kabin-api/notes/sent.md"), false, "the adopted remote is not undone");
+});
+
+test("syncSession turns a failure into one status line, whatever was thrown", async () => {
+  const w = await world();
+  const ctx = await initialized(w);
+  const items = await syncSession({ ...ctx, privacy: Promise.reject("no network") });
+  assert.deepEqual(items, [{ level: "error", text: "sync failed: no network" }]);
+});
+
+test("idleSession journals this session once per cooldown, then syncs the entry and the notes past the quiet window", async () => {
+  const w = await world();
+  const harness = new ListedHarness([]);
+  const ctx = await initialized(w, { harness });
+  await writeRel(join(w.vaultRoot, "Projects"), "kabin-api/notes/idle.md", "written in the session's last turn\n");
+  const now = () => new Date("2026-09-21T07:00:00Z");
+  const items = await idleSession(ctx, { harness, sessionId: "ses_current", journalModel: "fake/model", now });
+  assert.deepEqual(items.filter((s) => s.level !== "info"), [], items.map((s) => s.text).join("\n"));
+  assert.ok(await remoteHas(w.remote, "kabin-api/notes/idle.md"), "the idle sync sent it");
+  const entries = await listEntries(ctx.projectDir);
+  assert.deepEqual(entries.map((e) => e.body.trim()), ["journal of ses_current"]);
+  const sent = await gitOk(["ls-tree", "-r", "--name-only", "main", "kabin-api/remember/journal"], { cwd: w.remote });
+  assert.equal(sent.trim().split("\n").filter(Boolean).length, 1, "the entry this idle wrote went with this idle's sync, past the quiet window");
+  await idleSession(ctx, { harness, sessionId: "ses_current", journalModel: "fake/model", now });
+  assert.equal((await listEntries(ctx.projectDir)).length, 1, "the cooldown holds the second idle");
+});
+
+test("idleSession with sync off only journals, and a journal failure is a line beside the sync's", async () => {
+  const w = await world();
+  const off = await initialized(w, { env: { OBSIDIAN_VAULT_PATH: w.vaultRoot } });
+  assert.equal(off.remote, null);
+  const failing = new (class extends ListedHarness {
+    override async callModel(): Promise<string> {
+      throw "model unavailable";
+    }
+  })([]);
+  const items = await idleSession(off, { harness: failing, sessionId: "ses_current", journalModel: "fake/model" });
+  assert.deepEqual(items, [{ level: "warn", text: "journal: model unavailable" }], "no sync line when sync is off");
+});
+
+// A model call that never answers.
+class HungHarness extends ListedHarness {
+  override async callModel(): Promise<string> {
+    return new Promise<string>(() => undefined);
+  }
+}
+
+test("after a timeout, the settled context does not wait for the journal's model calls", async () => {
+  const w = await world();
+  const lock = await holdPrepareLock(w);
+  const harness = new HungHarness([{ id: "ses_other", directory: w.code, updated: Date.parse("2026-09-21T06:00:00Z"), parentId: null }]);
+  let r;
+  try {
+    r = await initializeSession(opts(w, { waitMs: 1_500, harness }));
+  } finally {
+    await lock.release();
+  }
+  const settled = await Promise.race([r.settled, new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 20_000).unref())]);
+  assert.notEqual(settled, "hung", "a sync must not wait on a summary");
+  assert.equal(settled === "hung" ? null : settled?.project, "kabin-api");
+});
+
+test("an idle whose journal model never answers syncs anyway, past the wait, and says so", async () => {
+  const w = await world();
+  const harness = new HungHarness([]);
+  const ctx = await initialized(w, { harness });
+  await writeEarlier(join(w.vaultRoot, "Projects"), "kabin-api/notes/while-hung.md", "sent without the entry\n");
+  const items = await idleSession(ctx, { harness, sessionId: "ses_current", journalModel: "fake/model", journalWaitMs: 300, quietMs: 0 });
+  assert.deepEqual(items.filter((s) => s.level !== "info"), [
+    { level: "warn", text: "journal: the model did not answer within 300 ms; the entry is written when it does, and this sync went ahead without it" },
+  ]);
+  assert.ok(await remoteHas(w.remote, "kabin-api/notes/while-hung.md"));
+});
+
+test("a journal call that fails after the idle stopped waiting for it is let go, never an unhandled rejection", async () => {
+  const w = await world();
+  const failsLate = new (class extends ListedHarness {
+    override async callModel(): Promise<string> {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      throw new Error("provider gave up");
+    }
+  })([]);
+  const ctx = await initialized(w, { harness: failsLate });
+  const seen: unknown[] = [];
+  const onRejection = (err: unknown): void => void seen.push(err);
+  process.on("unhandledRejection", onRejection);
+  try {
+    const items = await idleSession(ctx, { harness: failsLate, sessionId: "ses_current", journalModel: "fake/model", journalWaitMs: 100, quietMs: 0 });
+    assert.match(items.find((s) => s.level === "warn")?.text ?? "", /did not answer within 100 ms/);
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    assert.deepEqual(seen, []);
+  } finally {
+    process.off("unhandledRejection", onRejection);
+  }
+});
+
+test("the session's context carries the privacy check initialization made, for its later syncs", async () => {
+  const w = await world();
+  const r = await initializeSession(opts(w));
+  assert.ok(r.context);
+  const verdict = await r.context.privacy;
+  assert.equal(verdict?.visibility, "not-github", "the one check, not a stand-in");
+  assert.deepEqual(verdict, await remoteVisibility(w.remote));
+});
+
+test("remember_sync right after a note is written sends it: the sync waits past the quiet window", async () => {
+  const w = await world();
+  const ctx = await initialized(w);
+  await writeRel(join(w.vaultRoot, "Projects"), "kabin-api/notes/just-written.md", "fixed a moment ago\n");
+  const items = await syncSession(ctx);
+  assert.deepEqual(items.filter((s) => s.level !== "info"), [], items.map((s) => s.text).join("\n"));
+  assert.ok(await remoteHas(w.remote, "kabin-api/notes/just-written.md"), "not deferred as a write in progress");
+});
+
+test("an idle's journal entry is the one the next session start's catch-up sees: no second entry, and it carries the branch and day", async () => {
+  const w = await world();
+  // The session's message is from 15:30 UTC: already the 22nd in the vault's zone (Asia/Tokyo),
+  // still the 21st in UTC. An entry is filed under its messages' day in the vault's zone.
+  class AfterMidnight extends ListedHarness {
+    override async readTranscript(sessionId: string): Promise<TranscriptChunk> {
+      return { sessionId, messages: [{ id: `${sessionId}-m1`, role: "user", text: "hello", time: Date.parse("2026-09-21T15:30:00Z") }] };
+    }
+  }
+  const harness = new AfterMidnight([]);
+  const now = () => new Date("2026-09-21T16:00:00Z");
+  const ctx = await initialized(w, { harness, now });
+  await idleSession(ctx, { harness, sessionId: "ses_current", journalModel: "fake/model", now, quietMs: 0 });
+  // The next session start lists that session, last updated before its entry was written.
+  const later = new AfterMidnight([{ id: "ses_current", directory: w.code, updated: Date.parse("2026-09-21T15:59:00Z"), parentId: null }]);
+  await initializeSession(opts(w, { harness: later, sessionId: "ses_next", now }));
+  const entries = await listEntries(ctx.projectDir);
+  assert.equal(entries.length, 1, entries.map((e) => e.id).join(", "));
+  assert.equal(entries[0]?.meta?.branch, "feat/x");
+  assert.equal(entries[0]?.day, "2026-09-22", "the vault's day, not UTC's");
 });

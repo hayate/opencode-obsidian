@@ -1980,6 +1980,7 @@ function payloadOf(r: CycleResult): string {
   return buildPayload({
     bootstrap: "BOOTSTRAP",
     project: "x",
+    projectDir: "/vault/Projects/x",
     status: statusFromCycle(r),
     branch: null,
     heads: null,

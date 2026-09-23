@@ -12,5 +12,5 @@
     "types": ["node"],
     "skipLibCheck": true
   },
-  "include": ["core/**/*.ts", "tests/core/**/*.ts"]
+  "include": ["core/**/*.ts", "adapters/**/*.ts", "tests/core/**/*.ts", "tests/adapters/**/*.ts"]
 }
