@@ -7,6 +7,7 @@ import { changedSince, remoteSeen, REMOTE_SEEN, runCycle, type CycleInput, type 
 import { bootInstant } from "../../core/sync/recovery.ts";
 import { statusFromCycle } from "../../core/session.ts";
 import { quoted } from "../../core/store.ts";
+import { buildPayload } from "../../core/inject.ts";
 import { prepareProjects, REQUIRED_IGNORES } from "../../core/sync/state.ts";
 import { acquireLock } from "../../core/lock.ts";
 import { git, gitOk } from "../../core/git.ts";
@@ -1881,12 +1882,30 @@ test("adopting a rewritten remote scans what it carries over: a secret there ask
   assert.ok(!(await gitOk(["log", "-p", "--all"], { cwd: remote })).includes(TOKEN));
 });
 
+// A3 (round 2): the stop names what matched, never the value. quoted() escapes and
+// truncates, it does not redact, and statusFromCycle carries the reason into the payload:
+// a reason repeating the flagged name would be the very leak this stop exists to prevent.
+// So both paths assert the assembled payload, not only the reason.
+function payloadOf(r: CycleResult): string {
+  return buildPayload({
+    bootstrap: "BOOTSTRAP",
+    project: "x",
+    status: statusFromCycle(r),
+    branch: null,
+    heads: null,
+    todayEntries: [],
+    recent: null,
+    identity: null,
+    now: new Date("2026-09-23T00:00:00Z"),
+  });
+}
+
 // Spec 5.4 step 3 (the gauntlet fix wave, 2026-09-23): the commit this cycle builds in the
 // state clone skipped the message scan along with the tree diff its first parent makes
 // redundant. That message interpolates the machine name and the project folder names, and
 // unlike a hand commit it is not one the user can amend in Projects/, so it needs its own
 // wording: what the message is made of, and what to rename.
-test("the message of the merge commit this cycle builds is scanned too: a machine name the scan flags stops the cycle, naming what that message is made of", async () => {
+test("the message of the merge commit this cycle builds is scanned too: a machine name the scan flags stops the cycle, naming what it flags and never the name itself", async () => {
   const { remote, m } = await setup(["a", "b"]);
   const [a, b] = m as [Machine, Machine];
   await writeRel(a.projects, "x/t.md", "from a\n");
@@ -1899,9 +1918,12 @@ test("the message of the merge commit this cycle builds is scanned too: a machin
   assert.equal(r.outcome, "stopped", r.reason ?? "");
   assert.equal(
     r.reason,
-    `the secret scan flags the message of the commit this sync would build: nothing was pushed. That message is made only of this machine's name (${JSON.stringify(TOKEN)}) and the folders it would send ("x"), never of anything inside a note, so rewriting a commit is not the fix: rename whichever of those the scan flags, then sync again`,
+    "the secret scan flags the commit message this sync would build: nothing was pushed. That message holds only this machine's name and the names of the folders it would send, never anything from inside a note, so rewriting a commit is not the fix. What it flags: this machine's name (github-token). Rename that, then sync again; the name itself is not repeated here, since this line is shown and stored.",
   );
   assert.equal(stoppedMentions(r), 1, statusFromCycle(r)[0]?.text);
+  assert.ok(!(r.reason ?? "").includes(TOKEN), "the reason never repeats the name it flags");
+  assert.ok(!payloadOf(r).includes(TOKEN), "and neither does the payload the session is given");
+  assert.ok(!payloadOf(r).includes(TOKEN.slice(0, 12)), "not even the first characters of it");
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
   assert.ok(!(await gitOk(["log", "-p", "--all"], { cwd: remote })).includes(TOKEN));
   // Renamed, the same cycle merges and pushes both machines' notes.
@@ -1912,7 +1934,7 @@ test("the message of the merge commit this cycle builds is scanned too: a machin
   assert.equal(await remoteFile(remote, "x/t.md"), "from a");
 });
 
-test("the message the adopt path builds is scanned too: a project folder the scan flags stops the cycle, and nothing is pushed", async () => {
+test("the message the adopt path builds is scanned too: a project folder the scan flags stops the cycle, and its name reaches neither the reason nor the payload", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];
   const before = await gitOk(["rev-parse", "main"], { cwd: remote });
@@ -1927,9 +1949,12 @@ test("the message the adopt path builds is scanned too: a project folder the sca
   assert.equal(r.outcome, "stopped", r.reason ?? "");
   assert.equal(
     r.reason,
-    `the secret scan flags the message of the commit this sync would build: nothing was pushed. That message is made only of this machine's name ("a") and the folders it would send (${JSON.stringify(TOKEN)}), never of anything inside a note, so rewriting a commit is not the fix: rename whichever of those the scan flags, then sync again`,
+    "the secret scan flags the commit message this sync would build: nothing was pushed. That message holds only this machine's name and the names of the folders it would send, never anything from inside a note, so rewriting a commit is not the fix. What it flags: the name of a folder it would send (github-token). Rename that, then sync again; the name itself is not repeated here, since this line is shown and stored.",
   );
   assert.equal(stoppedMentions(r), 1, statusFromCycle(r)[0]?.text);
+  assert.ok(!(r.reason ?? "").includes(TOKEN), "the reason never repeats the name it flags");
+  assert.ok(!payloadOf(r).includes(TOKEN), "and neither does the payload the session is given");
+  assert.ok(!payloadOf(r).includes(TOKEN.slice(0, 12)), "not even the first characters of it");
   assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, "nothing pushed");
   assert.ok(!(await gitOk(["log", "-p", "--all"], { cwd: remote })).includes(TOKEN));
   // Renamed, the adopt carries the note over under its new folder.

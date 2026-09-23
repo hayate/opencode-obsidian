@@ -527,11 +527,26 @@ async function outbound(clone: string, input: CycleInput, from: string, to: stri
   const { inCommits, inTree, generatedMessage } = await outboundHits(clone, from, to, built);
   // First: this one recurs every cycle whatever the user does to their own commits, and
   // rewriting a commit is not what fixes it.
+  //
+  // It names what matched, never the value. The message is built from the machine name and
+  // the project folder names, so each is scanned on its own to say which of the two it was
+  // and by which rule; nothing that reached the scan is reproduced here. quoted() escapes
+  // and truncates, it does not redact, and this reason goes into the status, which
+  // session.ts puts in the payload: repeating the name here would be the leak this stop
+  // exists to prevent, one channel over.
   if (generatedMessage) {
-    const projects = [...new Set((await changedBetween(clone, from, to)).map((f) => f.split("/")[0] ?? ""))].sort();
+    const rulesOf = (value: string): string[] => [...new Set(scanText(value).map((h) => h.rule))];
+    const flagged: string[] = [];
+    const machineRules = rulesOf(input.machine);
+    if (machineRules.length) flagged.push(`this machine's name (${machineRules.join(", ")})`);
+    const projects = [...new Set((await changedBetween(clone, from, to)).map((f) => f.split("/")[0] ?? ""))];
+    const folderRules = [...new Set(projects.flatMap(rulesOf))].sort();
+    if (folderRules.length) flagged.push(`the name of a folder it would send (${folderRules.join(", ")})`);
+    // Neither alone: a rule matched across the two, or across the message's own words.
+    const what = flagged.length ? flagged.join(" and ") : "the message the two of them make";
     return {
       kind: "stopped",
-      reason: `the secret scan flags the message of the commit this sync would build: nothing was pushed. That message is made only of this machine's name (${quoted(input.machine)}) and the folders it would send (${joinNames(projects)}), never of anything inside a note, so rewriting a commit is not the fix: rename whichever of those the scan flags, then sync again`,
+      reason: `the secret scan flags the commit message this sync would build: nothing was pushed. That message holds only this machine's name and the names of the folders it would send, never anything from inside a note, so rewriting a commit is not the fix. What it flags: ${what}. Rename that, then sync again; the name itself is not repeated here, since this line is shown and stored.`,
     };
   }
   if (inCommits.length) {

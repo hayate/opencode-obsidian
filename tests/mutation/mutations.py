@@ -503,8 +503,11 @@ mutate(F_RC, "        throw err instanceof GitError && err.result.timedOut ? new
 GENERATED = "is scanned too"
 mutate(CY, "  if (generatedMessage) {", "  if (false) {", C, pattern=GENERATED)
 mutate(CY, "      if (own) generatedMessage = true;\n      else inCommits.push({ file: null, commit });\n", "      inCommits.push({ file: null, commit });\n", C, pattern=GENERATED)
-mutate(CY, "and the folders it would send (${joinNames(projects)})", 'and the folders it would send (${projects.join(", ")})', C, pattern=GENERATED)
-mutate(CY, "this machine's name (${quoted(input.machine)})", "this machine's name (${input.machine})", C, pattern=GENERATED)
+# Round 2: the stop names what matched, never the value.
+mutate(CY, "    const what = flagged.length ? flagged.join(\" and \") : \"the message the two of them make\";",
+       "    const what = flagged.length ? `${flagged.join(\" and \")}: ${input.machine} ${projects.join(\" \")}` : \"the message the two of them make\";", C, pattern=GENERATED)
+mutate(CY, "    if (machineRules.length) flagged.push(`this machine's name (${machineRules.join(\", \")})`);\n", "", C, pattern=GENERATED)
+mutate(CY, "    if (folderRules.length) flagged.push(`the name of a folder it would send (${folderRules.join(\", \")})`);\n", "", C, pattern=GENERATED)
 
 # B2, B3 and B4 (the gauntlet fix wave): a reason that reaches the user carries git's own
 # first lines, or `timed out`, or the exit code, and never nothing; the plugin refuses a git
