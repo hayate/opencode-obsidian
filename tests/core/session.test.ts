@@ -1243,3 +1243,25 @@ test("remember_sync right after a note is written sends it: the sync waits past 
   assert.deepEqual(items.filter((s) => s.level !== "info"), [], items.map((s) => s.text).join("\n"));
   assert.ok(await remoteHas(w.remote, "kabin-api/notes/just-written.md"), "not deferred as a write in progress");
 });
+
+test("an idle's journal entry is the one the next session start's catch-up sees: no second entry, and it carries the branch and day", async () => {
+  const w = await world();
+  // The session's message is from 15:30 UTC: already the 22nd in the vault's zone (Asia/Tokyo),
+  // still the 21st in UTC. An entry is filed under its messages' day in the vault's zone.
+  class AfterMidnight extends ListedHarness {
+    override async readTranscript(sessionId: string): Promise<TranscriptChunk> {
+      return { sessionId, messages: [{ id: `${sessionId}-m1`, role: "user", text: "hello", time: Date.parse("2026-09-21T15:30:00Z") }] };
+    }
+  }
+  const harness = new AfterMidnight([]);
+  const now = () => new Date("2026-09-21T16:00:00Z");
+  const ctx = await initialized(w, { harness, now });
+  await idleSession(ctx, { harness, sessionId: "ses_current", journalModel: "fake/model", now, quietMs: 0 });
+  // The next session start lists that session, last updated before its entry was written.
+  const later = new AfterMidnight([{ id: "ses_current", directory: w.code, updated: Date.parse("2026-09-21T15:59:00Z"), parentId: null }]);
+  await initializeSession(opts(w, { harness: later, sessionId: "ses_next", now }));
+  const entries = await listEntries(ctx.projectDir);
+  assert.equal(entries.length, 1, entries.map((e) => e.id).join(", "));
+  assert.equal(entries[0]?.meta?.branch, "feat/x");
+  assert.equal(entries[0]?.day, "2026-09-22", "the vault's day, not UTC's");
+});

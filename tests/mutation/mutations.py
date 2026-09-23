@@ -753,3 +753,8 @@ JT = "tests/core/journal.test.ts"
 mutate("core/journal.ts", '  if (inFlight.has(key)) return "running";\n', "", JT, pattern="once at a time")
 mutate("core/journal.ts", "if (prior === undefined || (prior.lastTime ?? 0) <= position.lastTime) {", "if (true) {", JT, pattern="never replaced by an older")
 mutate("core/journal.ts", "  const lock = await acquireLock(`${file}.lock`, { waitMs: 10_000 });\n", "  const lock = { release: async () => undefined };\n", JT, runs=5, pattern="keep their positions")
+
+# Idle's journal is catch-up's: the same state file, and the session's branch and vault day.
+mutate("core/session.ts", '      stateFile: join(ctx.projectStateDir, "journal.json"),', '      stateFile: join(ctx.projectStateDir, "journal-idle.json"),', SE, pattern="catch-up sees")
+mutate("core/session.ts", "      branch: ctx.branch ?? ctx.branchKey,", '      branch: "x",', SE, pattern="catch-up sees")
+mutate("core/session.ts", "      model: opts.journalModel,\n      timezone: ctx.timezone,", '      model: opts.journalModel,\n      timezone: "UTC",', SE, pattern="catch-up sees")
