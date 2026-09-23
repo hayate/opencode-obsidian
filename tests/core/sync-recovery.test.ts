@@ -1016,6 +1016,9 @@ test("the boot instant is the same number at any moment of this boot, and never 
   await sleep(1100);
   // The machine booted before this process started, and by now this process has been
   // running for over a second: an instant that is merely "now" cannot satisfy that.
+  // The 500 ms is the slack the two readings need, not a tolerance on the claim: the boot
+  // instant is rounded to the second, and Date.now() and process.uptime() are read a
+  // moment apart from each other and from os.uptime() inside bootInstant().
   assert.ok(bootInstant() <= Date.now() - process.uptime() * 1000 + 500, `the machine booted before this process: ${bootInstant()}`);
   // The same number throughout, within the second uptime() is counted in.
   assert.ok(Math.abs(bootInstant() - first) <= 2000, `the same number a second later: ${first} then ${bootInstant()}`);

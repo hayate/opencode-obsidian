@@ -220,6 +220,33 @@ test("statusFromCycle collapses the control characters a reason carries (git's w
   }
 });
 
+// E8 (the gauntlet fix wave): the class oneLine strips has two halves. \p{Cc} is what
+// stops a reason adding lines; \p{Cf} is anti-spoofing for git's raw stderr, which no
+// quoting has been through. Only the first was pinned.
+test("statusFromCycle strips the format characters a line could be spoofed with, not only the ones that break lines", () => {
+  const base = {
+    committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
+    conflicts: [], embedded: [], caseCollisions: [], notices: [], timedOut: null, waiting: null,
+  };
+  // A bidi override and a zero-width space, as git's stderr could carry them: neither
+  // breaks a line, and both change what a line looks like it says.
+  const rlo = "\u202e";
+  const zwsp = "\u200b";
+  const lri = "\u2066";
+  const items = statusFromCycle({
+    ...base,
+    outcome: "aborted",
+    reason: `git show ${rlo}dm.dangerous${zwsp} failed${lri}`,
+    notices: [`a notice${rlo} with a hidden turn`],
+  });
+  for (const i of items) {
+    assert.doesNotMatch(i.text, /\p{Cf}/u, JSON.stringify(i.text));
+    assert.doesNotMatch(i.text, /[\p{Cc}\u2028\u2029]/u, JSON.stringify(i.text));
+  }
+  assert.equal(items[0]?.text, "sync aborted: git show  dm.dangerous  failed ");
+  assert.equal(items.at(-1)?.text, "a notice  with a hidden turn");
+});
+
 test("statusFromCycle shows a reason recorded on a synced outcome (a failed lock release)", () => {
   const items = statusFromCycle({
     outcome: "synced",
@@ -896,7 +923,9 @@ test("a git call that hangs before the sync starts still returns within the wait
     const t0 = Date.now();
     const r = await initializeSession(opts(w, { waitMs: 1_000 }));
     const elapsed = Date.now() - t0;
-    assert.ok(elapsed < 2_000, `initializeSession returned after ${elapsed} ms for a 1000 ms wait`);
+    // Well inside the 3 s the wrapper sleeps, and far outside any scheduling delay: what
+    // this pins is that the deadline is honoured at all, never a millisecond budget.
+    assert.ok(elapsed < 2_500, `initializeSession returned after ${elapsed} ms for a 1000 ms wait`);
     assert.equal(r.context, null);
     assert.ok(r.payload.startsWith(`${PAYLOAD_MARKER}\nBOOTSTRAP\n`), "the bootstrap is still sent");
     assert.match(r.payload, /memory initialization timed out/);

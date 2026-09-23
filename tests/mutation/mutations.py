@@ -311,7 +311,7 @@ mutate(F_RC, "    for (const rel of unit) left.set(rel, null);\n", "", RC, patte
 mutate(F_RC, ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";', "    return (await lstat(path)).isDirectory();"),
        ('import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, stat, unlink } from "node:fs/promises";', "    return (await stat(path)).isDirectory();"), RC,
        pattern="never goes through a symlink", survives=("linux", "darwin"),
-       why="defence in depth behind onDisk: respell walks only folders a set-back just went through, so no test meets a symlink there, and where case matters its renames need one file under two spellings")
+       why="defence in depth behind oneEntry: respell renames only a twin that is the wanted spelling's own entry (same device and inode), which two names on a case-sensitive disk never are, so nothing there reaches this check with a symlink in a folder's place; where case is ignored the walk goes only through folders the set-back has just written")
 mutate(F_R, "    if (!hasRule(record.type)) {\n      const todo = record.type.includes(\"submodule\") ? REMOVE_REPOSITORY : MOVE_ASIDE_RETRY;\n      return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths, todo);\n    }\n    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n",
        "    for (const path of record.paths) handled.add(path);\n    if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;\n    if (!hasRule(record.type)) {\n      const todo = record.type.includes(\"submodule\") ? REMOVE_REPOSITORY : MOVE_ASIDE_RETRY;\n      return stop(`git reported ${record.type}, which the plugin cannot resolve by itself`, record.paths, todo);\n    }\n", R,
        pattern="even when a collision or a folder moved aside covers its paths")
@@ -560,3 +560,27 @@ mutate("core/store.ts", "  await flush(dir);\n}", "}", "tests/core/store.test.ts
        why="a flush to the platter is not observable from node: what it guarantees appears only across a power loss")
 mutate("core/store.ts", "    await rm(tmp, { force: true });\n    throw err;\n  }\n  await flush(dir);", "    throw err;\n  }\n  await flush(dir);",
        "tests/core/store.test.ts", pattern="temp sibling with it and throws")
+
+# Group E (the gauntlet fix wave): guards and paths no test covered. The lost-lock check at
+# each of its three places, the push cap, the two reads of remote-seen that get killed, the
+# defence-in-depth check that nothing can make fire, and the anti-spoofing half of the
+# status line's character class.
+LOST_LOCK = "whose sync lock was taken from it"
+mutate(CY, "    if (!snap.ok || !(await stillHeld())) return result;", "    if (!snap.ok) return result;", C, pattern=LOST_LOCK)
+mutate(CY, "      if (!(await stillHeld())) return result;\n      const integration = await integrate(clone, input, live);", "      const integration = await integrate(clone, input, live);", C,
+       pattern=LOST_LOCK)
+mutate(CY, "    if (!(await stillHeld())) return result;\n    await updateLive(", "    await updateLive(", C, pattern=LOST_LOCK)
+mutate(CY, '      result.reason = "lost the sync lock";\n      return false;', '      result.reason = "lost the sync lock";\n      return true;', C, pattern=LOST_LOCK)
+mutate(CY, "const MAX_PUSH_ATTEMPTS = 3;", "const MAX_PUSH_ATTEMPTS = 300;", C, pattern="keeps moving ends at the cap")
+mutate(CY, "      if (attempt >= MAX_PUSH_ATTEMPTS) {\n", "      if (false) {\n", C, pattern="keeps moving ends at the cap")
+mutate(CY, '  if (exists.timedOut) return { kind: "unknown", detail: "timed out" };\n', "", C, pattern="a read of remote-seen that has to be killed")
+mutate(CY, '  if (r.timedOut) return { kind: "unknown", detail: "timed out" };\n  return r.code === 0 ? { kind: "seen"', '  return r.code === 0 ? { kind: "seen"', C,
+       pattern="a read of remote-seen that has to be killed")
+mutate("core/session.ts", "/[\\p{Cc}\\p{Cf}\\u2028\\u2029]+/gu", "/[\\p{Cc}\\u2028\\u2029]+/gu", SE, pattern="strips the format characters")
+# E6: defence in depth behind the unstage above, declared rather than dropped. scanStaged
+# pins the diff's prefixes, so the path it flags is the path the unstage names, and git's
+# own `reset -- <path>` puts HEAD's version back in the index: nothing staged can still be
+# flagged when this runs.
+mutate(CY, "  const stillDirty = await scanStaged(dir);\n  if (stillDirty.size) {", "  const stillDirty = new Map<string, unknown>();\n  if (false) {", C,
+       pattern="a held-back file stays dirty and does not block", survives=("linux", "darwin"),
+       why="defence in depth: it fires only if `git reset -- <path>` leaves a flagged addition staged, which it cannot, since scanStaged pins the diff's prefixes so the path it flags is the path the unstage names")

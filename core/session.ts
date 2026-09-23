@@ -134,6 +134,12 @@ function conflictLine(c: Conflict): string {
 // break or other control character (a vault path in a failed git command's
 // arguments): each run of them becomes one space here, the one place every cycle
 // line passes, so no line can add lines of its own.
+//
+// The second half of the class is not about lines. Every name the plugin puts in a status
+// line is escaped by quoted() before it gets here; what is still raw is git's own stderr,
+// and \p{Cf} is what keeps a bidi override or a zero-width character in it from making a
+// line read as something other than what it says once it is in the payload. Both halves
+// are needed, and neither replaces the other.
 const oneLine = (text: string): string => text.replace(/[\p{Cc}\p{Cf}\u2028\u2029]+/gu, " ");
 
 // A limit as the user reads it: in whole minutes or seconds where it is one (every

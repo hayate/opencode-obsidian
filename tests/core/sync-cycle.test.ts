@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { chmod, mkdir, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { changedSince, REMOTE_SEEN, runCycle, type CycleInput, type CycleResult } from "../../core/sync/cycle.ts";
+import { changedSince, remoteSeen, REMOTE_SEEN, runCycle, type CycleInput, type CycleResult } from "../../core/sync/cycle.ts";
 import { bootInstant } from "../../core/sync/recovery.ts";
 import { statusFromCycle } from "../../core/session.ts";
 import { quoted } from "../../core/store.ts";
@@ -487,6 +487,45 @@ test("a push that loses a race (the remote moved after the fetch) is retried aft
   assert.equal(await remoteFile(remote, "x/notes/other.md"), "o");
 });
 
+// E4 (the gauntlet fix wave): the retry above is capped at MAX_PUSH_ATTEMPTS. Nothing
+// reached the cap, so nothing proved the loop is bounded at all.
+test("a remote that keeps moving ends at the cap, with the reason saying so, never in an unbounded loop", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  await writeRel(a.projects, "x/notes/first.md", "1\n");
+  assert.ok((await cycle(remote, a)).pushed); // builds A's state clone
+  const other = join(await tempDir(), "other");
+  await gitOk(["clone", "-q", remote, other], { cwd: await tempDir() });
+  const moves = join(a.state, "moves");
+  // Every time the state clone's fetch moves a remote-tracking ref, the other machine
+  // pushes again: every push of this cycle is then non-fast-forward.
+  const hooks = await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "hooks"], { cwd: join(a.state, "sync.git") });
+  await mkdir(hooks, { recursive: true });
+  const hook = join(hooks, "reference-transaction");
+  await writeFile(
+    hook,
+    `#!/bin/sh\n[ "$1" = committed ] || exit 0\ngrep -q " refs/remotes/origin/" || exit 0\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\nn=$(cat '${moves}' 2>/dev/null || echo 0)\necho $((n + 1)) > '${moves}'\ngit -C '${other}' commit -q --allow-empty -m "another machine $n"\ngit -C '${other}' push -q origin HEAD\n`,
+  );
+  await chmod(hook, 0o755);
+  // One move before the cycle, so its very first fetch moves the ref and fires the hook.
+  await commitFile(other, "x/notes/other.md", "o\n", "another machine");
+  await gitOk(["push", "-q", "origin", "HEAD"], { cwd: other });
+  await writeRel(a.projects, "x/notes/n.md", "n\n");
+  const r = await cycle(remote, a);
+  assert.equal(r.outcome, "unsynced", r.reason ?? "");
+  assert.match(r.reason ?? "", /^push rejected 3 times \(the remote kept moving\): /);
+  assert.equal(r.pushed, false);
+  assert.equal(r.liveUpdated, false);
+  assert.equal(Number(await readFile(moves, "utf8")), 3, "three attempts, each with the remote moved under it");
+  assert.deepEqual(statusFromCycle(r).map((i) => i.level), ["warn"]);
+  // The snapshot is committed here and goes out as soon as the remote stops moving.
+  await rm(hook);
+  const again = await cycle(remote, a);
+  assert.ok(again.pushed, again.reason ?? "");
+  assert.equal(await remoteFile(remote, "x/notes/n.md"), "n");
+  assert.equal(await remoteFile(remote, "x/notes/other.md"), "o");
+});
+
 test("a push the remote refuses (a server-side hook, e.g. push protection) is reported once, never retried as a race", async () => {
   const { remote, m } = await setup(["a"]);
   const [a] = m as [Machine];
@@ -535,6 +574,34 @@ test(
     assert.match(r.reason ?? "", /releasing the sync lock failed/);
   },
 );
+
+// E3 (the gauntlet fix wave): every reason runCycle returns goes through
+// redactUrlCredentials, because git's stderr and a GitError's arguments carry the remote
+// URL. sync-state has the sibling test for its own reasons; no cycle test drove one.
+test("a cycle's reason never carries the credentials in a remote URL, and still names the remote", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  // Port 1 refuses at once: no network needed.
+  const password = j("s3cret", "pass");
+  const url = j("https://deploy", ":", password, "@127.0.0.1:1/x.git");
+  await writeRel(a.projects, "x/n.md", "n\n");
+  const r = await runCycle({ timezone: TZ, projectsDir: a.projects, remote: url, branch: "main", stateDir: a.state, machine: "a", quietMs: 0 });
+  assert.equal(r.outcome, "unsynced", r.reason ?? "");
+  assert.match(r.reason ?? "", /^fetch failed: /);
+  assert.ok(!(r.reason ?? "").includes(password), r.reason ?? "");
+  assert.match(r.reason ?? "", /127\.0\.0\.1:1\/x\.git/, "the reason still names the remote");
+  for (const item of statusFromCycle(r)) assert.ok(!item.text.includes(password), item.text);
+  // git strips the userinfo from its own message above; a GitError carries the command's
+  // arguments instead, and the state clone's `remote set-url origin` holds the whole URL.
+  let aborted: CycleResult | undefined;
+  await withGitFailing(url, async () => {
+    aborted = await runCycle({ timezone: TZ, projectsDir: a.projects, remote: url, branch: "main", stateDir: a.state, machine: "a", quietMs: 0 });
+  }, "fatal: injected failure");
+  assert.equal(aborted?.outcome, "aborted", aborted?.reason ?? "");
+  assert.ok(!(aborted?.reason ?? "").includes(password), aborted?.reason ?? "");
+  assert.match(aborted?.reason ?? "", /https:\/\/\*\*\*@127\.0\.0\.1:1\/x\.git/, "the userinfo is replaced, not dropped");
+  assert.equal((await cycle(remote, a)).outcome, "synced", "and the real remote still works");
+});
 
 test("an unreachable remote keeps the commit local and reports it; the next cycle pushes it", async () => {
   const { remote, m } = await setup(["a"]);
@@ -861,6 +928,25 @@ test("a remote-seen that cannot be read stops the cycle instead of skipping the 
     assert.equal(stoppedMentions(r), 1, statusFromCycle(r)[0]?.text);
     assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, `${label}: nothing pushed back`);
   }
+});
+
+// E5 (the gauntlet fix wave): the two branches where a read of remote-seen has to be
+// killed. A ref read is not something a cycle can be made to hang on cheaply, so this
+// drives the read directly, with the small limit the tests give the live update too.
+test("a read of remote-seen that has to be killed is 'could not tell', never 'the ref is corrupt'", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  await writeRel(a.projects, "x/first.md", "1\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  assert.equal((await remoteSeen(a.projects, 5_000)).kind, "seen", "it is readable when git answers");
+  // show-ref hangs, then rev-parse does: the first is the presence check, the second the
+  // one that says a present ref names a commit.
+  for (const at of ["--exists", "^{commit}"]) {
+    await withGitDoing(at, "  sleep 30", async () => {
+      assert.deepEqual(await remoteSeen(a.projects, 200), { kind: "unknown", detail: "timed out" }, at);
+    });
+  }
+  assert.equal((await cycle(remote, a)).outcome, "synced", "and the next cycle runs normally");
 });
 
 // B3 (the gauntlet fix wave): show-ref answers 1 for a ref it cannot look up and 2 for one
@@ -1227,6 +1313,41 @@ test("a live update that fails partway (a smudge filter fails) is finished by th
   assert.equal(await read(b, "x/s.md"), "s from a\n");
   assert.equal(await remoteFile(remote, "x/t.md"), "t from a", "the note the failed update had unlinked is not deleted on the remote");
   assert.deepEqual((await remoteNames(remote)).filter((n) => n.includes(".conflict-")), [], "nor moved to a conflict copy");
+});
+
+// E2 (the gauntlet fix wave): the sibling of the test above, following the repair's other
+// outcome all the way out. A path the repair keeps is the user's edit, so the cycle that
+// kept it snapshots it, merges it against the remote's own version and pushes the merge,
+// with the other version beside it as a conflict copy: nothing of either side is lost.
+test("a note the user edited while a failed update was unfinished is kept by the repair, then snapshotted, merged and pushed with the other version beside it", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/s.md", "s from a\n");
+  await writeRel(a.projects, "x/t.md", "t from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  for (const [key, value] of [["filter.bad.clean", "cat"], ["filter.bad.smudge", "false"], ["filter.bad.required", "true"]]) {
+    await gitOk(["config", key ?? "", value ?? ""], { cwd: b.projects });
+  }
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "x/t.md filter=bad\n");
+  const first = await cycle(remote, b);
+  assert.equal(first.outcome, "unsynced", first.reason ?? "");
+  assert.match(first.reason ?? "", /updating the vault failed/);
+  // The update had already written x/s.md; the user edits it before the next cycle runs.
+  await writeRel(b.projects, "x/s.md", "mine, written on b\n");
+  await gitOk(["config", "filter.bad.smudge", "cat"], { cwd: b.projects });
+  const second = await cycle(remote, b);
+  assert.equal(second.outcome, "synced", second.reason ?? "");
+  assert.deepEqual(second.notices, ["finished an interrupted vault update; 1 file set back to update again; your edits since kept in \"x/s.md\""]);
+  assert.ok(second.pushed, "the kept edit is sent");
+  assert.equal(await read(b, "x/s.md"), "mine, written on b\n", "the user's version stays at the path");
+  assert.equal(await read(b, "x/t.md"), "t from a\n", "and the note the failed update had unlinked came back");
+  assert.deepEqual(second.conflicts, [{ kind: "both-changed", path: "x/s.md", copy: second.conflicts[0]?.copy ?? null }]);
+  const copy = second.conflicts[0]?.copy ?? "";
+  assert.match(copy, /^x\/s\.conflict-\d{4}-\d{2}-\d{2}-\d{4}-[0-9a-f]{6}\.md$/, copy);
+  assert.equal(await remoteFile(remote, "x/s.md"), "mine, written on b", "the merge the remote gets keeps the user's version at the path");
+  assert.equal(await remoteFile(remote, copy), "s from a", "with the other machine's version beside it");
+  assert.equal(await read(b, copy), "s from a\n", "and the copy is in the vault too");
+  assert.equal(await remoteFile(remote, "x/t.md"), "t from a");
 });
 
 test("an unfinished live update whose history then moved by hand stops sync with the record kept; undoing what it left and deleting the record lets sync carry on with nothing lost", async () => {
@@ -1854,6 +1975,53 @@ async function withAncestryFailing(pair: string, fn: () => Promise<void>, says =
   }
 }
 
+// Runs fn with a git on PATH that runs `shell` whenever its arguments hold `match`, then
+// the real git: the way to make something happen at a chosen point inside a cycle.
+async function withGitDoing(match: string, shell: string, fn: () => Promise<void>): Promise<void> {
+  const dir = await tempDir();
+  const real = `${await gitOk(["--exec-path"], { cwd: dir })}/git`;
+  const script = `#!/bin/sh\ncase " $* " in\n  *' ${match} '*|*"${match}"*)\n${shell}\n  ;;\nesac\nexec '${real}' "$@"\n`;
+  await writeFile(join(dir, "git"), script, { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${dir}:${path}`;
+  try {
+    await fn();
+  } finally {
+    process.env.PATH = path;
+  }
+}
+
+// E1 (the gauntlet fix wave): the sync lock is a directory whose one owner entry another
+// contender takes over once it judges the holder dead (lock.ts). A cycle that lost it that
+// way must stop at its next check: two cycles reaching `reset --keep` at once would write
+// the vault from two histories. The three checks sit after the snapshot, before each
+// integrate attempt, and before the live update; each is exercised where the lock goes.
+test("a cycle whose sync lock was taken from it stops at the next check, and never reaches the live update", async () => {
+  for (const at of ["-A", "--is-bare-repository", "--exists"]) {
+    const { remote, m } = await setup(["a", "b"]);
+    const [a, b] = m as [Machine, Machine];
+    // One clean cycle first, so the state clone exists and its usability check runs.
+    assert.equal((await cycle(remote, a)).outcome, "synced");
+    // Then the remote moves: this cycle has something to merge and something to update.
+    await writeRel(b.projects, "x/t.md", "from b\n");
+    assert.ok((await cycle(remote, b)).pushed);
+    const lockDir = await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "sro-sync.lock"], { cwd: a.projects });
+    await writeRel(a.projects, "x/mine.md", "m\n");
+    let r: CycleResult | undefined;
+    await withGitDoing(at, `  rm -f '${lockDir}'/owner.*`, async () => {
+      r = await cycle(remote, a);
+    });
+    assert.equal(r?.outcome, "aborted", `${at}: ${r?.reason}`);
+    assert.equal(r?.reason, "lost the sync lock", at);
+    assert.equal(r?.liveUpdated, false, `${at}: the live update never ran`);
+    // The snapshot commit is this cycle's own and changes no file; `reset --keep` is what
+    // it never reached, so the vault stays at it.
+    assert.equal(await gitOk(["rev-parse", "HEAD"], { cwd: a.projects }), r?.committed, `${at}: the vault is at its own snapshot, never at the merge`);
+    // Only the last of the three is past the push, which is what the third check guards.
+    assert.equal(r?.pushed, at === "--exists", at);
+  }
+});
+
 // Runs fn with a git on PATH that fails whenever its arguments hold `match`, printing
 // `says` (empty: nothing, as a killed git leaves) and exiting `code`; everything else is
 // the real git. The failures these stage (a corrupt object, a lookup git cannot answer)
@@ -2175,7 +2343,9 @@ test("a session that died mid-update leaves it running: the next cycle waits for
   assert.ok((await cycle(remote, a)).pushed);
   const pushedByA = await gitOk(["rev-parse", "main"], { cwd: remote });
   // Only the last note's filter hangs, so the update writes the other two and then waits.
-  await gitOk(["config", "filter.slow.smudge", "sleep 3; cat"], { cwd: b.projects });
+  // Long enough that the group cannot exit before the assertions below, whatever the
+  // machine's load; waitGone then waits it out, bounded at 30 s.
+  await gitOk(["config", "filter.slow.smudge", "sleep 10; cat"], { cwd: b.projects });
   await writeFile(join(b.projects, ".git", "info", "attributes"), "x/u.md filter=slow\n");
   const input = { timezone: TZ, projectsDir: b.projects, remote, branch: "main", stateDir: b.state, machine: "b", quietMs: 0 };
   const session = spawn(process.execPath, [join(import.meta.dirname, "fixtures", "cycle-session.ts"), JSON.stringify(input)], { stdio: "ignore" });

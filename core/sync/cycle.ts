@@ -275,13 +275,16 @@ type Seen = { kind: "absent" } | { kind: "seen"; commit: string } | { kind: "unr
 // failed to look up reference"), and a rev-parse that cannot resolve a ref show-ref found.
 // Any other exit (129, the usage error a git without --exists gives) says nothing about
 // the ref, so it is "could not tell" and the next cycle asks again.
-async function remoteSeen(dir: string): Promise<Seen> {
-  const exists = await git(["show-ref", "--exists", REMOTE_SEEN], { cwd: dir });
+// timeoutMs: git.ts's local limit when unset; the tests' small one otherwise, as the live
+// update's own limit is (CycleInput.liveUpdateTimeoutMs). A ref read runs no filter, so
+// the cycle never passes one.
+export async function remoteSeen(dir: string, timeoutMs?: number): Promise<Seen> {
+  const exists = await git(["show-ref", "--exists", REMOTE_SEEN], { cwd: dir, timeoutMs });
   if (exists.timedOut) return { kind: "unknown", detail: "timed out" };
   if (exists.code === 2) return { kind: "absent" };
   if (exists.code === 1) return { kind: "unreadable", detail: firstLines(exists.stderr) || "git show-ref exited 1" };
   if (exists.code !== 0) return { kind: "unknown", detail: firstLines(exists.stderr) || `git show-ref exited ${exists.code}` };
-  const r = await git(["rev-parse", "-q", "--verify", `${REMOTE_SEEN}^{commit}`], { cwd: dir });
+  const r = await git(["rev-parse", "-q", "--verify", `${REMOTE_SEEN}^{commit}`], { cwd: dir, timeoutMs });
   if (r.timedOut) return { kind: "unknown", detail: "timed out" };
   return r.code === 0 ? { kind: "seen", commit: r.stdout.trim() } : { kind: "unreadable", detail: firstLines(r.stderr) || `git rev-parse exited ${r.code}` };
 }
