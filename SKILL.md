@@ -136,7 +136,7 @@ commands there race the plugin's own and can strand changes. Write notes with th
 file tools; the plugin sends them.
 
 The plugin reports what it did as status lines at the top of the session, and
-later ones beside the message they arrived after:
+later ones as notes in the conversation, only when they have something new:
 
 - A note changed on two machines keeps both versions: yours at the path, the
   other beside it as a conflict copy. The status line names both. Merge what you
@@ -150,4 +150,4 @@ later ones beside the message they arrived after:
 
 Because `Projects/` is its own repository, the vault's own repository (if the
 vault is one) must not also track it. The plugin refuses to sync while it does;
-the README's migration steps fix it.
+the README's procedure "The vault's own repository tracks `Projects/`" fixes it.

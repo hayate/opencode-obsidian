@@ -65,11 +65,13 @@ The plugin loads each project's memory into the session and keeps the vault's
 
 The plugin syncs `Projects/` when a session starts and, best effort, when it
 goes idle: it commits what changed (after a secret scan), integrates what other
-machines pushed, and pushes. This happens in main sessions whose memory is on,
-never in subagents. An idle first writes the session's journal entry, then
-waits a moment so the notes just written are complete, then syncs; headless
-`opencode run` can exit before an idle finishes, in which case the next
-session's start sends what it left. On a machine's first session it clones
+machines pushed, and pushes. The start's sync runs in every session the plugin
+starts (a session OpenCode reports as a subagent's is skipped); the idle sync
+and the journal run only in a main session whose memory is on. An idle first writes the session's
+journal entry (waiting at most two minutes for the model), then waits a moment
+so the notes just written are complete, then syncs; headless `opencode run` can
+exit before an idle finishes, in which case the next session's start sends
+what it left. `remember_sync` syncs on demand, with the same short wait. On a machine's first session it clones
 the remote into `Projects/`, or, when the remote is empty, fills it from the
 `Projects/` already there. A note changed on two machines keeps both versions:
 yours at the path, the other beside it as a conflict copy, and the session's
@@ -82,14 +84,18 @@ Obsidian stays behind until OpenCode runs there, or until you pull by hand:
 git -C "$OBSIDIAN_VAULT_PATH/Projects" pull --ff-only
 ```
 
-What each sync did appears as status lines at the top of the session. Errors
-also appear as a toast in the TUI. Headless `opencode run` has no toast: there
-the status reaches only the model, and the next session's start.
+What the start's sync did appears as status lines at the top of the session.
+A later sync adds a note to the conversation only when it has something new to
+say (a clean sync says nothing), and errors also appear as a toast in the TUI.
+Headless `opencode run` has no toast: there the status reaches only the model,
+and the next session's start.
 
 The journal is written by a model call from the plugin: the `journalModel`
-option, else OpenCode's `small_model`, else its default model. Each idle session
-is journaled at most once every ten minutes; choose a small, cheap model if your
-default is an expensive one.
+option, else OpenCode's `small_model`, else its default model; a setting that
+is not `provider/model` is reported, and OpenCode's default is used. An idle
+journals its session at most once every ten minutes, and a session's start
+journals other sessions of the project that have new messages since their last
+entry; choose a small, cheap model if your default is an expensive one.
 
 ## Procedures
 
@@ -107,7 +113,8 @@ such as the Obsidian Git plugin, on every machine first):
    `OBSIDIAN_PROJECTS_REMOTE` set to a new, empty, private repository:
 
    ```
-   echo "Projects/" >> .gitignore
+   cd "$OBSIDIAN_VAULT_PATH"
+   printf '\nProjects/\n' >> .gitignore
    git rm -r --cached Projects
    git commit -m "Stop tracking Projects/ (synced on its own)"
    git push
