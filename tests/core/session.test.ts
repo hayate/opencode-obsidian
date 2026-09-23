@@ -345,13 +345,16 @@ test("statusFromCycle waits at warn for an update another session is still runni
     committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
     conflicts: [], embedded: [], caseCollisions: [], notices: [], timedOut: null,
   };
-  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 12_400, hung: false } }), [
+  // The record's boot stamp is this boot's in every case below; the mismatch has its own
+  // line and its own test.
+  const here = { thisBoot: true, record: "/state/interrupted-update.json" };
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 12_400, hung: false, ...here } }), [
     { level: "warn", text: "unsynced: an earlier vault update is still running (process group 4242, 12 s so far); sync waits for it. If it is hung, end that process" },
   ]);
-  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 45_000, hung: false } }), [
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 45_000, hung: false, ...here } }), [
     { level: "warn", text: "unsynced: an earlier vault update is still running (process group 4242, 45 s so far); sync waits for it. If it is hung, end that process" },
   ]);
-  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 1_920_000, hung: true } }), [
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 1_920_000, hung: true, ...here } }), [
     {
       level: "error",
       text: "unsynced: an earlier vault update has been running for 32 min (process group 4242), longer than the longest limit a live update gets: it is hung. End that process, and the next sync tries the update again",
@@ -371,17 +374,53 @@ test("statusFromCycle waits at warn for an update another session is still runni
     [601_200_000, "7 days"],
   ];
   for (const [runningMs, reads] of ages) {
-    const [line] = statusFromCycle({ ...base, waiting: { group: 7, runningMs, hung: true } });
+    const [line] = statusFromCycle({ ...base, waiting: { group: 7, runningMs, hung: true, ...here } });
     assert.match(line?.text ?? "", new RegExp(`^unsynced: an earlier vault update has been running for ${reads} \\(process group 7\\)`), `${runningMs} ms`);
   }
   // A problem runCycle recorded with the reason comes last here too.
   const lock = { ...base, reason: "an earlier vault update is still running; releasing the sync lock failed: EACCES" };
-  assert.deepEqual(statusFromCycle({ ...lock, waiting: { group: 4242, runningMs: 0, hung: false } }), [
+  assert.deepEqual(statusFromCycle({ ...lock, waiting: { group: 4242, runningMs: 0, hung: false, ...here } }), [
     {
       level: "warn",
       text: "unsynced: an earlier vault update is still running (process group 4242, 0 s so far); sync waits for it. If it is hung, end that process; releasing the sync lock failed: EACCES",
     },
   ]);
+});
+
+// Spec 5.4 step 5 (the gauntlet fix wave): the boot stamp is derived from os.uptime(), so
+// a clock correction larger than its tolerance reads as another boot. A live group is
+// waited for either way; a stamp that does not match only makes the line a notify, and
+// gives the one way out that costs nothing when the wait is right.
+test("statusFromCycle waits at notify for an update whose record is not this boot's, naming the record to delete", () => {
+  const base = {
+    outcome: "unsynced" as const,
+    reason: "an earlier vault update is still running",
+    committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
+    conflicts: [], embedded: [], caseCollisions: [], notices: [], timedOut: null,
+  };
+  const elsewhere = { thisBoot: false, record: "/state/interrupted-update.json" };
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 12_400, hung: false, ...elsewhere } }), [
+    {
+      level: "error",
+      text: 'unsynced: an earlier vault update is still running (process group 4242, 12 s so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. If it is not that update, delete "/state/interrupted-update.json" to let sync carry on',
+    },
+  ]);
+  // Hung or not, the mismatch is what the line is about: the age alone cannot say whether
+  // the process is the update at all.
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 9, runningMs: 86_400_000, hung: true, ...elsewhere } }), [
+    {
+      level: "error",
+      text: 'unsynced: an earlier vault update is still running (process group 9, 1 day so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. If it is not that update, delete "/state/interrupted-update.json" to let sync carry on',
+    },
+  ]);
+  // A problem runCycle recorded with the reason comes last here too, and the record's name
+  // is quoted like any other name a status line carries.
+  const lock = { ...base, reason: "an earlier vault update is still running; releasing the sync lock failed: EACCES" };
+  const [line] = statusFromCycle({ ...lock, waiting: { group: 9, runningMs: 0, hung: false, thisBoot: false, record: "/state/a\nb.json" } });
+  assert.equal(
+    line?.text,
+    'unsynced: an earlier vault update is still running (process group 9, 0 s so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. If it is not that update, delete "/state/a\\nb.json" to let sync carry on; releasing the sync lock failed: EACCES',
+  );
 });
 
 async function identityWorld(): Promise<{ vaultRoot: string; remote: string; code: string; stateRoot: string }> {

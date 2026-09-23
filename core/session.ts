@@ -164,7 +164,9 @@ function age(ms: number): string {
 // says the next sync finishes the update, only that it tries: at the ceiling six timeouts
 // in a row are the normal case, and an update hung past that limit will often hang its
 // repair on the same filter. An update another session left running is waited for, at warn
-// level, until it has run longer than that longest limit, when it is hung and says so.
+// level, until it has run longer than that longest limit, when it is hung and says so; a
+// record whose boot stamp is not this boot's is waited for at notify level instead, since
+// the process holding that id may be something else entirely.
 // No line says when the retry comes: a cycle runs when an OpenCode session starts.
 // Anything runCycle appended to the reason (a failed lock release) goes last, after this
 // line's own words, so both read cleanly.
@@ -172,8 +174,17 @@ function unsynced(r: CycleResult): StatusItem {
   const said = r.reason ?? "push did not happen";
   const rest = (lead: string): string => (said.startsWith(lead) ? said.slice(lead.length) : `; ${said}`);
   if (r.waiting !== null) {
-    const { group, runningMs, hung } = r.waiting;
+    const { group, runningMs, hung, thisBoot, record } = r.waiting;
     const also = rest(STILL_RUNNING);
+    // A stamp that is not this boot's: the wait still happens (liveness decides), but the
+    // process holding that id may be anything, so this is a notify and it names the one
+    // file the user deletes to carry on. Rewriting or ending anything else is not asked.
+    if (!thisBoot) {
+      return {
+        level: "error",
+        text: `unsynced: ${STILL_RUNNING} (process group ${group}, ${age(runningMs)} so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. If it is not that update, delete ${quoted(record)} to let sync carry on${also}`,
+      };
+    }
     if (!hung) {
       return { level: "warn", text: `unsynced: ${STILL_RUNNING} (process group ${group}, ${age(runningMs)} so far); sync waits for it. If it is hung, end that process${also}` };
     }

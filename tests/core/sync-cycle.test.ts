@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { changedSince, REMOTE_SEEN, runCycle, type CycleInput, type CycleResult } from "../../core/sync/cycle.ts";
 import { bootInstant } from "../../core/sync/recovery.ts";
 import { statusFromCycle } from "../../core/session.ts";
+import { quoted } from "../../core/store.ts";
 import { prepareProjects, REQUIRED_IGNORES } from "../../core/sync/state.ts";
 import { acquireLock } from "../../core/lock.ts";
 import { git, gitOk } from "../../core/git.ts";
@@ -1933,14 +1934,39 @@ test("a record naming a process group that is gone is repaired like any other, a
   assert.equal(await remoteFile(remote, "x/t.md"), "from a");
 });
 
-test("a group recorded before a reboot is ignored: any process may hold that id now, so the repair runs instead of waiting for ever", async () => {
+// Spec 5.4 step 5 (the gauntlet fix wave, 2026-09-23): the boot stamp is derived from
+// os.uptime(), so a wall-clock correction larger than the tolerance reads as another
+// boot; on Linux /proc/uptime is boot-based, so a clock step moves it there too. A live
+// group is therefore always waited for, and the stamp only decides how loudly.
+test("a live group stamped with another boot (a reboot, or a clock stepped since) is still waited for: nothing is repaired or snapshotted, and the notify says which file to delete to carry on", async () => {
   const { remote, b, slow } = await behindSlowFilter("sleep 10; cat", 500);
   assert.equal((await runCycle(slow)).outcome, "unsynced");
+  const pushed = await gitOk(["rev-parse", "main"], { cwd: remote });
   const alive = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
   alive.unref();
   const group = alive.pid ?? 0;
-  // The same id, alive, but recorded under the boot before this one.
+  // The same id, alive, but stamped with a boot instant far from this one.
   await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group, boot: bootInstant() - 86_400_000, startedAt: Date.now() }));
+  const waiting = await runCycle(slow);
+  assert.equal(waiting.outcome, "unsynced", waiting.reason ?? "");
+  assert.equal(waiting.reason, "an earlier vault update is still running");
+  assert.deepEqual({ group: waiting.waiting?.group, thisBoot: waiting.waiting?.thisBoot }, { group, thisBoot: false });
+  assert.equal(waiting.waiting?.record, join(b.state, RECORD), "the record the way out names");
+  assert.equal(waiting.committed, null, "nothing is snapshotted");
+  assert.deepEqual(waiting.notices, [], "nothing is repaired");
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushed, "nothing is pushed");
+  assert.equal((await recordOf(b)).group, group, "the record is left exactly as it was");
+  const [line] = statusFromCycle(waiting);
+  assert.equal(line?.level, "error", "a notify: the wait may be on a process that is not the update");
+  assert.match(
+    line?.text ?? "",
+    new RegExp(
+      `^unsynced: an earlier vault update is still running \\(process group ${group}, \\d+ s so far\\), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else\\. Sync waits for it\\. If it is not that update, delete `,
+    ),
+  );
+  assert.ok((line?.text ?? "").endsWith(`delete ${quoted(join(b.state, RECORD))} to let sync carry on`), line?.text);
+  // Once that process is gone the record is judged as any other: the repair runs.
+  await endHelper(alive, "group");
   await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });
   const after = await runCycle({ ...slow, liveUpdateTimeoutMs: undefined });
   assert.equal(after.outcome, "synced", after.reason ?? "");
@@ -1948,7 +1974,6 @@ test("a group recorded before a reboot is ignored: any process may hold that id 
   assert.deepEqual(after.notices, ["finished an interrupted vault update; 1 file set back to update again"]);
   assert.equal(await read(b, "x/t.md"), "from a\n");
   assert.equal(await remoteFile(remote, "x/t.md"), "from a");
-  await endHelper(alive, "group");
 });
 
 test("an update still running after the longest limit a live update gets is hung: the wait escalates to a notify naming it and its age, and a start in the future reads as just started", async () => {

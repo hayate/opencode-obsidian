@@ -455,15 +455,20 @@ export function bootInstant(): number {
 
 // How far a record's boot may sit from this one and still be this boot: uptime() counts
 // whole seconds and the clock can be adjusted under it, so two readings differ by a
-// second or two, while a reboot moves this by far more.
+// second or two, while a reboot moves this by far more. It is not an identity a clock
+// cannot fake: on Linux os.uptime() reads /proc/uptime, which counts from boot, so a
+// wall-clock correction larger than this moves the derived instant; on macOS it is
+// derived from kern.boottime, which a clock step moves outright. That is why the stamp
+// no longer decides whether to wait (a live group is always waited for) but only how
+// loudly the wait is reported.
 const BOOT_TOLERANCE_MS = 5000;
 
 // Spec 5.6's model for the lock's pid, applied to a process group: ESRCH means it is
 // gone, EPERM means it is alive under another user, and anything else is treated as
 // alive, since nothing may repair over an update that might still be running. A group id
 // this boot has since given to something else therefore reads as alive and sync waits for
-// a process that is not ours: the accepted limitation, as for the lock, and bounded by
-// the boot check above, since a record from an earlier boot names no group at all.
+// a process that is not ours: the accepted limitation, as for the lock. Its way out is
+// the record file, which the status names whenever the boot stamp does not match.
 function groupAlive(group: number): boolean {
   // The plugin's process groups are POSIX: git.ts spawns detached and kills -pgid on a
   // timeout, and CI runs ubuntu and macOS. Where the platform has none the question
@@ -484,19 +489,36 @@ export interface RunningUpdate {
   // How long it has been running. A start in the future (the clock moved back under it)
   // reads as just started, never as long-running.
   runningMs: number;
+  // Whether the record's boot stamp is this boot's. False after a reboot (any process may
+  // hold that id now) and false after a clock step larger than the tolerance, which the
+  // derived instant cannot tell apart from one. The wait happens either way; this decides
+  // how loudly it is reported, and whether the way out below is offered.
+  thisBoot: boolean;
+  // The record file. Deleting it is the user's way out of a wait on a process that is not
+  // this update, so the status names it whenever the boot stamp does not match.
+  record: string;
 }
 
 // The live update that may still be running, or null: no record, a record with no group,
-// a group of an earlier boot (any process may hold that id now, so it counts for
-// nothing), or a group that has exited. Read before the repair (cycle.ts): repairing or
+// or a group that has exited. Read before the repair (cycle.ts): repairing or
 // snapshotting over a running update would set its notes back under it and push the old
 // versions as this machine's change.
+//
+// Liveness alone decides. A boot stamp that does not match is not a reason to go ahead:
+// the two failure modes pull opposite ways, and waiting on a recycled id after a reboot
+// only strands sync until the user deletes the record, while going ahead during a clock
+// step loses notes. So the stamp is reported, never obeyed.
 export async function runningUpdate(stateDir: string): Promise<RunningUpdate | null> {
-  const record = await readRecord(join(stateDir, RECORD));
+  const path = join(stateDir, RECORD);
+  const record = await readRecord(path);
   if (record?.group === undefined) return null;
-  if (record.boot === undefined || Math.abs(bootInstant() - record.boot) > BOOT_TOLERANCE_MS) return null;
   if (!groupAlive(record.group)) return null;
-  return { group: record.group, runningMs: Math.max(0, Date.now() - (record.startedAt ?? Date.now())) };
+  return {
+    group: record.group,
+    runningMs: Math.max(0, Date.now() - (record.startedAt ?? Date.now())),
+    thisBoot: record.boot !== undefined && Math.abs(bootInstant() - record.boot) <= BOOT_TOLERANCE_MS,
+    record: path,
+  };
 }
 
 // Called after git() returned for the killed reset, so its process group is gone.

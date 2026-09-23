@@ -57,8 +57,10 @@ export interface CycleResult {
   // Spec 5.4 step 5: an update another session started is still running, so this cycle
   // did nothing (the outcome is unsynced). Its process group, how long it has been
   // running, and whether that is longer than the longest limit a live update gets, which
-  // makes it hung rather than slow and escalates the status to a notify. Null otherwise.
-  waiting: { group: number; runningMs: number; hung: boolean } | null;
+  // makes it hung rather than slow and escalates the status to a notify; plus whether the
+  // record's boot stamp is this boot's and the record's own path, which the status names
+  // as the way out when it is not. Null otherwise.
+  waiting: { group: number; runningMs: number; hung: boolean; thisBoot: boolean; record: string } | null;
 }
 
 // The remote head this machine last integrated with (spec 5.3).

@@ -430,14 +430,23 @@ mutate("core/git.ts", "      reported = Promise.reject(err);", "      throw err;
 # Fix round 2: a record's group belongs to the boot that wrote it, an update that outlives the
 # longest limit is hung rather than slow, and where the platform has no process groups the
 # check answers gone.
-REBOOT = "group recorded before a reboot"; HUNG = "longest limit a live update gets is hung"
-mutate(F_RC, "  if (record.boot === undefined || Math.abs(bootInstant() - record.boot) > BOOT_TOLERANCE_MS) return null;\n", "", C, pattern=REBOOT)
+REBOOT = "stamped with another boot"; HUNG = "longest limit a live update gets is hung"
+# The gauntlet fix wave: a live group is waited for whatever its boot stamp says (the stamp
+# is derived from os.uptime(), which a clock step moves), and the stamp only decides how
+# loudly, plus whether the record to delete is named.
+mutate(F_RC, "  if (!groupAlive(record.group)) return null;\n",
+       "  if (!groupAlive(record.group) || record.boot === undefined || Math.abs(bootInstant() - record.boot) > BOOT_TOLERANCE_MS) return null;\n", C, pattern=REBOOT)
+mutate(F_RC, "    thisBoot: record.boot !== undefined && Math.abs(bootInstant() - record.boot) <= BOOT_TOLERANCE_MS,\n", "    thisBoot: true,\n", C, pattern=REBOOT)
+mutate(F_RC, "    record: path,\n", '    record: "",\n', C, pattern=REBOOT)
 mutate(F_RC, "const BOOT_TOLERANCE_MS = 5000;", "const BOOT_TOLERANCE_MS = 604_800_000;", C, pattern=REBOOT)
+NOT_THIS_BOOT = "not this boot's"
+mutate("core/session.ts", "    if (!thisBoot) {", "    if (false) {", SE, pattern=NOT_THIS_BOOT)
+mutate("core/session.ts", "delete ${quoted(record)} to let sync carry on", "delete ${record} to let sync carry on", SE, pattern=NOT_THIS_BOOT)
 mutate(F_RC, '  const record: Record_ = group === undefined ? { from, to } : { from, to, group, boot: bootInstant(), startedAt: Date.now() };',
        "  const record: Record_ = group === undefined ? { from, to } : { from, to, group };", C, pattern="records its process group")
 mutate(F_RC, '  if (process.platform === "win32") return false;\n', "", RC, pattern="no process groups the check answers gone")
-mutate(F_RC, "  return { group: record.group, runningMs: Math.max(0, Date.now() - (record.startedAt ?? Date.now())) };",
-       "  return { group: record.group, runningMs: Date.now() - (record.startedAt ?? Date.now()) };", C, pattern=HUNG)
+mutate(F_RC, "    runningMs: Math.max(0, Date.now() - (record.startedAt ?? Date.now())),\n",
+       "    runningMs: Date.now() - (record.startedAt ?? Date.now()),\n", C, pattern=HUNG)
 mutate(CY, "result.waiting = { ...running, hung: running.runningMs > limitOf({ ...ladder, level: MAX_LEVEL }) };",
        "result.waiting = { ...running, hung: false };", C, pattern=HUNG)
 mutate("core/session.ts", "    if (!hung) {", "    if (true) {", SE, pattern="statusFromCycle waits at warn for an update")
