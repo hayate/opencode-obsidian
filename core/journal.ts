@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { readFile, readdir, rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { Harness, SessionRef, TranscriptChunk } from "./harness.ts";
+import { acquireLock } from "./lock.ts";
 import { scanText } from "./secrets.ts";
 import {
   checkMemoryDir,
@@ -38,7 +39,9 @@ export interface JournalEntry {
 }
 
 export interface JournalState {
-  sessions: Record<string, { lastMessageId: string; journaledAt: number }>;
+  // lastTime: the time of the last message journaled, which orders positions whatever the
+  // harness's message ids look like (absent in state written before it existed).
+  sessions: Record<string, { lastMessageId: string; lastTime?: number; journaledAt: number }>;
 }
 
 export const COOLDOWN_MS = 10 * 60 * 1000;
@@ -173,10 +176,50 @@ export interface JournalContext {
   now: () => Date;
 }
 
+// The journals in flight in this process, one per session: an idle that stopped waiting for
+// its model, the next idle, and a catch-up never journal one session twice at once.
+const inFlight = new Map<string, Promise<"written" | "nothing-new" | "cooldown">>();
+
+// One session's journal entry, if one is due. "running" when this process is already
+// journaling that session: nothing is read, written or billed.
 export async function journalSession(
   ctx: JournalContext,
   sessionId: string,
   opts: { force?: boolean } = {},
+): Promise<"written" | "nothing-new" | "cooldown" | "running"> {
+  const key = `${ctx.stateFile}\0${sessionId}`;
+  if (inFlight.has(key)) return "running";
+  const run = journalOnce(ctx, sessionId, opts);
+  inFlight.set(key, run);
+  try {
+    return await run;
+  } finally {
+    inFlight.delete(key);
+  }
+}
+
+// The position is merged into the state file under the machine's lock (every session of
+// every OpenCode process on this machine shares the file), and a position another writer
+// saved for a later message is never replaced by an earlier one.
+async function savePosition(file: string, sessionId: string, position: { lastMessageId: string; lastTime: number; journaledAt: number }): Promise<void> {
+  const lock = await acquireLock(`${file}.lock`, { waitMs: 10_000 });
+  if (!lock) throw new Error(`${quoted(file)} stayed locked by another session; the entry is written, and its position is saved by the next journal`);
+  try {
+    const fresh = await loadJournalState(file);
+    const prior = fresh.sessions[sessionId];
+    if (prior === undefined || (prior.lastTime ?? 0) <= position.lastTime) {
+      fresh.sessions[sessionId] = position;
+      await saveJournalState(file, fresh);
+    }
+  } finally {
+    await lock.release();
+  }
+}
+
+async function journalOnce(
+  ctx: JournalContext,
+  sessionId: string,
+  opts: { force?: boolean },
 ): Promise<"written" | "nothing-new" | "cooldown"> {
   const state = await loadJournalState(ctx.stateFile);
   const prior = state.sessions[sessionId];
@@ -199,9 +242,7 @@ export async function journalSession(
     summary,
     timezone: ctx.timezone,
   });
-  const fresh = await loadJournalState(ctx.stateFile);
-  fresh.sessions[sessionId] = { lastMessageId: last.id, journaledAt: now.getTime() };
-  await saveJournalState(ctx.stateFile, fresh);
+  await savePosition(ctx.stateFile, sessionId, { lastMessageId: last.id, lastTime: last.time, journaledAt: now.getTime() });
   return "written";
 }
 

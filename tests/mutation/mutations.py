@@ -724,3 +724,10 @@ mutate(OI, '      if (event.type === "session.deleted") sessions.forget(event.pr
 mutate(OI, '        report("loading project memory", err);', "        throw err;", AI, pattern="never throws")
 mutate(OI, "        return message;\n", "        throw err;\n", AI, pattern="fails answers")
 mutate(OI, "        await notify(message).catch(() => undefined);", "        await notify(message);", AI, pattern="toast fails too")
+
+# The journal (gauntlet fix pass): one run per session in this process, and the position merged
+# under the machine's lock, never replacing a later one.
+JT = "tests/core/journal.test.ts"
+mutate("core/journal.ts", '  if (inFlight.has(key)) return "running";\n', "", JT, pattern="once at a time")
+mutate("core/journal.ts", "if (prior === undefined || (prior.lastTime ?? 0) <= position.lastTime) {", "if (true) {", JT, pattern="never replaced by an older")
+mutate("core/journal.ts", "  const lock = await acquireLock(`${file}.lock`, { waitMs: 10_000 });\n", "  const lock = { release: async () => undefined };\n", JT, runs=5, pattern="keep their positions")

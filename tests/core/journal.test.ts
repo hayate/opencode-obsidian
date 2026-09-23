@@ -258,3 +258,55 @@ test("catch-up continues past a session that fails, and names it", async () => {
   assert.deepEqual(r.failed, [{ session: "bad", error: "transcript store unavailable" }]);
   assert.deepEqual((await listEntries(c.projectDir)).map((e) => e.body), ["worked on the sync engine"]);
 });
+
+// A model call the test releases.
+class GatedHarness extends FakeHarness {
+  release: () => void = () => undefined;
+  gate = new Promise<void>((resolve) => (this.release = resolve));
+  override async callModel(): Promise<string> {
+    this.calls++;
+    await this.gate;
+    return this.reply;
+  }
+}
+
+test("a session is journaled once at a time: a call while one waits on the model writes nothing and calls no model", { timeout: 10_000 }, async () => {
+  const clock = { t: new Date("2026-09-21T10:00:00Z") };
+  const h = new GatedHarness();
+  h.transcripts.set("s1", [msg("m1", "2026-09-21T09:00:00Z")]);
+  const c = await ctx(h, clock);
+  const first = journalSession(c, "s1");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await journalSession(c, "s1"), "running");
+  h.release();
+  assert.equal(await first, "written");
+  assert.equal(h.calls, 1);
+  assert.equal((await listEntries(c.projectDir)).length, 1);
+});
+
+test("a position another writer saved later is never replaced by an older one", { timeout: 10_000 }, async () => {
+  const clock = { t: new Date("2026-09-21T10:00:00Z") };
+  const h = new GatedHarness();
+  h.transcripts.set("s1", [msg("m1", "2026-09-21T09:00:00Z")]);
+  const c = await ctx(h, clock);
+  const first = journalSession(c, "s1");
+  await new Promise((resolve) => setImmediate(resolve));
+  // Meanwhile another session journaled s1 further (its catch-up, say).
+  await mkdir(join(c.stateFile, ".."), { recursive: true });
+  const newer = { lastMessageId: "m2", lastTime: Date.parse("2026-09-21T09:30:00Z"), journaledAt: clock.t.getTime() };
+  await writeFile(c.stateFile, JSON.stringify({ sessions: { s1: newer } }));
+  h.release();
+  await first;
+  assert.deepEqual(JSON.parse(await readFile(c.stateFile, "utf8")).sessions.s1, newer);
+});
+
+test("sessions journaled at once all keep their positions: no writer loses another's", { timeout: 10_000 }, async () => {
+  const clock = { t: new Date("2026-09-21T10:00:00Z") };
+  const h = new FakeHarness();
+  const ids = Array.from({ length: 12 }, (_, i) => `s${i}`);
+  for (const id of ids) h.transcripts.set(id, [msg(`${id}-m1`, "2026-09-21T09:00:00Z")]);
+  const c = await ctx(h, clock);
+  await Promise.all(ids.map((id) => journalSession(c, id)));
+  const saved = JSON.parse(await readFile(c.stateFile, "utf8")).sessions;
+  assert.deepEqual(Object.keys(saved).sort(), [...ids].sort());
+});
