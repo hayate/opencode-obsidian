@@ -14,6 +14,7 @@ import {
   readMemoryFile,
   renderDoc,
   writeAtomic,
+  writeDurable,
   writeHandoff,
   type Handoff,
 } from "../../core/store.ts";
@@ -297,4 +298,35 @@ test("errorText renders what was thrown, whatever it is, and names the built-in 
   ] as Array<[unknown, string]>) {
     assert.equal(errorText(thrown), reads, JSON.stringify(thrown));
   }
+});
+
+// D1 (the gauntlet fix wave): recovery.ts's intent record is written before `reset --keep`
+// changes a single note, so its absence loses work that is already on disk. Write-plus-
+// rename survives a crash, not a power loss: neither the bytes nor the directory entry
+// need have reached the platter. What the flushes themselves guarantee is only visible
+// across a power loss (the mutations for them are declared survivors); what is testable
+// is that the write is otherwise writeAtomic's, replacement and all.
+test("writeDurable replaces a file whole, creates its directory, and leaves no temp sibling", async () => {
+  const dir = join(await tempDir(), "nested", "deeper");
+  const path = join(dir, "record.json");
+  await writeDurable(path, '{"from":"a"}');
+  assert.equal(await readFile(path, "utf8"), '{"from":"a"}');
+  await writeDurable(path, '{"from":"b","to":"c"}');
+  assert.equal(await readFile(path, "utf8"), '{"from":"b","to":"c"}');
+  assert.deepEqual((await readdir(dir)).sort(), ["record.json"]);
+  // A long value and an empty one both land whole.
+  await writeDurable(path, "");
+  assert.equal(await readFile(path, "utf8"), "");
+  const long = "x".repeat(200_000);
+  await writeDurable(path, long);
+  assert.equal(await readFile(path, "utf8"), long);
+  assert.deepEqual((await readdir(dir)).sort(), ["record.json"]);
+});
+
+test("a writeDurable whose rename fails takes its temp sibling with it and throws", async () => {
+  const dir = await tempDir();
+  // A directory where the file goes: the rename cannot replace it.
+  await mkdir(join(dir, "record.json"));
+  await assert.rejects(() => writeDurable(join(dir, "record.json"), "x"));
+  assert.deepEqual(await readdir(dir), ["record.json"], "no temp sibling is left behind");
 });

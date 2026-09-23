@@ -11,7 +11,7 @@ import { uptime } from "node:os";
 import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { git, GitError, gitOk, literal, type GitResult } from "../git.ts";
-import { writeAtomic } from "../store.ts";
+import { writeAtomic, writeDurable } from "../store.ts";
 import { fold } from "./copies.ts";
 import { ignoresCase, isEffectivelyEmpty, isFinderLitter } from "./state.ts";
 
@@ -442,7 +442,11 @@ async function setBack(
 // repairs as it always has.
 export async function recordIntent(stateDir: string, from: string, to: string, group?: number): Promise<void> {
   const record: Record_ = group === undefined ? { from, to } : { from, to, group, boot: bootInstant(), startedAt: Date.now() };
-  await writeAtomic(join(stateDir, RECORD), JSON.stringify(record));
+  // writeDurable, not writeAtomic: this is the one file on the branch whose absence loses
+  // work already on disk. A power loss between this write and the reset's first write
+  // would otherwise leave the notes changed with no record of it, and the next snapshot
+  // would publish a half-applied update as the user's own change.
+  await writeDurable(join(stateDir, RECORD), JSON.stringify(record));
 }
 
 // When this machine booted, as a wall-clock instant to the second: os.uptime() is the

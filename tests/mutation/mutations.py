@@ -545,3 +545,18 @@ mutate("core/git.ts", "      result.lockNote = note;\n", "", C, pattern="the not
 mutate("core/session.ts", "      if (released !== null && prepared.err instanceof Error) prepared.err.message = `${prepared.err.message}; ${released}`;\n", "", SE,
        pattern="prepare that fails while the lock")
 mutate("core/session.ts", '    if (released !== null) out.push({ level: "warn", text: released });\n', "", SE, pattern="prepare lock that cannot be released")
+
+# D1 (the gauntlet fix wave): the intent record is the one file on the branch whose absence
+# loses work already on disk, so it is written durably. What the two flushes guarantee is
+# only visible across a power loss; the rest of writeDurable is writeAtomic's contract and
+# is tested.
+mutate("core/sync/recovery.ts", "  await writeDurable(join(stateDir, RECORD), JSON.stringify(record));", "  await writeAtomic(join(stateDir, RECORD), JSON.stringify(record));", RC,
+       pattern="records its process group", survives=("linux", "darwin"),
+       why="writeDurable and writeAtomic differ only in what reaches the platter, which no test can observe: both leave the same bytes at the same path")
+mutate("core/store.ts", "    await handle.sync();\n  } finally {\n    await handle.close();\n  }\n  try {\n    await rename(tmp, path);", "  } finally {\n    await handle.close();\n  }\n  try {\n    await rename(tmp, path);",
+       "tests/core/store.test.ts", pattern="writeDurable", survives=("linux", "darwin"),
+       why="a flush to the platter is not observable from node: what it guarantees appears only across a power loss")
+mutate("core/store.ts", "  await flush(dir);\n}", "}", "tests/core/store.test.ts", pattern="writeDurable", survives=("linux", "darwin"),
+       why="a flush to the platter is not observable from node: what it guarantees appears only across a power loss")
+mutate("core/store.ts", "    await rm(tmp, { force: true });\n    throw err;\n  }\n  await flush(dir);", "    throw err;\n  }\n  await flush(dir);",
+       "tests/core/store.test.ts", pattern="temp sibling with it and throws")

@@ -156,6 +156,51 @@ export async function writeAtomic(path: string, content: string): Promise<void> 
   }
 }
 
+// Flushes what is at a path to the disk itself, file or directory (fsync on a directory
+// is what makes a rename into it survive a power loss; it works on macOS and on Linux,
+// both measured).
+async function flush(path: string): Promise<void> {
+  const handle = await open(path, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+// writeAtomic, and what is on disk after a power loss is the old file or the whole new
+// one, never neither: the temp sibling is flushed before the rename and the directory
+// after it. Write-plus-rename alone survives a crash, not a power loss, because neither
+// the bytes nor the directory entry need have reached the platter.
+//
+// Only for a file whose absence would lose work that is already on disk. On this branch
+// that is recovery.ts's intent record alone, written before `reset --keep` changes a
+// single note: lose it and the notes are changed with nothing saying so, and the next
+// snapshot publishes a half-applied update as the user's own change. Every other caller
+// of writeAtomic was checked and none has that property: the blocked-cycle count, the
+// live-update level and .gitignore are rebuilt by the next cycle, and a handoff, a
+// journal entry and the vault config are the work rather than a record of it, so losing
+// the write loses nothing that happened.
+export async function writeDurable(path: string, content: string): Promise<void> {
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true });
+  const tmp = join(dir, `.${basename(path)}.${randomHex(4)}.sro-tmp`);
+  const handle = await open(tmp, "w");
+  try {
+    await handle.writeFile(content);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await rename(tmp, path);
+  } catch (err) {
+    await rm(tmp, { force: true });
+    throw err;
+  }
+  await flush(dir);
+}
+
 // A memory path that exists but cannot be used: an I/O failure, or a refusal by
 // the read boundary below (`boundary`). `why` is short and never raw vault text
 // (an errno code, or which part is a link, named through vaultName), so the
