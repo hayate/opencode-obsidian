@@ -22,11 +22,15 @@ export class VaultError extends Error {
   }
 }
 
+// Only a path that is not there, or not a directory on the way, is "not a directory": any other
+// failure (EACCES, ELOOP, EIO) says what it is, never that the vault does not exist.
 async function isDirectory(path: string): Promise<boolean> {
   try {
     return (await stat(path)).isDirectory();
-  } catch {
-    return false;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    throw new VaultError(`OBSIDIAN_VAULT_PATH "${path}" cannot be read (${code ?? (err as Error).message})`);
   }
 }
 

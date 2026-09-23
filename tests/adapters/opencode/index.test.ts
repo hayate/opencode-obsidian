@@ -20,7 +20,7 @@ async function hooks(client: FakeClient) {
 
 // These tests run with no vault, so the plugin's load-time toast (tested below) is left out of
 // counts that are about something else.
-const besidesVault = (toasts: Array<{ message: string }>) => toasts.filter((t) => !t.message.startsWith("memory and sync are off: "));
+const besidesVault = (toasts: Array<{ message: string }>) => toasts.filter((t) => !t.message.startsWith("memory and sync disabled: "));
 
 function user(sessionID: string): Message[] {
   return [{ info: { id: "u1", sessionID, role: "user" }, parts: [{ id: "p1", sessionID, messageID: "u1", type: "text", text: "hello" }] }];
@@ -127,7 +127,7 @@ test("a missing vault is told as the plugin loads: logged at once, and a toast o
   const h = await hooks(client);
   await settle();
   assert.deepEqual(client.logs, [
-    { service: "superpower-remember-obsidian", level: "error", message: "memory and sync are off: OBSIDIAN_VAULT_PATH is not set: this plugin needs it set to the absolute path of your Obsidian vault" },
+    { service: "superpower-remember-obsidian", level: "error", message: "memory and sync disabled: OBSIDIAN_VAULT_PATH is not set: this plugin needs it set to the absolute path of your Obsidian vault" },
   ]);
   assert.deepEqual(client.toasts, [], "nothing is drawn yet: the TUI may not be listening");
   await h.event?.({ event: { type: "tui.toast.show", properties: {} } } as never);
@@ -161,7 +161,7 @@ test("a vault path that is not a vault is told at load with core's own reason", 
     await until("the log", () => client.logs.length > 0);
     await h.event?.({ event: { type: "plugin.added", properties: {} } } as never);
     await until("the toast", () => client.toasts.length > 0);
-    assert.match(client.logs[0]?.message ?? "", /^memory and sync are off: OBSIDIAN_VAULT_PATH ".*" is not an Obsidian vault \(no \.obsidian\/ folder\)$/);
+    assert.match(client.logs[0]?.message ?? "", /^memory and sync disabled: OBSIDIAN_VAULT_PATH ".*" is not an Obsidian vault \(no \.obsidian\/ folder\)$/);
     assert.equal(client.toasts[0]?.message, client.logs[0]?.message);
   } finally {
     delete process.env.OBSIDIAN_VAULT_PATH;

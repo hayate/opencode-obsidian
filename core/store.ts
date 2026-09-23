@@ -41,10 +41,11 @@ const STATUS_TEXT_MAX = 120;
 // A string read from the vault, shown inside plugin text such as a status line
 // (which sits outside the payload's data block): quoted, escaped (JSON, plus the
 // line and format characters JSON leaves raw) and capped, so it can neither pass
-// for plugin text nor add lines of its own.
-export function quoted(value: string): string {
+// for plugin text nor add lines of its own. A path the model must use whole is passed
+// with no cap (max: Infinity).
+export function quoted(value: string, max = STATUS_TEXT_MAX): string {
   const chars = [...value];
-  const short = chars.length > STATUS_TEXT_MAX ? `${chars.slice(0, STATUS_TEXT_MAX - 3).join("")}...` : value;
+  const short = chars.length > max ? `${chars.slice(0, max - 3).join("")}...` : value;
   return JSON.stringify(short).replace(/[\u007f-\u009f\u2028\u2029\p{Cf}]/gu, (c) => {
     const cp = c.codePointAt(0) ?? 0;
     return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, "0")}`;

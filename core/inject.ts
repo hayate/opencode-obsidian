@@ -1,7 +1,7 @@
 // Spec 7.2-7.3: the session-start payload, built once and frozen. Everything
 // recorded (handoffs, journal, identity) sits inside a block framed as data.
 import type { Handoff, Heads } from "./store.ts";
-import { MALFORMED_BRANCH, vaultName } from "./store.ts";
+import { MALFORMED_BRANCH, quoted, vaultName } from "./store.ts";
 import type { JournalEntry } from "./journal.ts";
 import { escapeTag, tagPattern } from "./tags.ts";
 
@@ -92,11 +92,18 @@ export function selectHandoffs(
   return { title, list, others };
 }
 
+// A path whole, however long (the model's file tools need all of it): in backticks when plain, as a
+// JSON string when it holds a line break, an invisible character or a backtick. The folder name in
+// it comes from the vault, synced from other machines, and must not add lines to the status block.
+function pathShown(path: string): string {
+  return /^[^\p{Cc}\p{Cf}\u2028\u2029`]+$/u.test(path) ? `\`${path}\`` : quoted(path, Infinity);
+}
+
 export function buildPayload(input: PayloadInput): string {
   const budget = input.budgetChars ?? DEFAULT_BUDGET;
   const status = input.status.length ? input.status.map((s) => `- [${s.level}] ${escapeBlockTags(s.text)}`) : ["- [info] all good"];
   const shown = input.project === null ? null : vaultName(input.project);
-  const where = input.projectDir === null ? "" : `, in the Obsidian vault at \`${input.projectDir}\` (not in the working directory)`;
+  const where = input.projectDir === null ? "" : `, in the Obsidian vault at ${pathShown(input.projectDir)} (not in the working directory)`;
   const project = shown === null ? "none" : shown === input.project ? `\`${shown}\`${where}` : `${shown} (a folder in Projects/)${where}`;
   const head = [PAYLOAD_MARKER, input.bootstrap.trim(), "", "## Project and status", `- Project: ${escapeBlockTags(project)}`, ...status].join("\n");
   if (!input.project) return head;

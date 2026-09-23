@@ -35,7 +35,8 @@ export function assemble(input: { client: OpenCodeClient; directory: string }, o
 function vaultCheck(harness: OpenCodeHarness, env: NodeJS.ProcessEnv): (eventType: string) => void {
   const problem = resolveVault(env).then(
     () => null,
-    (err: unknown) => `memory and sync are off: ${errorText(err)}`,
+    // Session start's own wording (core/session.ts), so the two reports read as one state.
+    (err: unknown) => `memory and sync disabled: ${errorText(err)}`,
   );
   void problem.then((p) => (p === null ? undefined : harness.logError(p))).catch(() => undefined);
   let told = false;

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveVault, readVaultConfig, systemTimezone, VaultError, CONFIG_FILE } from "../../core/vault.ts";
 import { addDays, dayStamp, fileStamp, isoWithOffset, monthStamp, timeStamp } from "../../core/time.ts";
@@ -96,3 +96,18 @@ test("a system zone Intl refuses (an empty TZ reads as Etc/Unknown) falls back t
     else process.env.TZ = saved;
   }
 });
+
+test(
+  "a vault that cannot be read says so, never that it does not exist",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const root = await tempDir();
+    await mkdir(join(root, ".obsidian"));
+    await chmod(root, 0o000);
+    try {
+      await assert.rejects(resolveVault({ OBSIDIAN_VAULT_PATH: root }), (err: unknown) => err instanceof VaultError && /^OBSIDIAN_VAULT_PATH ".*" cannot be read \(EACCES\)$/.test(err.message));
+    } finally {
+      await chmod(root, 0o755);
+    }
+  },
+);
