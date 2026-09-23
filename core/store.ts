@@ -51,6 +51,22 @@ export function quoted(value: string): string {
   });
 }
 
+// The built-in kinds, which are what a bug of ours throws: their message says what went
+// wrong but never where it came from, so "sync aborted: x is not a function" could be read
+// as a bad repository. The plugin's own classes (git.ts's GitError and its subclasses,
+// this file's MemoryPathError) write their whole message for the user, spec 5.6's
+// stranded-lock sentence among them, so naming their kind would only get in the way.
+const BUG_KINDS = new Set(["TypeError", "RangeError", "ReferenceError", "SyntaxError", "EvalError", "URIError", "AggregateError"]);
+
+// What a thrown value says, for a status line. A catch-all catches whatever was thrown,
+// and `(err as Error).message` on a value that is not an Error (a string, a rejected
+// promise's value, a null from a library) renders "sync aborted: undefined", which says
+// nothing at all.
+export function errorText(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  return BUG_KINDS.has(err.name) ? `${err.name}: ${err.message}` : err.message;
+}
+
 // A folder name from the vault, shown as is when it is plain, quoted otherwise.
 export function vaultName(name: string): string {
   return /^[^\p{Cc}\p{Cf}\u2028\u2029`]{1,120}$/u.test(name) ? name : quoted(name);
@@ -137,6 +153,68 @@ export async function writeAtomic(path: string, content: string): Promise<void> 
   } catch (err) {
     await rm(tmp, { force: true });
     throw err;
+  }
+}
+
+// Flushes what is at a path to the disk itself, file or directory (fsync on a directory
+// is what makes a rename into it survive a power loss; it works on macOS and on Linux,
+// both measured).
+async function flush(path: string): Promise<void> {
+  const handle = await open(path, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+// writeAtomic, and what is on disk after a power loss is the old file or the whole new
+// one, never neither: the temp sibling is flushed before the rename and the directory
+// after it. Write-plus-rename alone survives a crash, not a power loss, because neither
+// the bytes nor the directory entry need have reached the platter.
+//
+// Only for a file whose absence would lose work that is already on disk. On this branch
+// that is recovery.ts's intent record alone, written before `reset --keep` changes a
+// single note: lose it and the notes are changed with nothing saying so, and the next
+// snapshot publishes a half-applied update as the user's own change. Every other caller of
+// writeAtomic was checked and none has that property. The blocked-cycle count and the
+// live-update level (cycle.ts), Projects/.gitignore (state.ts), the journal's positions
+// and its digest cache (journal.ts) are all regenerable: the next cycle or the next
+// session writes them again, and each says so where it is read. The migration marker
+// (migrate.ts) is written after a migration that is idempotent by construction, so losing
+// it costs one re-run that finds nothing left to move. And recovery.ts's two other writes
+// of the record replace one that is already there, so a lost rename leaves the older
+// record, which errs toward keeping the user's files.
+// Returns null, or what went wrong with the last step alone. Everything up to and
+// including the rename fails closed, by throwing: until then nothing is in place and the
+// caller must not go on. The directory flush is different, because by then the file is
+// there: on a filesystem whose directory fd refuses fsync (some FUSE and network mounts
+// answer EINVAL) throwing here would abort every cycle identically, with an errno naming
+// neither the record nor a remedy, over a file that was written. So it degrades: the
+// caller reports what it costs (the write is not promised across a power loss) and carries
+// on.
+export async function writeDurable(path: string, content: string): Promise<string | null> {
+  const dir = dirname(path);
+  await mkdir(dir, { recursive: true });
+  const tmp = join(dir, `.${basename(path)}.${randomHex(4)}.sro-tmp`);
+  const handle = await open(tmp, "w");
+  try {
+    await handle.writeFile(content);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await rename(tmp, path);
+  } catch (err) {
+    await rm(tmp, { force: true });
+    throw err;
+  }
+  try {
+    await flush(dir);
+    return null;
+  } catch (err) {
+    return `flushing ${dir} failed: ${errorText(err)}`;
   }
 }
 

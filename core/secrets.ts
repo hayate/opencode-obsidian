@@ -159,26 +159,31 @@ export function redactUrlCredentials(text: string): string {
 }
 
 // git's empty tree: attributes are read from it, i.e. from nowhere in the tree.
-const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-// The staged diff exactly as the scan must see it, whatever the user's config or
-// the synced tree says. --attr-source=<empty tree>: a .gitattributes "*.md -diff"
-// (it syncs like any file) would print "Binary files differ" for every note; a real
-// binary (NUL bytes) is still detected as one. --no-textconv: a textconv driver rewrites
+// A diff exactly as the scan must see it, whatever the user's config or the synced
+// tree says. --attr-source=<empty tree>: a .gitattributes "*.md -diff" (it syncs
+// like any file) would print "Binary files differ" for every note; a real binary
+// (NUL bytes) is still detected as one. --no-textconv: a textconv driver rewrites
 // the + lines. --src-prefix/--dst-prefix: diff.mnemonicPrefix / noprefix /
 // dstPrefix change the +++ header, and scanDiff strips only git's own "b/"; a path
 // it cannot parse means the later unstage matches nothing and the secret stays staged.
-export async function scanStaged(cwd: string): Promise<Map<string, SecretHit[]>> {
+// --find-renames: git's default rename detection, pinned, so no diff.renames (the
+// vault's or the user's) changes what is scanned. "copies" would print a new copy of
+// a note as "copy from" with no added line, its secret unscanned (verified, git
+// 2.50.1); "false" would scan a pure rename as a whole new file.
+async function scanned(cwd: string, what: string[]): Promise<Map<string, SecretHit[]>> {
   const diff = await gitOk(
     [
       `--attr-source=${EMPTY_TREE}`,
       "-c",
       "core.quotePath=false",
       "diff",
-      "--cached",
+      ...what,
       "--no-color",
       "--no-ext-diff",
       "--no-textconv",
+      "--find-renames",
       "--src-prefix=a/",
       "--dst-prefix=b/",
       "-U0",
@@ -186,4 +191,14 @@ export async function scanStaged(cwd: string): Promise<Map<string, SecretHit[]>>
     { cwd },
   );
   return scanDiff(diff);
+}
+
+// The staged snapshot (spec 5.4 step 2).
+export async function scanStaged(cwd: string): Promise<Map<string, SecretHit[]>> {
+  return scanned(cwd, ["--cached"]);
+}
+
+// What the commits from..to add (spec 5.4 step 3, the outbound diff in the state clone).
+export async function scanRange(cwd: string, from: string, to: string): Promise<Map<string, SecretHit[]>> {
+  return scanned(cwd, [from, to]);
 }

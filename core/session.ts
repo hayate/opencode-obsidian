@@ -12,8 +12,9 @@ import { buildRollups, catchUp, listEntries, type JournalContext, type JournalEn
 import { legacyReappeared, schemaVersion, SCHEMA_VERSION } from "./migrate.ts";
 import { normalizeOrigin, recordOrigin, resolveProject, type ProjectResolution } from "./project.ts";
 import { acquireLock } from "./lock.ts";
-import { branchKey, computeHeads, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
-import { runCycle, type CycleResult } from "./sync/cycle.ts";
+import { branchKey, computeHeads, errorText, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
+import { ESCALATE_AT, runCycle, STILL_RUNNING, TIMED_OUT, type CycleResult } from "./sync/cycle.ts";
+import type { Conflict } from "./sync/resolve.ts";
 import { remoteVisibility, type Visibility } from "./sync/privacy.ts";
 import { prepareProjects, syncConfig, type SyncConfig, type SyncState } from "./sync/state.ts";
 import { dayStamp } from "./time.ts";
@@ -109,19 +110,134 @@ async function resolveSafely(vault: Vault, sessionDir: string): Promise<ProjectR
   }
 }
 
+// One plain sentence per conflict: where each version is, and what to do.
+function conflictLine(c: Conflict): string {
+  const path = quoted(c.path);
+  const copy = c.copy === null ? "" : quoted(c.copy);
+  switch (c.kind) {
+    case "both-changed":
+      return `${path} changed on two machines: yours stays; the other version is saved as ${copy}. Merge what you need into the note, then delete the copy`;
+    case "deleted-here":
+      return `${path}, which you deleted, was changed on another machine: it stays deleted; that version is saved as ${copy}`;
+    case "deleted-there":
+      return `${path} was deleted on another machine; your version is kept`;
+    case "two-names":
+      return `a note is now both ${path} and ${quoted(c.other ?? "")}: this machine and another renamed it differently; both names are kept`;
+    case "file-folder":
+      return `${path} is a file on one machine and a folder on another: yours stays; the other is saved as ${copy}`;
+    case "type-differs":
+      return `${path} is a different kind of file on another machine (a symlink, or an executable): yours stays; the other is saved as ${copy}`;
+  }
+}
+
+// A reason carries git's own words and error messages, which can hold a raw line
+// break or other control character (a vault path in a failed git command's
+// arguments): each run of them becomes one space here, the one place every cycle
+// line passes, so no line can add lines of its own.
+//
+// The second half of the class is not about lines. Every name the plugin puts in a status
+// line is escaped by quoted() before it gets here; what is still raw is git's own stderr,
+// and \p{Cf} is what keeps a bidi override or a zero-width character in it from making a
+// line read as something other than what it says once it is in the payload. Both halves
+// are needed, and neither replaces the other.
+const oneLine = (text: string): string => text.replace(/[\p{Cc}\p{Cf}\u2028\u2029]+/gu, " ");
+
+// A limit as the user reads it: in whole minutes or seconds where it is one (every
+// limit the live update gets outside the tests is), else in milliseconds.
+function duration(ms: number): string {
+  if (ms % 60_000 === 0) return `${ms / 60_000} min`;
+  if (ms % 1000 === 0) return `${ms / 1000} s`;
+  return `${ms} ms`;
+}
+
+// How long something has been running, as the user reads it: seconds, then minutes, then
+// hours and days, each rounded (unlike a limit, which is exact by construction). A hang
+// nobody has seen can outlast a day, and "1440 min" is not something anyone reads.
+function age(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"}`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+// Spec 5.4 step 5: a live update, or the repair of one, killed on its limit gets twice
+// the time next, up to the longest limit; one killed even with that escalates to a
+// notify (the adapter notifies on errors), and sync keeps retrying with it. Neither line
+// says the next sync finishes the update, only that it tries: at the ceiling six timeouts
+// in a row are the normal case, and an update hung past that limit will often hang its
+// repair on the same filter. An update another session left running is waited for, at warn
+// level, until it has run longer than that longest limit, when it is hung and says so; a
+// record whose boot stamp is not this boot's is waited for at notify level instead, since
+// the process holding that id may be something else entirely.
+// No line says when the retry comes: a cycle runs when an OpenCode session starts.
+// Anything runCycle appended to the reason (a failed lock release) goes last, after this
+// line's own words, so both read cleanly.
+function unsynced(r: CycleResult): StatusItem {
+  const said = r.reason ?? "push did not happen";
+  const rest = (lead: string): string => (said.startsWith(lead) ? said.slice(lead.length) : `; ${said}`);
+  if (r.waiting !== null) {
+    const { group, runningMs, hung, thisBoot, record, safeToDelete } = r.waiting;
+    const also = rest(STILL_RUNNING);
+    // A stamp that is not this boot's: the wait still happens (liveness decides), but the
+    // process holding that id may be anything, so this is a notify and it says how to look
+    // at that process and what ending it does. It offers deleting the record only where
+    // the cycle established that the record protects nothing: following that advice while
+    // the vault is half updated would leave the next snapshot sending what the interrupted
+    // update left as the user's own change, which is the one thing this must never cause.
+    if (!thisBoot) {
+      const out = safeToDelete
+        ? `Nothing of that update has reached the vault, so deleting ${quoted(record)} also lets sync carry on.`
+        : `Do not delete ${quoted(record)}: it is what lets the next sync finish an update that stopped part way, and without it the changes that update left would be sent as yours.`;
+      return {
+        level: "error",
+        text: `unsynced: ${STILL_RUNNING} (process group ${group}, ${age(runningMs)} so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. \`ps -g ${group}\` shows what it is; if it is not this vault's update, ending it lets sync carry on by itself. ${out}${also}`,
+      };
+    }
+    if (!hung) {
+      return { level: "warn", text: `unsynced: ${STILL_RUNNING} (process group ${group}, ${age(runningMs)} so far); sync waits for it. If it is hung, end that process${also}` };
+    }
+    return {
+      level: "error",
+      text: `unsynced: an earlier vault update has been running for ${age(runningMs)} (process group ${group}), longer than the longest limit a live update gets: it is hung. End that process, and the next sync tries the update again${also}`,
+    };
+  }
+  if (r.timedOut === null) return { level: "warn", text: `unsynced: ${said}` };
+  const also = rest(TIMED_OUT);
+  const limit = duration(r.timedOut.nextLimitMs);
+  if (!r.timedOut.ceiling) {
+    return { level: "warn", text: `unsynced: ${TIMED_OUT}; the next sync tries again, with its limit doubled to ${limit}${also}` };
+  }
+  // At the ceiling the repair's checkout is what usually times out, and it knows the note
+  // whose filters it was running; `reset --keep` names none, and none is guessed.
+  const note = r.timedOut.note === null ? "" : ` while it was rewriting ${quoted(r.timedOut.note)}`;
+  return {
+    level: "error",
+    text: `unsynced: ${TIMED_OUT}${note}, even with its longest limit (${limit}). The likely cause is a hung disk, or a smudge filter that never finishes (such as LFS or git-crypt); sync keeps retrying with that limit${also}`,
+  };
+}
+
 // File names come from the vault, and status lines sit outside the payload's data
 // block: every one is quoted.
 export function statusFromCycle(r: CycleResult): StatusItem[] {
   const out: StatusItem[] = [];
   const files = (list: string[]): string => list.map((f) => quoted(f)).join(", ");
-  if (r.outcome === "paused") out.push({ level: "error", text: r.reason ?? "sync paused" });
-  if (r.outcome === "unsynced") out.push({ level: "warn", text: `unsynced: ${r.reason ?? "push did not happen"}` });
+  if (r.outcome === "stopped") out.push({ level: "error", text: `sync stopped: ${r.reason ?? ""}` });
+  if (r.outcome === "unsynced") out.push(unsynced(r));
   if (r.outcome === "aborted") out.push({ level: "error", text: `sync aborted: ${r.reason ?? ""}` });
   if (r.outcome === "busy") out.push({ level: "info", text: "another session is syncing; this one will sync when idle" });
   // runCycle records a problem that did not stop the sync (a failed lock release) here.
   if (r.outcome === "synced" && r.reason) out.push({ level: "warn", text: r.reason });
   for (const h of r.heldBack) out.push({ level: "warn", text: `held back by the secret scan (${h.rules.join(", ")}): ${quoted(h.file)}` });
   for (const e of r.embedded) out.push({ level: "warn", text: `not synced: ${quoted(e)} is a git repository inside Projects/ (move it out, or remove its .git)` });
+  // Spec 5.4 step 3: a conflict never pauses sync; each one gets a line saying where
+  // both versions are (at most 10 lines, then a count).
+  for (const c of r.conflicts.slice(0, 10)) out.push({ level: "warn", text: conflictLine(c) });
+  if (r.conflicts.length > 10) out.push({ level: "warn", text: `and ${r.conflicts.length - 10} more notes changed on two machines; no version was lost, and any copy made sits beside its note` });
+  for (const n of r.notices) out.push({ level: "info", text: n });
   if (r.caseCollisions.length) {
     out.push({
       level: "warn",
@@ -129,13 +245,17 @@ export function statusFromCycle(r: CycleResult): StatusItem[] {
     });
   }
   if (r.blockedBy.length) {
-    // Spec 5.4 step 5: after 3 blocked cycles in a row the status escalates (the adapter notifies on errors).
+    // Spec 5.4 step 5: after ESCALATE_AT blocked cycles in a row the status escalates (the
+    // adapter notifies on errors). A streak the cycle could not read escalates too, and
+    // says so: "(3 cycles in a row)" would be a count nobody has.
+    const streak = r.blockedCycles;
+    const how = streak === null ? " (and how many cycles in a row that is could not be read)" : streak > 1 ? ` (${streak} cycles in a row)` : "";
     out.push({
-      level: r.blockedCycles >= 3 ? "error" : "warn",
-      text: `live update blocked by local edits to: ${files(r.blockedBy)}${r.blockedCycles > 1 ? ` (${r.blockedCycles} cycles in a row)` : ""}`,
+      level: streak === null || streak >= ESCALATE_AT ? "error" : "warn",
+      text: `live update blocked by local edits to: ${files(r.blockedBy)}${how}`,
     });
   }
-  return out;
+  return out.map((item) => ({ ...item, text: oneLine(item.text) }));
 }
 
 // No project and no memory: the bootstrap and the status lines only.
@@ -259,15 +379,27 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
       out.push({ level: "warn", text: "another session is still preparing Projects/; run remember_sync shortly" });
       return { items: out, project: early };
     }
-    let state: SyncState;
-    try {
-      state = await prepareProjects(vault, cfg, shared.timezone);
-    } finally {
-      await prep.release();
+    // The lock is released whatever preparation did, and a failing release never replaces
+    // the reason the session needed: it is appended to what prepareProjects threw, or
+    // reported beside what it returned. runCycle does the same with the sync lock.
+    type Prepared = { kind: "ok"; state: SyncState } | { kind: "failed"; err: unknown };
+    const prepared: Prepared = await prepareProjects(vault, cfg, shared.timezone).then(
+      (ready): Prepared => ({ kind: "ok", state: ready }),
+      (err: unknown): Prepared => ({ kind: "failed", err }),
+    );
+    const released = await prep.release().then(
+      () => null,
+      (err: unknown) => `releasing the prepare lock failed: ${errorText(err)}`,
+    );
+    if (prepared.kind === "failed") {
+      if (released !== null && prepared.err instanceof Error) prepared.err.message = `${prepared.err.message}; ${released}`;
+      throw prepared.err;
     }
+    if (released !== null) out.push({ level: "warn", text: released });
+    const state = prepared.state;
     out.push(...statusFromSync(state));
     if (state.kind === "ready" && cfg.remote) {
-      out.push(...statusFromCycle(await runCycle({ projectsDir: vault.projectsDir, remote: cfg.remote, branch: state.branch, stateDir, machine })));
+      out.push(...statusFromCycle(await runCycle({ projectsDir: vault.projectsDir, remote: cfg.remote, branch: state.branch, stateDir, machine, timezone: shared.timezone })));
     }
     // The top-level read above ran before Projects/ existed on a fresh machine,
     // so it could only ever see this machine's own zone. Now that Projects/ is
@@ -306,7 +438,9 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
       const caught = await catchUp(journal, others);
       for (const f of caught.failed) out.push({ level: "warn", text: `journal catch-up failed for session ${f.session}: ${f.error}` });
     } catch (err) {
-      out.push({ level: "warn", text: `journal catch-up: ${(err as Error).message}` });
+      // errorText: catchUp calls the adapter's readTranscript, which is the host's code
+      // and can reject with anything; `.message` on a non-Error renders "catch-up: undefined".
+      out.push({ level: "warn", text: `journal catch-up: ${errorText(err)}` });
     }
     try {
       await buildRollups({
@@ -322,7 +456,8 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
           }),
       });
     } catch (err) {
-      out.push({ level: "warn", text: `journal rollups: ${(err as Error).message}` });
+      // errorText: buildRollups calls the adapter's callModel, the same way.
+      out.push({ level: "warn", text: `journal rollups: ${errorText(err)}` });
     }
     return { items: out, project };
   })();
@@ -354,9 +489,9 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
             ? s.result.status
             : s.work.then(
                 (later) => [...s.status, ...afterSync(NOT_SHOWN, later)],
-                (err: unknown) => [...s.status, { level: "error" as const, text: `sync failed: ${(err as Error).message}` }],
+                (err: unknown) => [...s.status, { level: "error" as const, text: `sync failed: ${errorText(err)}` }],
               ),
-        (err: unknown) => [{ level: "error" as const, text: `memory and sync disabled: unexpected error: ${(err as Error).message}` }],
+        (err: unknown) => [{ level: "error" as const, text: `memory and sync disabled: unexpected error: ${errorText(err)}` }],
       );
       const line: StatusItem = {
         level: "error",
@@ -374,13 +509,13 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
     const project = started.shared.resolved;
     const status = started.status;
     if (first.kind === "done") status.push(...first.value.items);
-    if (first.kind === "failed") status.push({ level: "error", text: `sync failed: ${(first.err as Error).message}` });
+    if (first.kind === "failed") status.push({ level: "error", text: `sync failed: ${errorText(first.err)}` });
     if (first.kind === "timeout") status.push({ level: "warn", text: "sync still running - memory may be stale" });
     const background =
       first.kind === "timeout"
         ? work.then(
             (later) => afterSync(project, later),
-            (err: unknown) => [{ level: "error" as const, text: `sync failed: ${(err as Error).message}` }],
+            (err: unknown) => [{ level: "error" as const, text: `sync failed: ${errorText(err)}` }],
           )
         : Promise.resolve([]);
     if (project.kind === "disabled") return disabled(opts.bootstrap, project.reason, status, background);
@@ -445,7 +580,7 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
     });
     return { payload, status, context: ctx, background };
   } catch (err) {
-    return disabled(opts.bootstrap, `unexpected error: ${(err as Error).message}`);
+    return disabled(opts.bootstrap, `unexpected error: ${errorText(err)}`);
   } finally {
     clearTimeout(timer);
   }

@@ -1,14 +1,19 @@
 // Spec 5.3-5.4: one sync cycle. The live repo (Projects/) only ever gets a
-// snapshot commit (changes no file) and a `reset --keep` (all-or-nothing). All
-// fetch/rebase/push happens in a private state clone nobody else touches, so a
-// conflict or a half-applied rebase is never visible in the vault.
-import { mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
+// snapshot commit (changes no file) and a `reset --keep` (all-or-nothing). Fetch,
+// merge and push happen in a private bare state clone: trees are merged in git's
+// object store, so no conflict marker and no case folding ever reach a worktree,
+// and a conflict never pauses sync (both versions are kept, resolve.ts).
+import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { git, gitOk, literal, NETWORK_TIMEOUT_MS } from "../git.ts";
+import { git, GitError, gitOk, literal, LOCAL_TIMEOUT_MS, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock, type LockHandle } from "../lock.ts";
-import { redactUrlCredentials, scanStaged } from "../secrets.ts";
-import { quoted, writeAtomic } from "../store.ts";
-import { identityProblem } from "./state.ts";
+import { EMPTY_TREE, redactUrlCredentials, scanRange, scanStaged, scanText } from "../secrets.ts";
+import { errorText, quoted, writeAtomic } from "../store.ts";
+import { ensureStateClone } from "./clone.ts";
+import { conflictStamp } from "./copies.ts";
+import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, RepairTimedOut, runningUpdate, type Finished } from "./recovery.ts";
+import { mergeAndResolve, type Conflict } from "./resolve.ts";
+import { identityProblem, ignoresCase } from "./state.ts";
 
 export interface CycleInput {
   projectsDir: string;
@@ -16,12 +21,20 @@ export interface CycleInput {
   branch: string;
   stateDir: string;
   machine: string;
+  // The vault timezone, for the conflict time in copy names.
+  timezone: string;
   quietMs?: number;
   lockWaitMs?: number;
+  // The live update's base limit, the first rung of its ladder (git.ts LOCAL_TIMEOUT_MS
+  // when unset; the tests' small one otherwise).
+  liveUpdateTimeoutMs?: number;
+  // remember_sync's "adopt the rewritten remote" (spec 5.4 step 3).
+  adoptRewrite?: boolean;
 }
 
 export interface CycleResult {
-  outcome: "synced" | "busy" | "aborted" | "paused" | "unsynced";
+  // stopped: sync cannot go on until the user acts (the reason says how).
+  outcome: "synced" | "busy" | "aborted" | "stopped" | "unsynced";
   reason: string | null;
   committed: string | null;
   heldBack: Array<{ file: string; rules: string[] }>;
@@ -29,13 +42,32 @@ export interface CycleResult {
   pushed: boolean;
   liveUpdated: boolean;
   blockedBy: string[];
-  blockedCycles: number;
-  conflicts: string[];
+  // How many cycles in a row ended blocked, this one included, or null when the count on
+  // disk could not be read at all. Null escalates as the threshold does, and the status
+  // says that rather than stating a number it does not have.
+  blockedCycles: number | null;
+  conflicts: Conflict[];
   embedded: string[];
   caseCollisions: string[];
+  // Things the user should know that did not stop the cycle.
+  notices: string[];
+  // Spec 5.4 step 5: the live update, or the repair of one, killed on its limit (the
+  // outcome is unsynced): the limit the next attempt gets, whether this one already had
+  // the longest, which escalates the status to a notify, and the note it was rewriting
+  // where one is known (the repair's checkout knows it; `reset --keep` names none).
+  // Null otherwise.
+  timedOut: { nextLimitMs: number; ceiling: boolean; note: string | null } | null;
+  // Spec 5.4 step 5: an update another session started is still running, so this cycle
+  // did nothing (the outcome is unsynced). Its process group, how long it has been
+  // running, and whether that is longer than the longest limit a live update gets, which
+  // makes it hung rather than slow and escalates the status to a notify; plus whether the
+  // record's boot stamp is this boot's and the record's own path, which the status names
+  // as the way out when it is not. Null otherwise.
+  waiting: { group: number; runningMs: number; hung: boolean; thisBoot: boolean; record: string; safeToDelete: boolean } | null;
 }
 
-export const LAST_INTEGRATED = "refs/sro/last-integrated";
+// The remote head this machine last integrated with (spec 5.3).
+export const REMOTE_SEEN = "refs/sro/remote-seen";
 const INTEGRATED = "refs/sro/integrated";
 const NO_SIGN = ["-c", "commit.gpgsign=false"];
 const MAX_PUSH_ATTEMPTS = 3;
@@ -64,9 +96,13 @@ export async function changedSince(root: string, before: Map<string, Stamp>): Pr
 }
 
 // Raw stdout, never gitOk's trimmed form: a -z listing's last name may end in a space.
+// A killed git prints nothing, so the reason says `timed out` or the exit code rather
+// than ending at the colon, as its siblings in recovery.ts do.
 async function zList(cwd: string, args: string[]): Promise<string[]> {
   const r = await git(["-c", "core.quotePath=false", ...args, "-z"], { cwd });
-  if (r.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim()}`);
+  if (r.code !== 0 || r.timedOut) {
+    throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim() || (r.timedOut ? "timed out" : `exit ${r.code}`)}`);
+  }
   return r.stdout.split("\0").filter(Boolean);
 }
 
@@ -114,9 +150,11 @@ async function onDisk(dir: string, rel: string, listings: Map<string, string[]>)
 }
 
 // On a case-insensitive filesystem git does not see Note.md -> note.md or
-// Dir/ -> dir/; stage it. Returns the tracked files that collide by case.
-async function stageCaseRenames(dir: string): Promise<string[]> {
-  if ((await git(["config", "--bool", "core.ignorecase"], { cwd: dir })).stdout.trim() !== "true") return [];
+// Dir/ -> dir/; stage it. Returns the tracked files that collide by case. The `add`
+// runs the note's clean filter, so it takes the live update's limit like the snapshot's
+// own `add -A` (the caller classifies a timeout of either).
+async function stageCaseRenames(dir: string, timeoutMs: number): Promise<string[]> {
+  if (!(await ignoresCase(dir))) return [];
   const tracked = await zList(dir, ["ls-files"]);
   const { ambiguous, collisions } = caseAmbiguous(tracked);
   const listings = new Map<string, string[]>();
@@ -125,7 +163,7 @@ async function stageCaseRenames(dir: string): Promise<string[]> {
     const actual = await onDisk(dir, rel, listings);
     if (actual === null || actual === rel) continue;
     await gitOk(["rm", "-q", "--cached", "--", literal(rel)], { cwd: dir });
-    await gitOk(["add", "--", literal(actual)], { cwd: dir });
+    await gitOk(["add", "--", literal(actual)], { cwd: dir, timeoutMs });
   }
   return collisions;
 }
@@ -142,17 +180,91 @@ async function dropEmbeddedRepos(dir: string): Promise<string[]> {
   return links;
 }
 
-// Spec 5.4 step 5 escalates after 3 blocked live updates in a row.
-async function readBlocked(stateDir: string): Promise<number> {
-  return Number(await readFile(join(stateDir, "blocked-cycles"), "utf8").catch(() => "0")) || 0;
+// Spec 5.4 step 5 escalates after this many blocked live updates in a row (session.ts
+// says it louder at the threshold).
+export const ESCALATE_AT = 3;
+
+// The streak, 0 when there is none yet, or null when it could not be read. Only a count
+// this code wrote reads as itself: digits, nothing else, as readLadder reads its own file.
+// A file that is not there is "never blocked yet"; one that is there but cannot be read, or
+// holds anything else, is not, and reading it as 0 would silence the escalation the user
+// needs for as long as it stays that way. Null is what the cycle then reports: it escalates
+// as the threshold does, without claiming a number nobody has. The cycle writes the file
+// again either way, so an unreadable one costs at most that cycle.
+async function readBlocked(stateDir: string): Promise<number | null> {
+  let text: string;
+  try {
+    text = await readFile(join(stateDir, "blocked-cycles"), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    return null;
+  }
+  return /^[0-9]{1,9}$/.test(text) ? Number(text) : null;
 }
 
 async function writeBlocked(stateDir: string, count: number): Promise<void> {
   await writeAtomic(join(stateDir, "blocked-cycles"), String(count));
 }
 
+// Spec 5.4 step 5 (Andrea, 2026-09-22): the live update's limit adapts. An update that
+// needs longer than its limit (a large LFS smudge, a slow disk) is killed, and the next
+// cycle sets back what it wrote and runs it again from scratch: with a fixed limit it
+// would never finish. So each live update or repair killed on its limit doubles the
+// next attempt's, from the base (git.ts's local timeout) up to 64 times it: 30 s, then
+// 1, 2, 4, 8, 16 and 32 min. At the longest, sync keeps retrying with it and the status
+// escalates to a notify. Only a live update that completes sets it back to the base; a
+// refusal, a failure that is not a timeout, and a cycle that stops before step 5 leave
+// it. The ladder climbs one rung per cycle that times out, never with time: a cycle runs
+// when an OpenCode session starts (and, once the adapter wires it, when one goes idle,
+// D11), so no status promises when the retry comes.
+const LEVEL = "live-update-level";
+const MAX_LEVEL = 6;
+
+interface Ladder {
+  base: number;
+  level: number;
+}
+
+const limitOf = (ladder: Ladder): number => ladder.base * 2 ** ladder.level;
+
+// Only a level this code writes reads as itself: one digit, no sign, no spaces and no
+// line break, and no rung past MAX_LEVEL (the character class is its rungs, so the two
+// move together). A missing or unreadable file reads as the first rung, and so does
+// anything else: the next timeout writes the file again, so a garbled one costs at most
+// one short attempt, and it never reads as more than was written.
+async function readLadder(stateDir: string, base: number): Promise<Ladder> {
+  const text = await readFile(join(stateDir, LEVEL), "utf8").catch(() => "");
+  return { base, level: /^[0-6]$/.test(text) ? Number(text) : 0 };
+}
+
+async function writeLevel(stateDir: string, level: number): Promise<void> {
+  await writeAtomic(join(stateDir, LEVEL), String(level));
+}
+
+// The cycle's own words for these two; session.ts says what follows from the limit, the
+// process group and the age, and runCycle can append a problem of its own (a failed lock
+// release) to the reason.
+export const TIMED_OUT = "updating the vault timed out";
+export const STILL_RUNNING = "an earlier vault update is still running";
+
+// A live update or its repair killed on its limit: the next attempt gets the next rung.
+async function timedOut(stateDir: string, ladder: Ladder, result: CycleResult, note: string | null = null): Promise<void> {
+  const next = { ...ladder, level: Math.min(ladder.level + 1, MAX_LEVEL) };
+  await writeLevel(stateDir, next.level);
+  result.outcome = "unsynced";
+  result.reason = TIMED_OUT;
+  result.timedOut = { nextLimitMs: limitOf(next), ceiling: ladder.level === MAX_LEVEL, note };
+}
+
+// --no-refresh: `git reset` refreshes the index, and the refresh hashes the worktree
+// through the vault's clean filters (measured, git 2.50.1: this form and the pathless one
+// below both run them; --no-refresh suppresses them in both and still unstages). This
+// call is index-only by intent, so the filter has no business here at all: with it, a
+// filter slower than git.ts's fixed limit aborted every cycle that held a note back,
+// outside the ladder's reach. Not running it beats running it with a bigger limit.
+// git 2.37 and later have the flag; the plugin requires 2.47.
 async function unstage(cwd: string, file: string): Promise<void> {
-  await gitOk(["reset", "-q", "--", literal(file)], { cwd });
+  await gitOk(["reset", "-q", "--no-refresh", "--", literal(file)], { cwd });
 }
 
 async function rev(cwd: string, ref: string): Promise<string | null> {
@@ -160,12 +272,32 @@ async function rev(cwd: string, ref: string): Promise<string | null> {
   return r.code === 0 ? r.stdout.trim() : null;
 }
 
-async function isAncestor(cwd: string, a: string, b: string): Promise<boolean> {
-  return (await git(["merge-base", "--is-ancestor", a, b], { cwd })).code === 0;
-}
+type Seen = { kind: "absent" } | { kind: "seen"; commit: string } | { kind: "unreadable"; detail: string } | { kind: "unknown"; detail: string };
 
-async function exists(path: string): Promise<boolean> {
-  return (await stampOf(path)) !== null;
+// refs/sro/remote-seen, three ways (verified, git 2.50.1): show-ref --exists says
+// present (0) or absent (2), and a present ref must name a commit. show-ref --verify
+// and rev-parse read a ref file git cannot parse as absent, which would skip the
+// rewrite check and merge or push back what a rewrite dropped.
+//
+// "Unreadable" carries git's own words and claims no more than the exit code supports.
+// Its reason prescribes deleting the ref, the one command that turns the rewrite check
+// off, so it is given only for an exit that is evidence about the ref: 1, which is what
+// show-ref answers for a ref it cannot look up (measured, git 2.50.1: exit 1, "error:
+// failed to look up reference"), and a rev-parse that cannot resolve a ref show-ref found.
+// Any other exit (129, the usage error a git without --exists gives) says nothing about
+// the ref, so it is "could not tell" and the next cycle asks again.
+// timeoutMs: git.ts's local limit when unset; the tests' small one otherwise, as the live
+// update's own limit is (CycleInput.liveUpdateTimeoutMs). A ref read runs no filter, so
+// the cycle never passes one.
+export async function remoteSeen(dir: string, timeoutMs?: number): Promise<Seen> {
+  const exists = await git(["show-ref", "--exists", REMOTE_SEEN], { cwd: dir, timeoutMs });
+  if (exists.timedOut) return { kind: "unknown", detail: "timed out" };
+  if (exists.code === 2) return { kind: "absent" };
+  if (exists.code === 1) return { kind: "unreadable", detail: firstLines(exists.stderr) || "git show-ref exited 1" };
+  if (exists.code !== 0) return { kind: "unknown", detail: firstLines(exists.stderr) || `git show-ref exited ${exists.code}` };
+  const r = await git(["rev-parse", "-q", "--verify", `${REMOTE_SEEN}^{commit}`], { cwd: dir, timeoutMs });
+  if (r.timedOut) return { kind: "unknown", detail: "timed out" };
+  return r.code === 0 ? { kind: "seen", commit: r.stdout.trim() } : { kind: "unreadable", detail: firstLines(r.stderr) || `git rev-parse exited ${r.code}` };
 }
 
 function emptyResult(): CycleResult {
@@ -182,13 +314,38 @@ function emptyResult(): CycleResult {
     conflicts: [],
     embedded: [],
     caseCollisions: [],
+    notices: [],
+    timedOut: null,
+    waiting: null,
   };
 }
 
-async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: boolean; pushAllowed: boolean }> {
+async function snapshot(input: CycleInput, ladder: Ladder, result: CycleResult): Promise<{ ok: boolean; pushAllowed: boolean }> {
   const dir = input.projectsDir;
-  await gitOk(["add", "-A"], { cwd: dir });
-  result.caseCollisions = await stageCaseRenames(dir);
+  // Spec 5.4 step 5: `git add -A` runs the vault's clean filters over every note that
+  // changed, so it takes the live update's own adaptive limit rather than git.ts's fixed
+  // one, which the ladder cannot raise. A timeout here is classified like the update's
+  // own, so the next cycle stages with twice the time instead of aborting identically for
+  // ever. It names no note, as `reset --keep` names none.
+  const limit = limitOf(ladder);
+  try {
+    await gitOk(["add", "-A"], { cwd: dir, timeoutMs: limit });
+    result.caseCollisions = await stageCaseRenames(dir, limit);
+  } catch (err) {
+    // Only the two calls above that run the vault's clean filters climb the ladder, and
+    // both are an `add`. The `rm --cached` beside the second is index-only and runs no
+    // filter (B3), so a timeout of it is a failure like any other and is rethrown.
+    if (!(err instanceof GitError) || !err.result.timedOut || err.args[0] !== "add") throw err;
+    // The index is left exactly as the killed command left it: the next cycle stages
+    // from scratch anyway, and nothing is committed or pushed from a cycle that ends here.
+    await timedOut(input.stateDir, ladder, result);
+    // git.ts removed, or could not remove, the index.lock this killed `add` left (spec
+    // 5.6): `add` is in its CLEANED_AFTER_KILL set. The line timedOut() writes promises
+    // that the next sync tries again, and without this that next sync would abort on the
+    // stale lock with nothing saying why (B1, the same as the live update's own timeout).
+    if (err.result.lockNote) result.notices.push(err.result.lockNote);
+    return { ok: false, pushAllowed: false };
+  }
 
   // Deferred while its mtime is within the quiet period of now, on either side. A
   // fresh write's sub-millisecond mtime is usually just ahead of Date.now()'s whole
@@ -218,7 +375,8 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
   // pins the diff's prefixes; this should never trigger.
   const stillDirty = await scanStaged(dir);
   if (stillDirty.size) {
-    await gitOk(["reset", "-q"], { cwd: dir });
+    // --no-refresh, as at the unstage above: this rollback is index-only.
+    await gitOk(["reset", "-q", "--no-refresh"], { cwd: dir });
     result.outcome = "aborted";
     result.reason = `the secret scan could not hold back ${[...stillDirty.keys()]
       .sort()
@@ -232,7 +390,8 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
 
   const identity = await identityProblem(dir);
   if (identity) {
-    await gitOk(["reset", "-q"], { cwd: dir });
+    // --no-refresh, as at the unstage above: this rollback is index-only.
+    await gitOk(["reset", "-q", "--no-refresh"], { cwd: dir });
     result.outcome = "aborted";
     result.reason = identity;
     return { ok: false, pushAllowed: false };
@@ -249,47 +408,43 @@ async function snapshot(input: CycleInput, result: CycleResult): Promise<{ ok: b
   return { ok: true, pushAllowed: (await changedSince(dir, before)).length === 0 };
 }
 
-// Nobody else uses the clone and the sync lock is held, so any lock file in it is
-// a leftover: a git command killed on its timeout (spec 5.6).
-async function leftoverLock(gitDir: string): Promise<boolean> {
-  const names = [...(await readdir(gitDir)), ...(await readdir(join(gitDir, "refs"), { recursive: true }))];
-  return names.some((name) => name.endsWith(".lock"));
+type Ancestry = { kind: "yes" } | { kind: "no" } | { kind: "unknown"; detail: string };
+
+// merge-base --is-ancestor: 0 is yes, 1 is no, anything else (a missing object, a
+// timeout) is "could not tell", which stops the cycle instead of reading as "no". "Could
+// not tell" carries git's own first lines, or `timed out`, or the exit code: a corrupt
+// object in the clone repeats this every cycle, and without them the reason says only
+// that a comparison failed, with nothing anywhere to say why (the plugin has no log).
+async function ancestry(cwd: string, a: string, b: string): Promise<Ancestry> {
+  const r = await git(["merge-base", "--is-ancestor", a, b], { cwd });
+  if (r.timedOut) return { kind: "unknown", detail: "timed out" };
+  if (r.code === 0) return { kind: "yes" };
+  if (r.code === 1) return { kind: "no" };
+  return { kind: "unknown", detail: firstLines(r.stderr) || `git exited ${r.code}` };
 }
 
-async function ensureStateClone(input: CycleInput): Promise<string> {
-  const clone = join(input.stateDir, "sync");
-  const gitDir = join(clone, ".git");
-  // The clone is disposable: a crash mid-rebase (either backend) or a leftover
-  // lock means rebuild it.
-  if (
-    (await exists(gitDir)) &&
-    ((await exists(join(gitDir, "rebase-merge"))) || (await exists(join(gitDir, "rebase-apply"))) || (await leftoverLock(gitDir)))
-  ) {
-    await rm(clone, { recursive: true, force: true });
-  }
-  if (!(await exists(join(clone, ".git")))) {
-    await rm(clone, { recursive: true, force: true });
-    await mkdir(input.stateDir, { recursive: true });
-    await gitOk(["clone", "-q", "--no-checkout", input.projectsDir, clone], { cwd: input.stateDir });
-    await gitOk(["remote", "rename", "origin", "live"], { cwd: clone });
-    await gitOk(["remote", "add", "origin", input.remote], { cwd: clone });
-  }
-  // Re-pointed every cycle: moving the vault or changing the remote cannot strand it.
-  await gitOk(["remote", "set-url", "live", input.projectsDir], { cwd: clone });
-  await gitOk(["remote", "set-url", "origin", input.remote], { cwd: clone });
-  for (const key of ["user.name", "user.email"]) {
-    await gitOk(["config", key, await gitOk(["config", key], { cwd: input.projectsDir })], { cwd: clone });
-  }
-  return clone;
+// A status line, not a transcript: at most the first 10 items, then a count of
+// what was left out.
+const MAX_LISTED = 10;
+
+function listed(shown: string[], total: number): string {
+  return (total > shown.length ? [...shown, `and ${total - shown.length} more`] : shown).join(", ");
 }
 
-// A status line, not a transcript: at most the first 10 names, quoted and
-// capped like any other, then a count of what was left out. The full list
-// (never capped) is still reported separately in the result.
-function joinNames(names: string[], max = 10): string {
-  const shown = names.slice(0, max).map((n) => quoted(n));
-  if (names.length > max) shown.push(`and ${names.length - max} more`);
-  return shown.join(", ");
+// File names (and the check's findings, which hold them) quoted and capped like any other.
+function joinNames(names: string[]): string {
+  return listed(names.slice(0, MAX_LISTED).map((n) => quoted(n)), names.length);
+}
+
+// resolve.ts's stop as the user reads it: what stopped the merge, the notes it names
+// (quoted and capped like any other names), that nothing was pushed or lost, and the
+// one thing to do (spec 5.4 step 3). A failed check's own findings come last, quoted
+// and capped the same way: they are about the merge it refused, never the vault, and
+// they let a failure that no known shape explains be diagnosed.
+function stopReason(stop: { reason: string; paths: string[]; todo: string; findings: string[] }): string {
+  const named = stop.paths.length ? `: ${joinNames(stop.paths)}` : "";
+  const found = stop.findings.length ? ` The check's findings, in the merge it refused: ${joinNames(stop.findings)}.` : "";
+  return `${stop.reason}${named}. Nothing was pushed and nothing was lost. ${stop.todo}${found}`;
 }
 
 // A status line, not a transcript: git's first few lines that say something.
@@ -303,42 +458,196 @@ function firstLines(stderr: string, count = 3): string {
 }
 
 type Integration =
-  | { kind: "ok"; next: string; needsPush: boolean }
-  | { kind: "conflict"; files: string[] }
+  | { kind: "ok"; next: string; needsPush: boolean; conflicts: Conflict[] }
+  | { kind: "stopped"; reason: string }
   | { kind: "unsynced"; reason: string };
 
-async function integrate(clone: string, input: CycleInput, live: string, last: string | null): Promise<Integration> {
+async function changedBetween(clone: string, from: string, to: string): Promise<string[]> {
+  return zList(clone, ["diff", "--name-only", "--no-renames", from, to]);
+}
+
+// `sync(<machine>): <n> files [<projects>]` for a commit built in the state clone.
+async function mergeMessage(clone: string, machine: string, from: string, tree: string): Promise<string> {
+  const files = await changedBetween(clone, from, tree);
+  const projects = [...new Set(files.map((f) => f.split("/")[0]))].sort();
+  return `sync(${machine}): ${files.length} file${files.length === 1 ? "" : "s"} [${projects.join(", ")}]`;
+}
+
+interface OutboundHits {
+  // Flagged in a commit of the vault's own history that the push would send: in a
+  // file it adds, or in its message (file null).
+  inCommits: Array<{ file: string | null; commit: string }>;
+  // Flagged in what the push leaves on the remote (from..to as two trees).
+  inTree: string[];
+  // Flagged in the message of the commit this cycle built (`built`). It is not in the
+  // vault's history and the user cannot amend it, so it has its own stop.
+  generatedMessage: boolean;
+}
+
+// Spec 5.4 step 3: nothing unscanned leaves the machine. The push sends every commit
+// in from..to, so each one's additions against its first parent go through the
+// step-2 scan (a commit made by hand never met it, and a later commit that removes
+// a secret does not unsend it), and so does its message, sent with it; and so does
+// the tree the push leaves. Exempt: objects
+// the remote's tree already holds (a copy of a remote version is inside the trusted
+// remote already, and would otherwise block every cycle). `built` is the commit this
+// cycle made in the state clone, if `to` is one: its first parent is `from`, so its
+// own additions are the tree's, and it is in no history the user can rewrite. Only that
+// redundant diff is skipped for it: its message is built here, from the machine name and
+// the project folder names, and a credential-shaped name in either would otherwise reach
+// the remote inside a commit the user cannot amend in Projects/.
+async function outboundHits(clone: string, from: string, to: string, built: boolean): Promise<OutboundHits> {
+  let remoteObjects: Promise<Set<string | undefined>> | undefined;
+  const exempt = async (commit: string, file: string): Promise<boolean> => {
+    remoteObjects ??= zList(clone, ["ls-tree", "-r", from]).then(
+      (lines) => new Set(lines.map((line) => line.slice(0, line.indexOf("\t")).split(" ")[2])),
+    );
+    // The lookup must answer: `file` is in `commit` (the scan found it added there), so a
+    // non-zero exit is git's failure, never an absent path. Read as "not exempt" it would
+    // tell the user to rewrite history for a secret the remote already holds; read as
+    // "exempt" it would let one through. Neither: the cycle stops, saying which lookup
+    // failed, and nothing is pushed.
+    const r = await git(["rev-parse", "-q", "--verify", `${commit}:${file}`], { cwd: clone });
+    if (r.code !== 0 || r.timedOut) {
+      const detail = firstLines(r.stderr) || (r.timedOut ? "timed out" : `git exited ${r.code}`);
+      throw new Error(`the secret scan could not look up ${quoted(file)} in a commit this sync would send (${detail}): nothing was pushed`);
+    }
+    return (await remoteObjects).has(r.stdout.trim());
+  };
+  const inCommits: OutboundHits["inCommits"] = [];
+  let generatedMessage = false;
+  // Oldest first, each with its parents; a root commit adds all it holds.
+  const commits = (await gitOk(["rev-list", "--reverse", "--topo-order", "--parents", `${from}..${to}`], { cwd: clone })).split("\n");
+  for (const line of commits.filter(Boolean)) {
+    const [commit = "", parent = EMPTY_TREE] = line.split(" ");
+    const own = built && commit === to;
+    if (scanText(await gitOk(["log", "-1", "--format=%B", commit], { cwd: clone })).length) {
+      if (own) generatedMessage = true;
+      else inCommits.push({ file: null, commit });
+    }
+    if (own) continue;
+    for (const file of [...(await scanRange(clone, parent, commit)).keys()].sort()) {
+      if (!(await exempt(commit, file))) inCommits.push({ file, commit });
+    }
+  }
+  const inTree: string[] = [];
+  for (const file of (await scanRange(clone, from, to)).keys()) if (!(await exempt(to, file))) inTree.push(file);
+  return { inCommits, inTree: inTree.sort(), generatedMessage };
+}
+
+async function outbound(clone: string, input: CycleInput, from: string, to: string, built: boolean, conflicts: Conflict[]): Promise<Integration> {
+  const { inCommits, inTree, generatedMessage } = await outboundHits(clone, from, to, built);
+  // First: this one recurs every cycle whatever the user does to their own commits, and
+  // rewriting a commit is not what fixes it.
+  //
+  // It names what matched, never the value. The message is built from the machine name and
+  // the project folder names, so each is scanned on its own to say which of the two it was
+  // and by which rule; nothing that reached the scan is reproduced here. quoted() escapes
+  // and truncates, it does not redact, and this reason goes into the status, which
+  // session.ts puts in the payload: repeating the name here would be the leak this stop
+  // exists to prevent, one channel over.
+  if (generatedMessage) {
+    const rulesOf = (value: string): string[] => [...new Set(scanText(value).map((h) => h.rule))];
+    const flagged: string[] = [];
+    const machineRules = rulesOf(input.machine);
+    if (machineRules.length) flagged.push(`this machine's name (${machineRules.join(", ")})`);
+    const projects = [...new Set((await changedBetween(clone, from, to)).map((f) => f.split("/")[0] ?? ""))];
+    const folderRules = [...new Set(projects.flatMap(rulesOf))].sort();
+    if (folderRules.length) flagged.push(`the name of a folder it would send (${folderRules.join(", ")})`);
+    // Neither alone: a rule matched across the two, or across the message's own words.
+    const what = flagged.length ? flagged.join(" and ") : "the message the two of them make";
+    return {
+      kind: "stopped",
+      reason: `the secret scan flags the commit message this sync would build: nothing was pushed. That message holds only this machine's name and the names of the folders it would send, never anything from inside a note, so rewriting a commit is not the fix. What it flags: ${what}. Rename that, then sync again; the name itself is not repeated here, since this line is shown and stored.`,
+    };
+  }
+  if (inCommits.length) {
+    // The short hash as git abbreviates it in the vault, where the user rewrites.
+    const shown: string[] = [];
+    for (const { file, commit } of inCommits.slice(0, MAX_LISTED)) {
+      const short = await gitOk(["rev-parse", "--short", commit], { cwd: input.projectsDir });
+      shown.push(file === null ? `the message of commit ${short}` : `${quoted(file)} (commit ${short})`);
+    }
+    return {
+      kind: "stopped",
+      reason: `the secret scan flags what this sync would send in ${listed(shown, inCommits.length)}: nothing was pushed. The secret is in commits of Projects/ that were never sent, so changing the notes is not enough: rewrite those commits (for example, drop or amend the one that added it), then sync again`,
+    };
+  }
+  if (inTree.length) {
+    return {
+      kind: "stopped",
+      reason: `the secret scan flags what this sync would send in ${joinNames(inTree)}: nothing was pushed (remove the secret, then sync again)`,
+    };
+  }
+  return { kind: "ok", next: to, needsPush: true, conflicts };
+}
+
+async function integrate(clone: string, input: CycleInput, live: string): Promise<Integration> {
   const b = input.branch;
+  // Stray temporary index files from a killed cycle (the sync lock is held).
+  for (const name of await readdir(clone)) if (name.startsWith("sro-index-")) await rm(join(clone, name), { force: true });
   await gitOk(["fetch", "-q", "live", `+refs/heads/${b}:refs/remotes/live/${b}`], { cwd: clone });
+  // remote-seen lives in the live repo, which keeps its commit reachable; a rebuilt
+  // clone has it too, since a local clone links the whole object store.
+  const seen = await remoteSeen(input.projectsDir);
+  if (seen.kind === "unknown") return { kind: "unsynced", reason: `reading ${REMOTE_SEEN} failed: ${seen.detail}` };
+  if (seen.kind === "unreadable") {
+    return {
+      kind: "stopped",
+      reason: `${REMOTE_SEEN} in Projects/ could not be read as a commit (${seen.detail}), so a rewritten remote could go unnoticed. If the remote's history was not rewritten, delete it (git update-ref -d ${REMOTE_SEEN}) and sync again.`,
+    };
+  }
   const fetched = await git(["fetch", "-q", "origin", `+refs/heads/${b}:refs/remotes/origin/${b}`], {
     cwd: clone,
     timeoutMs: NETWORK_TIMEOUT_MS,
   });
-  if (fetched.code !== 0) {
+  if (fetched.code !== 0 || fetched.timedOut) {
     const detail = firstLines(fetched.stderr) || (fetched.timedOut ? "timed out" : `git exited ${fetched.code}`);
     return { kind: "unsynced", reason: `fetch failed: ${detail}` };
   }
-  const upstream = `refs/remotes/origin/${b}`;
-  const upstreamSha = await rev(clone, upstream);
-  if (upstreamSha === null) return { kind: "unsynced", reason: `remote has no branch ${b}` };
-  if (await isAncestor(clone, live, upstream)) return { kind: "ok", next: upstreamSha, needsPush: false };
+  const upstream = await rev(clone, `refs/remotes/origin/${b}`);
+  if (upstream === null) return { kind: "unsynced", reason: `remote has no branch ${b}` };
+  const when = conflictStamp(new Date(), input.timezone);
 
-  // Replay only what the remote has not seen: commits after last-integrated.
-  const base = last && (await isAncestor(clone, last, live)) ? last : await gitOk(["merge-base", live, upstream], { cwd: clone });
-  await gitOk(["checkout", "-q", "-f", "--detach", live], { cwd: clone });
-  await gitOk(["clean", "-q", "-f", "-d", "-x"], { cwd: clone });
-  const rebased = await git([...NO_SIGN, "rebase", "-q", "--onto", upstream, base], { cwd: clone });
-  if (rebased.code !== 0) {
-    const unmerged = await zList(clone, ["diff", "--name-only", "--diff-filter=U"]);
-    await git(["rebase", "--abort"], { cwd: clone });
-    if (unmerged.length) return { kind: "conflict", files: unmerged };
-    // No conflict (a hook refused, a timeout, a broken clone): nothing for the user
-    // to resolve, so it is not a pause. The next cycle tries again.
-    const detail = firstLines(rebased.stderr) || (rebased.timedOut ? "timed out" : `git exited ${rebased.code}`);
-    return { kind: "unsynced", reason: `rebase failed: ${detail}` };
+  if (seen.kind === "seen") {
+    const kept = await ancestry(clone, seen.commit, upstream);
+    if (kept.kind === "unknown") return { kind: "unsynced", reason: `could not tell whether the remote's history was rewritten: ${kept.detail}` };
+    if (kept.kind === "no") {
+      if (!input.adoptRewrite) {
+        return {
+          kind: "stopped",
+          reason:
+            "the remote's history was rewritten (a force-push): nothing the rewrite dropped is deleted here or pushed back. If the rewrite was intended, run remember_sync to adopt the rewritten remote.",
+        };
+      }
+      // Adopt: carry over only this machine's unsent changes, with the single parent
+      // upstream, so none of the dropped history is published again.
+      const base = await gitOk(["merge-base", seen.commit, live], { cwd: clone });
+      const merged = await mergeAndResolve(clone, upstream, live, { mergeBase: base, when });
+      if (merged.kind === "stop") return { kind: "stopped", reason: stopReason(merged) };
+      // Nothing unsent: the vault moves to the remote as it is, and no empty commit is pushed.
+      if (merged.tree === (await gitOk(["rev-parse", `${upstream}^{tree}`], { cwd: clone }))) {
+        return { kind: "ok", next: upstream, needsPush: false, conflicts: merged.conflicts };
+      }
+      const message = await mergeMessage(clone, input.machine, upstream, merged.tree);
+      const next = await gitOk([...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-m", message], { cwd: clone });
+      return outbound(clone, input, upstream, next, true, merged.conflicts);
+    }
   }
-  const next = (await rev(clone, "HEAD")) ?? upstreamSha;
-  return { kind: "ok", next, needsPush: next !== upstreamSha };
+
+  const sent = await ancestry(clone, live, upstream);
+  if (sent.kind === "unknown") return { kind: "unsynced", reason: `could not compare the live snapshot with the remote: ${sent.detail}` };
+  if (sent.kind === "yes") return { kind: "ok", next: upstream, needsPush: false, conflicts: [] };
+  const ahead = await ancestry(clone, upstream, live);
+  if (ahead.kind === "unknown") return { kind: "unsynced", reason: `could not compare the remote with the live snapshot: ${ahead.detail}` };
+  if (ahead.kind === "yes") return outbound(clone, input, upstream, live, false, []);
+
+  const merged = await mergeAndResolve(clone, upstream, live, { when });
+  if (merged.kind === "stop") return { kind: "stopped", reason: stopReason(merged) };
+  // Two parents, remote first: ancestry records that live is on the remote.
+  const message = await mergeMessage(clone, input.machine, upstream, merged.tree);
+  const next = await gitOk([...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-p", live, "-m", message], { cwd: clone });
+  return outbound(clone, input, upstream, next, true, merged.conflicts);
 }
 
 type Push = { kind: "pushed" } | { kind: "raced"; detail: string } | { kind: "failed"; reason: string };
@@ -358,6 +667,94 @@ async function push(clone: string, input: CycleInput, sha: string): Promise<Push
   return { kind: "failed", reason: `push failed: ${detail}` };
 }
 
+// git's refusals of `reset --keep`, each printed before it writes anything: a local
+// edit, an edit or a deletion staged by hand, an untracked file where a note goes or
+// that a deletion would remove, a folder of untracked files where a note goes. Each
+// verified (git 2.50.1) to leave HEAD, the index and the worktree exactly as they
+// were. Only these: a refusal clears the intent record, so a message counted here
+// that git prints after writing would skip the repair of a half-updated vault. Each
+// is matched as git's whole line, so a note named with a refusal's words, in another
+// error's line (a smudge filter that fails names its note), is never read as one;
+// the quoted path may hold a line break, which git prints raw.
+const REFUSED =
+  /^error: (?:Entry '([\s\S]+?)' (?:not uptodate|would be overwritten by merge)\. Cannot merge\.|Untracked working tree file '([\s\S]+?)' would be (?:overwritten|removed) by merge\.|Updating '([\s\S]+?)' would lose untracked files in it)$/gm;
+
+// Spec 5.4 step 5: the remote head now known, into the live repo's objects before
+// anything refers to it; then remote-seen; then the all-or-nothing reset.
+async function updateLive(clone: string, input: CycleInput, live: string, next: string, streak: number | null, ladder: Ladder, result: CycleResult): Promise<void> {
+  const dir = input.projectsDir;
+  await gitOk(["update-ref", INTEGRATED, next], { cwd: clone });
+  await gitOk(["fetch", "-q", clone, `+${INTEGRATED}:${INTEGRATED}`], { cwd: dir });
+  await gitOk(["update-ref", REMOTE_SEEN, next], { cwd: dir });
+  if (next === live) {
+    result.liveUpdated = true;
+    return;
+  }
+  // Only this first write is reported: it is the one whose absence loses work already on
+  // disk. The writes after it replace a record that is already there, so a rename of
+  // theirs that a power loss drops leaves this one, which errs toward keeping.
+  const unflushed = await recordIntent(input.stateDir, live, next);
+  if (unflushed !== null) {
+    result.notices.push(
+      `the record that lets the next sync finish this vault update is on disk but could not be flushed to it (${unflushed}); a power loss now could lose it, and with it the knowledge that the update was unfinished`,
+    );
+  }
+  const reset = await git(["reset", "-q", "--keep", next], {
+    cwd: dir,
+    timeoutMs: limitOf(ladder),
+    // The record names this update's process group from the moment git exists, so a
+    // cycle that starts after this session dies waits for it instead of repairing over
+    // it (spec 5.4 step 5). Only the instant between the spawn and this write is not
+    // covered.
+    onSpawn: async (group) => {
+      await recordIntent(input.stateDir, live, next, group);
+    },
+  });
+  if (reset.code === 0 && !reset.timedOut) {
+    await clearInterrupted(input.stateDir);
+    result.liveUpdated = true;
+    await gitOk(["update-ref", `refs/remotes/origin/${input.branch}`, next], { cwd: dir });
+    // The limit was enough: the next update starts again from the base.
+    await writeLevel(input.stateDir, 0);
+    return;
+  }
+  if (reset.timedOut) {
+    // Not the user's block, and never counted toward the escalation: the next
+    // cycle finishes it before its snapshot (recovery.ts), with the next rung.
+    await recordInterrupted(input.stateDir, dir, live, next);
+    await timedOut(input.stateDir, ladder, result);
+    // git.ts removed, or could not remove, the index.lock this killed reset left (spec
+    // 5.6). Without it the status promises a retry that would abort at `git add -A`.
+    if (reset.lockNote) result.notices.push(reset.lockNote);
+    return;
+  }
+  // git's check before it writes anything refuses the whole update and nothing changed.
+  const blocked = [...reset.stderr.matchAll(REFUSED)].map((m) => m[1] ?? m[2] ?? m[3] ?? "");
+  if (!blocked.length) {
+    // Any other error (a smudge filter that fails) can stop it partway: the intent
+    // stays, and the next cycle finishes it before its snapshot. git has exited, so the
+    // record drops its process group and nothing waits for it.
+    await recordIntent(input.stateDir, live, next);
+    result.outcome = "unsynced";
+    result.reason = `updating the vault failed (${firstLines(reset.stderr) || `git exited ${reset.code}`}); the next sync finishes it`;
+    return;
+  }
+  await clearInterrupted(input.stateDir);
+  result.blockedBy = blocked;
+  // Null stays null in the result, so the status says the count is unknown rather than
+  // inventing one; the file is written with what this cycle does know, so the next one has
+  // a count again.
+  result.blockedCycles = streak === null ? null : streak + 1;
+  await writeBlocked(input.stateDir, (streak ?? 0) + 1);
+}
+
+function describeFinished(done: Finished): string {
+  const parts = ["finished an interrupted vault update"];
+  if (done.restored.length) parts.push(`${done.restored.length} file${done.restored.length === 1 ? "" : "s"} set back to update again`);
+  if (done.kept.length) parts.push(`your edits since kept in ${joinNames(done.kept)}`);
+  return parts.join("; ");
+}
+
 // Never throws: every failure, the lock's own included, is an outcome.
 export async function runCycle(input: CycleInput): Promise<CycleResult> {
   const result = emptyResult();
@@ -374,11 +771,39 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       result.reason = "lost the sync lock";
       return false;
     };
+    // One limit for the whole cycle: the repair rewrites the same files through the
+    // same filters as the live update.
+    const ladder = await readLadder(input.stateDir, input.liveUpdateTimeoutMs ?? LOCAL_TIMEOUT_MS);
+    // Spec 5.4 step 5: an update whose session died keeps running, in the process group
+    // git.ts recorded with the intent (the kill timer died with that session). Repairing
+    // or snapshotting now would set its notes back under it and push the old versions as
+    // this machine's change, so this cycle does nothing at all: it repairs nothing,
+    // snapshots nothing, pushes nothing, and, like a cycle that found the lock busy, it
+    // leaves the blocked-cycle streak alone.
+    const running = await runningUpdate(input.stateDir, dir);
+    if (running !== null) {
+      result.outcome = "unsynced";
+      result.reason = STILL_RUNNING;
+      // Past the longest limit a live update gets, it is not slow but hung, and the status
+      // escalates to the notify the ladder uses at its own ceiling.
+      result.waiting = { ...running, hung: running.runningMs > limitOf({ ...ladder, level: MAX_LEVEL }) };
+      return result;
+    }
     // Every cycle that runs breaks the streak, whatever its outcome, unless it ends
     // blocked again; a busy cycle never ran and leaves it alone.
     const streak = await readBlocked(input.stateDir);
     await writeBlocked(input.stateDir, 0);
-    const snap = await snapshot(input, result);
+    // An interrupted update is finished before anything is snapshotted.
+    let finished: Finished | null;
+    try {
+      finished = await finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) });
+    } catch (err) {
+      if (!(err instanceof RepairTimedOut)) throw err;
+      await timedOut(input.stateDir, ladder, result, err.path);
+      return result;
+    }
+    if (finished && (finished.restored.length || finished.kept.length)) result.notices.push(describeFinished(finished));
+    const snap = await snapshot(input, ladder, result);
     if (!snap.ok || !(await stillHeld())) return result;
     if (!snap.pushAllowed) {
       result.outcome = "unsynced";
@@ -395,16 +820,15 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     }
 
     const live = (await rev(dir, "HEAD")) ?? "";
-    const last = await rev(dir, LAST_INTEGRATED);
-    const clone = await ensureStateClone(input);
+    const clone = await ensureStateClone(input.stateDir, dir, input.remote);
     let next = "";
+    let conflicts: Conflict[] = [];
     for (let attempt = 1; ; attempt++) {
       if (!(await stillHeld())) return result;
-      const integration = await integrate(clone, input, live, last);
-      if (integration.kind === "conflict") {
-        result.outcome = "paused";
-        result.conflicts = integration.files;
-        result.reason = `sync paused: your local changes conflict with the remote in ${joinNames(integration.files)}`;
+      const integration = await integrate(clone, input, live);
+      if (integration.kind === "stopped") {
+        result.outcome = "stopped";
+        result.reason = integration.reason;
         return result;
       }
       if (integration.kind === "unsynced") {
@@ -413,6 +837,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
         return result;
       }
       next = integration.next;
+      conflicts = integration.conflicts;
       if (!integration.needsPush) break;
       const pushed = await push(clone, input, next);
       if (pushed.kind === "pushed") {
@@ -430,33 +855,16 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
         return result;
       }
     }
-
-    // Spec 5.4 step 4: our snapshot is confirmed upstream now (pushed, or already
-    // there), so record it before the step-5 lock check. If step 5 never finishes
-    // (the lock lost here, the fetch/reset below failing, or the process exiting),
-    // the next cycle must not replay a snapshot that is already on the remote.
-    await gitOk(["update-ref", LAST_INTEGRATED, live], { cwd: dir });
+    // Only now: a conflict's copy exists once N is on the remote (or nothing needed
+    // pushing), and a cycle that ends before that reports none.
+    result.conflicts = conflicts;
 
     if (!(await stillHeld())) return result;
-    await gitOk(["update-ref", INTEGRATED, next], { cwd: clone });
-    await gitOk(["fetch", "-q", clone, `+${INTEGRATED}:${INTEGRATED}`], { cwd: dir });
-    const reset = await git(["reset", "-q", "--keep", next], { cwd: dir });
-    if (reset.code === 0) {
-      result.liveUpdated = true;
-      await gitOk(["update-ref", LAST_INTEGRATED, next], { cwd: dir });
-      await gitOk(["update-ref", `refs/remotes/origin/${input.branch}`, next], { cwd: dir });
-    } else {
-      const blocked = [...reset.stderr.matchAll(/Entry '(.+)' not uptodate/g)].map((m) => m[1] ?? "");
-      result.blockedBy = blocked.length ? blocked : [`(reset --keep refused: ${reset.stderr.trim().split("\n")[0]})`];
-      result.blockedCycles = streak + 1;
-      await writeBlocked(input.stateDir, result.blockedCycles);
-      // Our snapshot is on the remote now; never replay it again.
-      await gitOk(["update-ref", LAST_INTEGRATED, live], { cwd: dir });
-    }
+    await updateLive(clone, input, live, next, streak, ladder, result);
     return result;
   } catch (err) {
     result.outcome = "aborted";
-    result.reason = (err as Error).message;
+    result.reason = errorText(err);
     return result;
   } finally {
     // A throw here would replace the cycle's result: report it in the reason.
@@ -464,7 +872,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       try {
         await lock.release();
       } catch (err) {
-        const failed = `releasing the sync lock failed: ${(err as Error).message}`;
+        const failed = `releasing the sync lock failed: ${errorText(err)}`;
         result.reason = result.reason ? `${result.reason}; ${failed}` : failed;
       }
     }

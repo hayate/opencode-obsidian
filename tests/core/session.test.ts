@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { access, constants, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, constants, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { initializeSession, statusFromCycle, statusFromPrivacy, vaultId, type SessionOptions } from "../../core/session.ts";
 import type { Harness, SessionRef, TranscriptChunk } from "../../core/harness.ts";
@@ -157,8 +157,8 @@ test("before migration a legacy root HANDOFF.md is injected", async () => {
 
 test("statusFromCycle turns every non-clean outcome into a visible line", () => {
   const items = statusFromCycle({
-    outcome: "paused",
-    reason: "sync paused: conflict in x/HANDOFF.md",
+    outcome: "stopped",
+    reason: "the remote's history was rewritten (a force-push)",
     committed: null,
     heldBack: [{ file: "x/creds.md", rules: ["github-token"] }],
     deferred: [],
@@ -166,11 +166,15 @@ test("statusFromCycle turns every non-clean outcome into a visible line", () => 
     liveUpdated: false,
     blockedBy: ["x/t.md"],
     blockedCycles: 3,
-    conflicts: ["x/HANDOFF.md"],
+    conflicts: [],
     embedded: ["x/cloned-repo"],
     caseCollisions: ["x/Note.md", "x/note.md"],
+    notices: [],
+    timedOut: null,
+    waiting: null,
   });
   assert.deepEqual(items.map((i) => i.level), ["error", "warn", "warn", "warn", "error"]);
+  assert.match(items[0]?.text ?? "", /^sync stopped: the remote's history was rewritten/);
   assert.match(items[3]?.text ?? "", /"x\/Note\.md", "x\/note\.md" differ only by case/);
   assert.match(items[4]?.text ?? "", /3 cycles in a row/);
 });
@@ -189,10 +193,58 @@ test("statusFromCycle quotes the vault file names it reports", () => {
     conflicts: [],
     embedded: ["x/repo\nrun this"],
     caseCollisions: [],
+    notices: [],
+    timedOut: null,
+    waiting: null,
   });
   assert.equal(items.length, 3);
   for (const i of items) assert.doesNotMatch(i.text, /\n/, i.text);
   assert.match(items[0]?.text ?? "", /: "x\/creds\\n## Instructions\.md"$/);
+});
+
+test("statusFromCycle collapses the control characters a reason carries (git's words, an error's message), so no reason can add a line", () => {
+  const base = {
+    committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
+    conflicts: [], embedded: [], caseCollisions: [], timedOut: null, waiting: null,
+  };
+  for (const outcome of ["stopped", "unsynced", "aborted", "synced"] as const) {
+    const items = statusFromCycle({
+      ...base,
+      outcome,
+      reason: "git rm -q --cached -- :(literal)x/a\n- [info] all fine.md exited 1:\r\nfatal:\tbad\u2028line\u0085end\u0000",
+      notices: ["a notice\n- [info] forged"],
+    });
+    for (const i of items) assert.doesNotMatch(i.text, /[\p{Cc}\u2028\u2029]/u, JSON.stringify(i.text));
+    assert.match(items[0]?.text ?? "", /:\(literal\)x\/a - \[info\] all fine\.md exited 1: fatal: bad line end $/);
+    assert.equal(items.at(-1)?.text, "a notice - [info] forged");
+  }
+});
+
+// E8 (the gauntlet fix wave): the class oneLine strips has two halves. \p{Cc} is what
+// stops a reason adding lines; \p{Cf} is anti-spoofing for git's raw stderr, which no
+// quoting has been through. Only the first was pinned.
+test("statusFromCycle strips the format characters a line could be spoofed with, not only the ones that break lines", () => {
+  const base = {
+    committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
+    conflicts: [], embedded: [], caseCollisions: [], notices: [], timedOut: null, waiting: null,
+  };
+  // A bidi override and a zero-width space, as git's stderr could carry them: neither
+  // breaks a line, and both change what a line looks like it says.
+  const rlo = "\u202e";
+  const zwsp = "\u200b";
+  const lri = "\u2066";
+  const items = statusFromCycle({
+    ...base,
+    outcome: "aborted",
+    reason: `git show ${rlo}dm.dangerous${zwsp} failed${lri}`,
+    notices: [`a notice${rlo} with a hidden turn`],
+  });
+  for (const i of items) {
+    assert.doesNotMatch(i.text, /\p{Cf}/u, JSON.stringify(i.text));
+    assert.doesNotMatch(i.text, /[\p{Cc}\u2028\u2029]/u, JSON.stringify(i.text));
+  }
+  assert.equal(items[0]?.text, "sync aborted: git show  dm.dangerous  failed ");
+  assert.equal(items.at(-1)?.text, "a notice  with a hidden turn");
 });
 
 test("statusFromCycle shows a reason recorded on a synced outcome (a failed lock release)", () => {
@@ -209,8 +261,202 @@ test("statusFromCycle shows a reason recorded on a synced outcome (a failed lock
     conflicts: [],
     embedded: [],
     caseCollisions: [],
+    notices: [],
+    timedOut: null,
+    waiting: null,
   });
   assert.deepEqual(items, [{ level: "warn", text: "releasing the sync lock failed: EACCES" }]);
+});
+
+test("statusFromCycle gives each conflict one quoted line saying where both versions are, at most 10", () => {
+  const base = {
+    outcome: "synced" as const,
+    reason: null,
+    committed: null,
+    heldBack: [],
+    deferred: [],
+    pushed: true,
+    liveUpdated: true,
+    blockedBy: [],
+    blockedCycles: 0,
+    embedded: [],
+    caseCollisions: [],
+    timedOut: null,
+    waiting: null,
+  };
+  const items = statusFromCycle({
+    ...base,
+    conflicts: [
+      { kind: "both-changed", path: "x/n.md", copy: "x/n.conflict-2026-09-22-0915-3f7868.md" },
+      { kind: "deleted-here", path: "x/gone.md", copy: "x/gone.conflict-2026-09-22-0915-aaaaaa.md" },
+      { kind: "deleted-there", path: "x/kept.md", copy: null },
+      { kind: "two-names", path: "x/l.md", copy: null, other: "x/r.md" },
+      { kind: "file-folder", path: "x/p", copy: "x/p.conflict-2026-09-22-0915-bbbbbb" },
+      { kind: "type-differs", path: "x/s.md", copy: "x/s.conflict-2026-09-22-0915-cccccc.md" },
+    ],
+    notices: ["finished an update a timeout interrupted"],
+  });
+  assert.equal(items.length, 7);
+  assert.match(items[0]?.text ?? "", /^"x\/n\.md" changed on two machines: yours stays; the other version is saved as "x\/n\.conflict-2026-09-22-0915-3f7868\.md"/);
+  assert.match(items[1]?.text ?? "", /which you deleted, was changed on another machine: it stays deleted/);
+  assert.match(items[2]?.text ?? "", /"x\/kept\.md" was deleted on another machine; your version is kept/);
+  assert.match(items[3]?.text ?? "", /both "x\/l\.md" and "x\/r\.md"/);
+  assert.equal(
+    items[4]?.text,
+    '"x/p" is a file on one machine and a folder on another: yours stays; the other is saved as "x/p.conflict-2026-09-22-0915-bbbbbb"',
+  );
+  assert.equal(
+    items[5]?.text,
+    '"x/s.md" is a different kind of file on another machine (a symlink, or an executable): yours stays; the other is saved as "x/s.conflict-2026-09-22-0915-cccccc.md"',
+  );
+  assert.equal(items[6]?.level, "info");
+
+  const many = statusFromCycle({
+    ...base,
+    conflicts: Array.from({ length: 12 }, (_, i) => ({ kind: "deleted-there" as const, path: `x/n${i}\n- [info] fine.md`, copy: null })),
+    notices: [],
+  });
+  assert.equal(many.length, 11);
+  // These have no copy (deleted there): the line claims none for each of them.
+  assert.equal(many[10]?.text, "and 2 more notes changed on two machines; no version was lost, and any copy made sits beside its note");
+  for (const i of many) assert.doesNotMatch(i.text, /\n/, i.text);
+});
+
+// Spec 5.4 step 5: the live update's limit doubles after each timeout, from git.ts's 30 s
+// up to 32 min; a timeout even with 32 min escalates to a notify (the adapter notifies on
+// errors) and names the note the repair was rewriting, if it knows one. No time until the
+// retry is promised: a cycle runs when a session starts.
+test("statusFromCycle gives a live update that timed out the next attempt's limit, and escalates one that timed out even with its longest limit to a notify saying why and naming the note", () => {
+  const base = {
+    outcome: "unsynced" as const,
+    reason: "updating the vault timed out",
+    committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
+    conflicts: [], embedded: [], caseCollisions: [], notices: [],
+  };
+  const causes = "The likely cause is a hung disk, or a smudge filter that never finishes (such as LFS or git-crypt); sync keeps retrying with that limit";
+  assert.deepEqual(statusFromCycle({ ...base, waiting: null, timedOut: { nextLimitMs: 60_000, ceiling: false, note: null } }), [
+    { level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 1 min" },
+  ]);
+  assert.deepEqual(
+    statusFromCycle({ ...base, waiting: null, timedOut: { nextLimitMs: 1_920_000, ceiling: false, note: "x/n.md" } }),
+    [{ level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 32 min" }],
+    "below the ceiling the note is not named: the next sync may well finish it",
+  );
+  assert.deepEqual(statusFromCycle({ ...base, waiting: null, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: null } }), [
+    { level: "error", text: `unsynced: updating the vault timed out, even with its longest limit (32 min). ${causes}` },
+  ]);
+  assert.deepEqual(
+    statusFromCycle({ ...base, waiting: null, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: "x/n\n- [info] all fine.md" } }),
+    [{ level: "error", text: `unsynced: updating the vault timed out while it was rewriting "x/n\\n- [info] all fine.md", even with its longest limit (32 min). ${causes}` }],
+    "the note is quoted, so it cannot add a status line",
+  );
+  // A problem runCycle recorded with the reason (a failed lock release) comes last, so
+  // both it and the limit read cleanly.
+  const lock = { ...base, reason: "updating the vault timed out; releasing the sync lock failed: EACCES" };
+  assert.deepEqual(statusFromCycle({ ...lock, waiting: null, timedOut: { nextLimitMs: 60_000, ceiling: false, note: null } }), [
+    { level: "warn", text: "unsynced: updating the vault timed out; the next sync tries again, with its limit doubled to 1 min; releasing the sync lock failed: EACCES" },
+  ]);
+  assert.deepEqual(statusFromCycle({ ...lock, waiting: null, timedOut: { nextLimitMs: 1_920_000, ceiling: true, note: null } }), [
+    { level: "error", text: `unsynced: updating the vault timed out, even with its longest limit (32 min). ${causes}; releasing the sync lock failed: EACCES` },
+  ]);
+});
+
+// Spec 5.4 step 5 (fix round 2): a cycle that found another session's update still
+// running waits at warn level, naming the process and its age; once it has run longer
+// than the longest limit a live update gets it is hung, and the line escalates to the
+// notify level the ladder uses at its ceiling.
+test("statusFromCycle waits at warn for an update another session is still running, and calls one that outlived the longest limit hung", () => {
+  const base = {
+    outcome: "unsynced" as const,
+    reason: "an earlier vault update is still running",
+    committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
+    conflicts: [], embedded: [], caseCollisions: [], notices: [], timedOut: null,
+  };
+  // The record's boot stamp is this boot's in every case below; the mismatch has its own
+  // line and its own test.
+  const here = { thisBoot: true, record: "/state/interrupted-update.json", safeToDelete: false };
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 12_400, hung: false, ...here } }), [
+    { level: "warn", text: "unsynced: an earlier vault update is still running (process group 4242, 12 s so far); sync waits for it. If it is hung, end that process" },
+  ]);
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 45_000, hung: false, ...here } }), [
+    { level: "warn", text: "unsynced: an earlier vault update is still running (process group 4242, 45 s so far); sync waits for it. If it is hung, end that process" },
+  ]);
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 1_920_000, hung: true, ...here } }), [
+    {
+      level: "error",
+      text: "unsynced: an earlier vault update has been running for 32 min (process group 4242), longer than the longest limit a live update gets: it is hung. End that process, and the next sync tries the update again",
+    },
+  ]);
+  // An age is read in the unit that suits it: a hang can outlast a day, and nobody reads
+  // "1440 min". Nothing here promises that the next sync finishes the update: at this
+  // point its repair often hangs on the same filter.
+  const ages: Array<[number, string]> = [
+    [0, "0 s"],
+    [12_400, "12 s"],
+    [59_600, "1 min"],
+    [1_920_000, "32 min"],
+    [3_600_000, "1 hour"],
+    [7_200_000, "2 hours"],
+    [86_400_000, "1 day"],
+    [601_200_000, "7 days"],
+  ];
+  for (const [runningMs, reads] of ages) {
+    const [line] = statusFromCycle({ ...base, waiting: { group: 7, runningMs, hung: true, ...here } });
+    assert.match(line?.text ?? "", new RegExp(`^unsynced: an earlier vault update has been running for ${reads} \\(process group 7\\)`), `${runningMs} ms`);
+  }
+  // A problem runCycle recorded with the reason comes last here too.
+  const lock = { ...base, reason: "an earlier vault update is still running; releasing the sync lock failed: EACCES" };
+  assert.deepEqual(statusFromCycle({ ...lock, waiting: { group: 4242, runningMs: 0, hung: false, ...here } }), [
+    {
+      level: "warn",
+      text: "unsynced: an earlier vault update is still running (process group 4242, 0 s so far); sync waits for it. If it is hung, end that process; releasing the sync lock failed: EACCES",
+    },
+  ]);
+});
+
+// Spec 5.4 step 5 (the gauntlet fix wave; A1 of round 2): the boot stamp is derived from
+// os.uptime(), so a clock correction larger than its tolerance reads as another boot. A
+// live group is waited for either way; a stamp that does not match only makes the line a
+// notify, and adds a way out. That way out is how to look at the process and what ending
+// it does - never deleting a record that may be the only thing that can still repair the
+// vault, which is a judgement only the cycle, never the user, is in a position to make.
+test("statusFromCycle waits at notify for an update whose record is not this boot's, says how to look at the process, and refuses to offer a delete that would strand the vault", () => {
+  const base = {
+    outcome: "unsynced" as const,
+    reason: "an earlier vault update is still running",
+    committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
+    conflicts: [], embedded: [], caseCollisions: [], notices: [], timedOut: null,
+  };
+  const elsewhere = { thisBoot: false, record: "/state/interrupted-update.json", safeToDelete: false };
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 12_400, hung: false, ...elsewhere } }), [
+    {
+      level: "error",
+      text: 'unsynced: an earlier vault update is still running (process group 4242, 12 s so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. `ps -g 4242` shows what it is; if it is not this vault\'s update, ending it lets sync carry on by itself. Do not delete "/state/interrupted-update.json": it is what lets the next sync finish an update that stopped part way, and without it the changes that update left would be sent as yours.',
+    },
+  ]);
+  // Hung or not, the mismatch is what the line is about: the age alone cannot say whether
+  // the process is the update at all.
+  assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 9, runningMs: 86_400_000, hung: true, ...elsewhere } }), [
+    {
+      level: "error",
+      text: 'unsynced: an earlier vault update is still running (process group 9, 1 day so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. `ps -g 9` shows what it is; if it is not this vault\'s update, ending it lets sync carry on by itself. Do not delete "/state/interrupted-update.json": it is what lets the next sync finish an update that stopped part way, and without it the changes that update left would be sent as yours.',
+    },
+  ]);
+  // A problem runCycle recorded with the reason comes last here too, and the record's name
+  // is quoted like any other name a status line carries.
+  const lock = { ...base, reason: "an earlier vault update is still running; releasing the sync lock failed: EACCES" };
+  const [line] = statusFromCycle({ ...lock, waiting: { group: 9, runningMs: 0, hung: false, thisBoot: false, record: "/state/a\nb.json", safeToDelete: false } });
+  assert.equal(
+    line?.text,
+    'unsynced: an earlier vault update is still running (process group 9, 0 s so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. `ps -g 9` shows what it is; if it is not this vault\'s update, ending it lets sync carry on by itself. Do not delete "/state/a\\nb.json": it is what lets the next sync finish an update that stopped part way, and without it the changes that update left would be sent as yours.; releasing the sync lock failed: EACCES',
+  );
+  // Only where the cycle established that the record protects nothing is a delete offered
+  // at all, and then it is offered as a way out rather than refused as a warning.
+  const [offered] = statusFromCycle({ ...base, waiting: { group: 9, runningMs: 0, hung: false, thisBoot: false, record: "/state/r.json", safeToDelete: true } });
+  assert.equal(offered?.level, "error");
+  assert.ok((offered?.text ?? "").endsWith('Nothing of that update has reached the vault, so deleting "/state/r.json" also lets sync carry on.'), offered?.text);
+  assert.doesNotMatch(offered?.text ?? "", /Do not delete/);
+  assert.match(offered?.text ?? "", /`ps -g 9` shows what it is/);
 });
 
 async function identityWorld(): Promise<{ vaultRoot: string; remote: string; code: string; stateRoot: string }> {
@@ -681,12 +927,15 @@ test("a git call that hangs before the sync starts still returns within the wait
   const w = await world();
   const marker = join(await tempDir(), "slept");
   // The first git command in the session directory (the early identity) hangs 3 s.
-  const slowOnce = `if [ "$here" = ${JSON.stringify(w.code)} ] && mkdir ${JSON.stringify(marker)} 2>/dev/null; then sleep 3; fi`;
+  const slowOnce = `if [ "$here" = ${JSON.stringify(w.code)} ] && mkdir ${JSON.stringify(marker)} 2>/dev/null; then sleep 10; fi`;
   await withGitWrapper(slowOnce, async () => {
     const t0 = Date.now();
     const r = await initializeSession(opts(w, { waitMs: 1_000 }));
     const elapsed = Date.now() - t0;
-    assert.ok(elapsed < 2_000, `initializeSession returned after ${elapsed} ms for a 1000 ms wait`);
+    // Five times the wait, and a fifth of the 10 s the wrapper sleeps: what this pins is
+    // that the deadline is honoured at all, never a millisecond budget, and no scheduling
+    // delay on a loaded machine can reach either end of that.
+    assert.ok(elapsed < 5_000, `initializeSession returned after ${elapsed} ms for a 1000 ms wait`);
     assert.equal(r.context, null);
     assert.ok(r.payload.startsWith(`${PAYLOAD_MARKER}\nBOOTSTRAP\n`), "the bootstrap is still sent");
     assert.match(r.payload, /memory initialization timed out/);
@@ -705,4 +954,93 @@ test("a session that timed out before the sync learns in the background why memo
     const later = (await r.background).map((s) => s.text).join("\n");
     assert.match(later, /after sync memory and sync are disabled: .*claimed by several folders/);
   });
+});
+
+// C5 (the gauntlet fix wave): the prepare lock was released in a `finally`, so a release
+// that threw replaced the reason the session needed with its own. runCycle already keeps
+// both for the sync lock; this does the same.
+const ownedLockDir = (w: { stateRoot: string; vaultRoot: string }): string => join(w.stateRoot, vaultId(w.vaultRoot), "prepare.lock");
+
+test(
+  "a prepare lock that cannot be released is reported beside what preparation did, never instead of it",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const w = await world();
+    const lockDir = ownedLockDir(w);
+    // While the clone runs, and so while the lock is held: release() then cannot unlink
+    // its owner entry.
+    const wedge = `for a in "$@"; do if [ "$a" = clone ]; then chmod 555 ${JSON.stringify(lockDir)} 2>/dev/null; fi; done`;
+    let r: Awaited<ReturnType<typeof initializeSession>>;
+    try {
+      r = await withGitWrapper(wedge, () => initializeSession(opts(w)));
+    } finally {
+      await chmod(lockDir, 0o755).catch(() => undefined);
+    }
+    const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+    assert.equal(r.context?.project, "kabin-api", lines);
+    assert.match(lines, /\[warn\] releasing the prepare lock failed: .*(EACCES|permission denied)/i);
+  },
+);
+
+test(
+  "a prepare that fails while the lock cannot be released keeps its own reason, with the release's appended",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const w = await world();
+    // One session prepares Projects/ so the next takes the already-a-repository path.
+    assert.equal((await initializeSession(opts(w, { sessionId: "s1" }))).context?.project, "kabin-api");
+    const lockDir = ownedLockDir(w);
+    const projects = join(w.vaultRoot, "Projects");
+    // checkRepo's --git-path lookup fails, and the lock is wedged on the way in.
+    const wedge = `if [ "$here" = ${JSON.stringify(projects)} ]; then for a in "$@"; do if [ "$a" = "--git-path" ]; then chmod 555 ${JSON.stringify(lockDir)} 2>/dev/null; echo "fatal: injected failure" >&2; exit 128; fi; done; fi`;
+    let r: Awaited<ReturnType<typeof initializeSession>>;
+    try {
+      r = await withGitWrapper(wedge, () => initializeSession(opts(w, { sessionId: "s2" })));
+    } finally {
+      await chmod(lockDir, 0o755).catch(() => undefined);
+    }
+    const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+    assert.match(lines, /\[error\] sync failed: .*injected failure/, lines);
+    assert.match(lines, /injected failure.*; releasing the prepare lock failed: /, lines);
+  },
+);
+
+// C2 (round 2): catchUp and buildRollups run the adapter's own code - listSessions,
+// readTranscript, callModel - which can reject with anything at all. `(err as Error)
+// .message` on a value that is not an Error renders "journal catch-up: undefined", which
+// says nothing and hides which of the host's entry points threw.
+function throwingHarness(thrown: unknown): Harness {
+  return {
+    async callModel(): Promise<string> {
+      throw thrown;
+    },
+    async readTranscript(sessionId: string): Promise<TranscriptChunk> {
+      return { sessionId, messages: [] };
+    },
+    async listSessions(): Promise<SessionRef[]> {
+      throw thrown;
+    },
+    async notify(): Promise<void> {},
+  };
+}
+
+test("a harness that rejects with something that is not an Error still says what it was, for the catch-up and for the rollups", async () => {
+  for (const [thrown, reads] of [
+    ["the model refused", "the model refused"],
+    [null, "null"],
+    [42, "42"],
+    [new TypeError("req.system is not a string"), "TypeError: req.system is not a string"],
+  ] as Array<[unknown, string]>) {
+    const w = await localWorld();
+    // A day before today's, so the rollups have something to digest and call the model for.
+    const then = new Date("2026-09-18T06:00:00Z");
+    await writeJournalEntry(w.projectDir, { machine: "a", session: "s", branch: "main", from: then, to: then, model: "m", summary: "older", timezone: "Asia/Tokyo" });
+    const r = await initializeSession(localOpts(w, { harness: throwingHarness(thrown) }));
+    const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+    assert.ok(lines.includes(`journal catch-up: ${reads}`), lines);
+    assert.ok(lines.includes(`journal rollups: ${reads}`), lines);
+    assert.doesNotMatch(lines, /: undefined$/m, "never a line that says nothing at all");
+    assert.equal(r.status.filter((s) => s.text.startsWith("journal ")).length, 2, lines);
+    assert.equal(r.context?.project, "kabin-api", "and the session still starts");
+  }
 });

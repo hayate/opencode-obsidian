@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ensureGitignore, prepareProjects, REQUIRED_IGNORES, syncConfig, type SyncState } from "../../core/sync/state.ts";
+import { ensureGitignore, firstPushFailure, prepareProjects, REQUIRED_IGNORES, syncConfig, type SyncState } from "../../core/sync/state.ts";
 import { git, gitOk } from "../../core/git.ts";
 import type { Vault } from "../../core/vault.ts";
 import { GIT_CONFIG, commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
@@ -115,6 +115,54 @@ test("notes in a non-repo Projects/ are imported into an empty remote, refused f
   await writeRel(w.projectsDir, "vero/HANDOFF.md", "# vero\n");
   const refused = await prepareProjects(w, { remote: await seededRemote() }, TZ);
   assertKind(refused, "stopped");
+});
+
+// A remote in git's sha256 object format, holding one note when seeded.
+async function sha256Remote(seeded: boolean): Promise<string> {
+  const path = join(await tempDir("sro-remote-"), "projects.git");
+  await gitOk(["init", "-q", "--bare", "--object-format=sha256", "-b", "main", path], { cwd: await tempDir() });
+  if (seeded) {
+    const work = join(await tempDir(), "seed");
+    await gitOk(["clone", "-q", path, work], { cwd: await tempDir() });
+    await commitFile(work, "kabin-api/HANDOFF.md", "# kabin-api\n", "seed");
+    await gitOk(["push", "-q", "origin", "HEAD"], { cwd: work });
+  }
+  return path;
+}
+
+test("a sha256 repository is refused in one sentence wherever sync meets it (Projects/ itself, a clone, an empty remote to bootstrap), and nothing is pushed", async () => {
+  const reason = (state: SyncState): string => (state.kind === "stopped" ? state.reason : JSON.stringify(state));
+  const remote = await sha256Remote(true);
+  const existing = await vault();
+  await gitOk(["clone", "-q", remote, existing.projectsDir], { cwd: existing.root });
+  assert.equal(
+    reason(await prepareProjects(existing, { remote }, TZ)),
+    "Projects/ is a sha256 git repository, and sync works only with sha1 ones (git's default): point OBSIDIAN_PROJECTS_REMOTE at a sha1 repository, and let the plugin clone it into an empty Projects/",
+  );
+  const cloned = await vault();
+  assert.equal(
+    reason(await prepareProjects(cloned, { remote }, TZ)),
+    "the remote is a sha256 git repository, and sync works only with sha1 ones (git's default): point OBSIDIAN_PROJECTS_REMOTE at a sha1 repository, and let the plugin clone it into an empty Projects/",
+  );
+  assert.equal(await stat(cloned.projectsDir).then(() => true, () => false), false, "Projects/ is left as it was");
+  const empty = await sha256Remote(false);
+  const bootstrap = await vault();
+  assert.match(reason(await prepareProjects(bootstrap, { remote: empty }, TZ)), /^the remote is a sha256 git repository/);
+  assert.equal(await gitOk(["ls-remote", "--heads", empty], { cwd: bootstrap.root }), "", "nothing pushed");
+});
+
+test("an import makes a sha1 repository even where git's default object format is sha256", async () => {
+  const v = await vault();
+  await writeRel(v.projectsDir, "vero/HANDOFF.md", "# vero\n");
+  const empty = await bareRemote();
+  process.env.GIT_DEFAULT_HASH = "sha256";
+  try {
+    assertKind(await prepareProjects(v, { remote: empty }, TZ), "ready");
+  } finally {
+    delete process.env.GIT_DEFAULT_HASH;
+  }
+  assert.equal(await gitOk(["rev-parse", "--show-object-format"], { cwd: v.projectsDir }), "sha1");
+  assert.match(await gitOk(["ls-tree", "-r", "--name-only", "main"], { cwd: empty }), /vero\/HANDOFF\.md/);
 });
 
 test("an origin that differs from the variable by even a .git suffix stops", async () => {
@@ -550,4 +598,73 @@ test("the emptiness check never follows a symlink, so bootstrap cannot delete ou
   assertKind(await prepareProjects(v, { remote: await bareRemote() }, TZ), "ready");
   assert.equal(await readFile(join(outside, ".DS_Store"), "utf8"), "outside");
   assert.match(await gitOk(["ls-tree", "HEAD", "escape"], { cwd: v.projectsDir }), /^120000 /, "committed as a link, not followed");
+});
+
+// B3 (the gauntlet fix wave): spec 5.3-5.4 were verified against git 2.47, and the cycle
+// leans on `show-ref --exists` (2.43) to tell a remote-seen that is absent from one git
+// cannot parse. An older git would skip the rewrite check and fail later, inside a cycle,
+// with git's own wording for a flag it does not know. The version is read once, where sync
+// state is detected, before anything touches Projects/.
+async function withGitSaying(version: string, fn: () => Promise<void>): Promise<void> {
+  const dir = await tempDir();
+  const real = `${await gitOk(["--exec-path"], { cwd: dir })}/git`;
+  await writeFile(join(dir, "git"), `#!/bin/sh\nif [ "$1" = --version ]; then\n  echo '${version}'\n  exit 0\nfi\nexec '${real}' "$@"\n`, { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${dir}:${path}`;
+  try {
+    await fn();
+  } finally {
+    process.env.PATH = path;
+  }
+}
+
+test("a git older than the minimum stops sync before anything touches Projects/, naming the minimum and what it found", async () => {
+  for (const [version, reason] of [
+    ["git version 2.39.5 (Apple Git-154)", "sync needs git 2.47 or newer, and this machine has 2.39: upgrade git, then start a new session"],
+    ["git version 1.9.1", "sync needs git 2.47 or newer, and this machine has 1.9: upgrade git, then start a new session"],
+    ["not a version at all", 'git\'s version could not be read (git --version said "not a version at all"); sync needs git 2.47 or newer'],
+  ] as Array<[string, string]>) {
+    const v = await vault();
+    let state: SyncState | undefined;
+    await withGitSaying(version, async () => {
+      state = await prepareProjects(v, { remote: await bareRemote() }, TZ);
+    });
+    assert.deepEqual(state, { kind: "stopped", reason }, version);
+    assert.deepEqual(await readdir(v.root), [".obsidian"], `${version}: Projects/ was not created`);
+  }
+});
+
+test("a git at the minimum, or past it, is accepted", async () => {
+  for (const version of ["git version 2.47.0", "git version 2.50.1 (Apple Git-155)", "git version 3.0.0"]) {
+    const v = await vault();
+    let state: SyncState | undefined;
+    await withGitSaying(version, async () => {
+      state = await prepareProjects(v, { remote: await seededRemote() }, TZ);
+    });
+    assert.equal(state?.kind, "ready", `${version}: ${state?.kind === "stopped" ? state.reason : ""}`);
+  }
+});
+
+test("the version check does not run when sync is off: no remote, nothing to check", async () => {
+  const v = await vault();
+  let state: SyncState | undefined;
+  await withGitSaying("git version 1.0.0", async () => {
+    state = await prepareProjects(v, { remote: null }, TZ);
+  });
+  assert.deepEqual(state, { kind: "off" });
+});
+
+
+// C1 (round 2): the bootstrap and import staging and the clone's checkout run the vault's
+// own filters over every note at once, with no ladder behind them and nothing that retries
+// with more time. They have their own generous bound now, and a failure of either says
+// which limit it hit rather than "timed out".
+test("a first-push failure names the limit it ran past, or git's own words", () => {
+  assert.equal(
+    firstPushFailure({ code: -1, stderr: "", timedOut: true }, 600_000, "the first staging of a whole vault"),
+    "it ran past 10 min, the limit for the first staging of a whole vault",
+  );
+  assert.equal(firstPushFailure({ code: -1, stderr: "", timedOut: true }, 60_000, "a clone"), "it ran past 1 min, the limit for a clone");
+  assert.equal(firstPushFailure({ code: 128, stderr: "fatal: bad\nhint: try\n", timedOut: false }, 600_000, "x"), "fatal: bad");
+  assert.equal(firstPushFailure({ code: 128, stderr: "", timedOut: false }, 600_000, "x"), "git exited 128", "never a phrase that says nothing");
 });

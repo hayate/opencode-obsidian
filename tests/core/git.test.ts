@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { chmod, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -342,4 +342,80 @@ test("git commands a commit hook runs are not forced into literal-pathspec mode"
   await chmod(hook, 0o755);
   const r = await git(["commit", "-q", "-m", "hook runs check-ignore"], { cwd: dir });
   assert.equal(r.code, 0, r.stderr);
+});
+
+// Spec 5.4 step 5 (fix round 1): git is detached, in its own group, and its timeout is a
+// timer in this process. A session that exits while git runs must not leave it running:
+// the next session would repair and push over what it is still writing.
+test("a session that exits normally takes the git it started with it, and installs no handler once nothing runs", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  const from = await commitFile(dir, "x/n.md", "old\n", "old");
+  const to = await commitFile(dir, "x/n.md", "new\n", "new");
+  await gitOk(["reset", "-q", "--hard", from], { cwd: dir });
+  await gitOk(["config", "filter.slow.smudge", "sleep 30; cat"], { cwd: dir });
+  await writeFile(join(dir, ".git", "info", "attributes"), "*.md filter=slow\n");
+  const fixture = fileURLToPath(new URL("./fixtures/git-exit.ts", import.meta.url));
+  const child = spawn(process.execPath, [fixture, dir, to], { stdio: ["ignore", "pipe", "inherit"] });
+  let out = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+    out += chunk;
+  });
+  const code: number = await new Promise((done) => child.on("close", (status) => done(status ?? -1)));
+  assert.equal(code, 0, "the session exited normally");
+  const group = Number(out.trim());
+  assert.ok(Number.isInteger(group) && group >= 2, `the session reported its git's group: ${JSON.stringify(out)}`);
+  const started = Date.now();
+  for (;;) {
+    try {
+      process.kill(-group, 0);
+    } catch (err) {
+      assert.equal((err as NodeJS.ErrnoException).code, "ESRCH");
+      break;
+    }
+    assert.ok(Date.now() - started < 10_000, "the git the session started outlived it");
+    await sleep(20);
+  }
+  // The handler goes with the last child, so a host that runs no git of ours keeps its
+  // exit listeners as they were (none of its own here, measured).
+  await gitOk(["--version"], { cwd: process.cwd() });
+  assert.equal(process.listenerCount("exit"), 0, "no exit listener is left behind");
+});
+
+// Spec 5.4 step 5 (fix round 2): the live update records its process group from onSpawn
+// while git is running. git() settles what onSpawn returns before its own result, so that
+// record is on disk before the caller goes on: a write that landed later would fall on top
+// of the fingerprints the kill records, and the next repair would have to judge every path
+// by content instead. A write that fails is the call's failure, never a silent loss.
+test("git waits for what onSpawn writes before it returns, and a write that fails is the call's failure", async () => {
+  let written = false;
+  const waited = await git(["--version"], {
+    cwd: process.cwd(),
+    onSpawn: () =>
+      new Promise<void>((done) => {
+        setTimeout(() => {
+          written = true;
+          done();
+        }, 150);
+      }),
+  });
+  assert.equal(written, true, "what onSpawn started had finished when git() returned");
+  assert.equal(waited.code, 0);
+  await assert.rejects(
+    git(["--version"], { cwd: process.cwd(), onSpawn: () => Promise.reject(new Error("no room on disk")) }),
+    /no room on disk/,
+  );
+});
+
+test("an onSpawn that throws where it stands is the call's failure too, and leaves nothing registered for a child that is gone", async () => {
+  await assert.rejects(
+    git(["--version"], {
+      cwd: process.cwd(),
+      onSpawn: () => {
+        throw new Error("the state directory is gone");
+      },
+    }),
+    /the state directory is gone/,
+  );
+  assert.equal(process.listenerCount("exit"), 0, "the child's group is forgotten however the call ends");
 });

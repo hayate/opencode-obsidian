@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { redactUrlCredentials, scanDiff, scanText, unquoteGitPath } from "../../core/secrets.ts";
+import { redactUrlCredentials, scanDiff, scanRange, scanStaged, scanText, unquoteGitPath } from "../../core/secrets.ts";
+import { gitOk } from "../../core/git.ts";
+import { commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
 
 // Fixtures are assembled at runtime: a literal token-shaped string in this file
 // would trip GitHub push protection on the repository itself.
@@ -197,4 +199,33 @@ test("the scanner stays linear on a 1 MB line and ignores identifiers notes are 
   const started = performance.now();
   assert.deepEqual(scanText("a".repeat(1024 * 1024)), []);
   assert.ok(performance.now() - started < 500, "a 1 MB line took over 500 ms");
+});
+
+test("scanRange scans what a commit range adds, with the same pinned diff as the snapshot scan", async () => {
+  const dir = await tempDir();
+  await initRepo(dir);
+  const from = await commitFile(dir, "x/a.md", "plain\n", "a");
+  await gitOk(["config", "diff.mnemonicPrefix", "true"], { cwd: dir });
+  await writeRel(dir, ".gitattributes", "*.md -diff\n");
+  await writeRel(dir, "x/b.md", `token ${j("gh", "p_", noise(36))}\n`);
+  await gitOk(["add", "-A"], { cwd: dir });
+  await gitOk(["commit", "-q", "-m", "b"], { cwd: dir });
+  const hits = await scanRange(dir, from, "HEAD");
+  assert.deepEqual([...hits.keys()], ["x/b.md"]);
+});
+
+test("both scans read renames as git does by default, whatever diff.renames says: a new copy's lines are scanned, a pure rename adds none", async () => {
+  const note = `a note long enough\nto be recognised as the same file\ntoken ${j("gh", "p_", noise(36))}\n`;
+  for (const setting of ["copies", "false"]) {
+    const dir = await tempDir();
+    await initRepo(dir);
+    const from = await commitFile(dir, "x/a.md", note, "a");
+    await gitOk(["config", "diff.renames", setting], { cwd: dir });
+    await gitOk(["mv", "x/a.md", "x/b.md"], { cwd: dir });
+    await writeRel(dir, "x/c.md", note);
+    await gitOk(["add", "-A"], { cwd: dir });
+    assert.deepEqual([...(await scanStaged(dir)).keys()], ["x/c.md"], `diff.renames=${setting}, staged`);
+    await gitOk(["commit", "-q", "-m", "moved and copied"], { cwd: dir });
+    assert.deepEqual([...(await scanRange(dir, from, "HEAD")).keys()], ["x/c.md"], `diff.renames=${setting}, a range`);
+  }
 });

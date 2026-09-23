@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only, as mutation.yml is: nothing here needs a token that can write.
+permissions:
+  contents: read
+
+# A new push to the pull request replaces the run in progress (mutation.yml does the same).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   core:
     strategy:
@@ -13,6 +22,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         node: [22, 24]
     runs-on: ${{ matrix.os }}
+    # The suite is about a minute on a laptop and a few on a runner; past this it is hung,
+    # not slow (the mutation gate, which is the long job, has its own 60).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,7 +37,18 @@ jobs:
 
   skills:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: python3 tests/validate_skills.py
       - run: bash tests/test_sdd_scripts.sh
+      # The mutation gate's own tests, and a fast check that every mutation's target is in place
+      # (the gate itself runs in mutation.yml).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # By name, never `unittest discover`: whether discover finds this file at all depends
+      # on the runner's Python (measured: 3.10 and 3.11 exit 0 having run nothing, 3.12 and
+      # later exit 5), and this is the only check that every mutation's target is still
+      # there and that the shard matrix is complete. The file runs unittest.main() itself.
+      - run: python3 tests/mutation/test_gate.py -v

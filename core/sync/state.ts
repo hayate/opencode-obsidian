@@ -4,7 +4,7 @@
 import { randomBytes } from "node:crypto";
 import { lstat, readFile, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { git, gitOk, NETWORK_TIMEOUT_MS } from "../git.ts";
+import { git, GitError, gitOk, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { redactUrlCredentials, scanStaged } from "../secrets.ts";
 import { createAt, quoted, writeAtomic } from "../store.ts";
 import { CONFIG_FILE, type Vault } from "../vault.ts";
@@ -60,10 +60,13 @@ async function entries(dir: string): Promise<string[]> {
   }
 }
 
+// Finder's own file, written into any folder the user opens: litter, never content.
+export const isFinderLitter = (name: string): boolean => name === ".DS_Store";
+
 // Absent, or holding only Finder litter and empty directories, counts as empty.
-async function isEffectivelyEmpty(dir: string): Promise<boolean> {
+export async function isEffectivelyEmpty(dir: string): Promise<boolean> {
   for (const name of await entries(dir)) {
-    if (name === ".DS_Store") continue;
+    if (isFinderLitter(name)) continue;
     const path = join(dir, name);
     // lstat: a symlink is content, never a directory to walk (or clean) through.
     const info = await lstat(path);
@@ -75,12 +78,70 @@ async function isEffectivelyEmpty(dir: string): Promise<boolean> {
 async function clearLitter(dir: string): Promise<void> {
   for (const name of await entries(dir)) {
     const path = join(dir, name);
-    if (name === ".DS_Store") await rm(path, { force: true });
+    if (isFinderLitter(name)) await rm(path, { force: true });
     else {
       await clearLitter(path);
       await rmdir(path).catch(() => undefined);
     }
   }
+}
+
+// The git the whole of spec 5.3-5.4 was verified against. Older ones lack features the
+// cycle cannot do without and fail inside it, with git's own wording for a flag it does
+// not know: `show-ref --exists` (2.43) is what tells a remote-seen that is absent from one
+// git cannot parse, so on an older git the rewrite check would be skipped; the scan's
+// `--attr-source` is 2.41, and `merge-tree --write-tree --merge-base` is 2.38. Checked
+// once, where sync state is detected, so the answer is one sentence naming the minimum and
+// what this machine has, before anything touches Projects/.
+const MIN_GIT = { major: 2, minor: 47 };
+
+// The two calls of the first push that run the vault's own filters over every note at
+// once, with no ladder behind them: the bootstrap and import staging (`git add -A` through
+// the clean filters, the one time the plugin hashes a whole vault in one go) and the clone
+// (its checkout writes every note through the smudge filters after a network fetch). A
+// failure of either removes the Projects/.git this call created and the next session starts
+// over identically, so git.ts's fixed local and network limits, sized for one cycle's work,
+// are the wrong shape here: the import is exactly where a whole vault can outlast 30 s.
+// 10 minutes each, the bound clone.ts already uses for a rebuild: at a slow disk's 20 MB/s
+// that is 12 GB, far past a notes vault, and a hung filter or a dead network still gives
+// the session an answer within it.
+const FIRST_PUSH_TIMEOUT_MS = 10 * 60_000;
+
+// Why a git call of the first push failed, in one phrase: the limit it ran past, named, or
+// git's own words. The limits above are generous and fixed, so no test can reach one; this
+// is where their wording is pinned.
+export function firstPushFailure(r: { code: number; stderr: string; timedOut: boolean }, limitMs: number, what: string): string {
+  if (r.timedOut) return `it ran past ${limitMs / 60_000} min, the limit for ${what}`;
+  return firstLines(r.stderr) || `git exited ${r.code}`;
+}
+const MIN_GIT_TEXT = `${MIN_GIT.major}.${MIN_GIT.minor}`;
+
+async function gitVersionProblem(cwd: string): Promise<string | null> {
+  const r = await git(["--version"], { cwd });
+  if (r.code !== 0 || r.timedOut) {
+    return `git could not be run (${firstLines(r.stderr) || (r.timedOut ? "timed out" : `git exited ${r.code}`)}); sync needs git ${MIN_GIT_TEXT} or newer`;
+  }
+  const found = /^git version (\d+)\.(\d+)/.exec(r.stdout.trim());
+  const major = Number(found?.[1]);
+  const minor = Number(found?.[2]);
+  if (found === null || !Number.isInteger(major) || !Number.isInteger(minor)) {
+    return `git's version could not be read (git --version said ${quoted(r.stdout.trim())}); sync needs git ${MIN_GIT_TEXT} or newer`;
+  }
+  if (major > MIN_GIT.major || (major === MIN_GIT.major && minor >= MIN_GIT.minor)) return null;
+  return `sync needs git ${MIN_GIT_TEXT} or newer, and this machine has ${major}.${minor}: upgrade git, then start a new session`;
+}
+
+// Case twins (Note.md and note.md, a case-only rename) are one file where the disk
+// ignores case, which git records at init as core.ignorecase (unset: case matters).
+// Exit 1 is git's own answer that the setting is not there; every other failure is a
+// failure, and throws. Read as "case matters", a failed lookup would make the cycle miss
+// every case-only rename in silence and suppress the collision warning with it, and would
+// make the repair judge case twins as separate files.
+export async function ignoresCase(dir: string): Promise<boolean> {
+  const r = await git(["config", "--type=bool", "--get", "core.ignorecase"], { cwd: dir });
+  if (r.code === 1 && !r.timedOut) return false;
+  if (r.code !== 0 || r.timedOut) throw new Error(`git config core.ignorecase failed: ${r.stderr.trim() || (r.timedOut ? "timed out" : `exit ${r.code}`)}`);
+  return r.stdout.trim() === "true";
 }
 
 export async function identityProblem(repo: string): Promise<string | null> {
@@ -121,7 +182,19 @@ async function commitAndPushNew(projectsDir: string, timezone: string, message: 
   if (identity) return identity;
   await ensureGitignore(projectsDir);
   await createAt(join(projectsDir, CONFIG_FILE), `${JSON.stringify({ timezone }, null, 2)}\n`);
-  await gitOk(["add", "-A"], { cwd: projectsDir });
+  // Only the limit is turned into a reason here: every other failure throws as it always
+  // has, so firstPush still removes the .git it created and session.ts still reports git's
+  // own words (and gitOk's stranded-lock sentence with them, spec 5.6).
+  const slow = await gitOk(["add", "-A"], { cwd: projectsDir, timeoutMs: FIRST_PUSH_TIMEOUT_MS }).then(
+    () => null,
+    (err: unknown) => {
+      if (err instanceof GitError && err.result.timedOut) {
+        return `staging Projects/ failed: ${firstPushFailure(err.result, FIRST_PUSH_TIMEOUT_MS, "the first staging of a whole vault")}`;
+      }
+      throw err;
+    },
+  );
+  if (slow !== null) return slow;
   // Spec 7.5: every staged diff is scanned before commit. At bootstrap there is
   // no later cycle to hold a hit back in, so any hit stops the whole import.
   const hits = await scanStaged(projectsDir);
@@ -183,14 +256,26 @@ async function sweepLeftoverClones(root: string, projectsDir: string): Promise<v
   }
 }
 
+// The plugin names git's sha1 empty tree and writes sha1 ids, so a repository in any
+// other object format fails every cycle with git's own error ("bad --attr-source",
+// verified with a sha256 repository, git 2.50.1). Sync refuses it where it meets it,
+// in one sentence: Projects/ itself, or a clone of the remote before it is put in place.
+async function objectFormatProblem(dir: string, what: string): Promise<string | null> {
+  const format = await gitOk(["rev-parse", "--show-object-format"], { cwd: dir });
+  if (format === "sha1") return null;
+  return `${what} is a ${format} git repository, and sync works only with sha1 ones (git's default): point OBSIDIAN_PROJECTS_REMOTE at a sha1 repository, and let the plugin clone it into an empty Projects/`;
+}
+
 async function cloneIntoPlace(root: string, projectsDir: string, remote: string): Promise<{ populated: boolean } | string> {
   await sweepLeftoverClones(root, projectsDir);
   const tmp = join(root, `.${basename(projectsDir)}.${randomBytes(4).toString("hex")}.sro-tmp`);
   try {
-    const clone = await git(["clone", "-q", remote, tmp], { cwd: root, timeoutMs: NETWORK_TIMEOUT_MS });
+    const clone = await git(["clone", "-q", remote, tmp], { cwd: root, timeoutMs: FIRST_PUSH_TIMEOUT_MS });
     if (clone.code !== 0 || clone.timedOut) {
-      return `clone of ${remote} failed: ${clone.stderr.trim() || (clone.timedOut ? "timed out" : `git exited ${clone.code}`)}`;
+      return `clone of ${remote} failed: ${firstPushFailure(clone, FIRST_PUSH_TIMEOUT_MS, "a clone and the checkout after it")}`;
     }
+    const format = await objectFormatProblem(tmp, "the remote");
+    if (format) return format;
     const populated = (await git(["rev-parse", "--verify", "-q", "HEAD"], { cwd: tmp })).code === 0;
     if (!populated) {
       const branches = await remoteHasBranches(tmp, remote);
@@ -267,6 +352,9 @@ async function checkRepo(projectsDir: string, remote: string): Promise<SyncState
     const detail = firstLines(head.stderr) || (head.timedOut ? "timed out" : `git exited ${head.code}`);
     return { kind: "stopped", reason: `Projects/'s HEAD could not be verified: ${detail}` };
   }
+  // After HEAD: git runs here (a refusal such as dubious ownership has its own words above).
+  const format = await objectFormatProblem(projectsDir, "Projects/");
+  if (format) return { kind: "stopped", reason: format };
   const origin = await git(["config", "--get", "remote.origin.url"], { cwd: projectsDir });
   if (origin.code !== 0 || origin.stdout.trim() !== remote) {
     return {
@@ -323,6 +411,9 @@ async function prepare(vault: Vault, cfg: SyncConfig, timezone: string): Promise
     return { kind: "off" };
   }
 
+  const old = await gitVersionProblem(vault.root);
+  if (old) return { kind: "stopped", reason: old };
+
   if (await vaultTracksProjects(vault.root)) {
     return {
       kind: "stopped",
@@ -352,7 +443,9 @@ async function prepare(vault: Vault, cfg: SyncConfig, timezone: string): Promise
   }
   const remote = cfg.remote;
   return firstPush(dir, remote, async () => {
-    await gitOk(["init", "-q"], { cwd: dir });
+    // sha1 whatever git's default is here (init.defaultObjectFormat, GIT_DEFAULT_HASH):
+    // the plugin never makes a repository it would refuse.
+    await gitOk(["init", "-q", "--object-format=sha1"], { cwd: dir });
     await gitOk(["remote", "add", "origin", remote], { cwd: dir });
     return commitAndPushNew(dir, timezone, "import Projects/");
   });

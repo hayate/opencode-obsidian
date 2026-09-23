@@ -7,12 +7,14 @@ import {
   computeHeads,
   createAt,
   createExclusive,
+  errorText,
   listHandoffs,
   MALFORMED_BRANCH,
   parseDoc,
   readMemoryFile,
   renderDoc,
   writeAtomic,
+  writeDurable,
   writeHandoff,
   type Handoff,
 } from "../../core/store.ts";
@@ -265,4 +267,93 @@ test("writeHandoff throws when another holder keeps the handoff lock", async () 
   } finally {
     await held.release();
   }
+});
+
+// B4 (the gauntlet fix wave): the widest catch-alls render whatever was thrown. A value
+// that is not an Error has no .message, and `(err as Error).message` on one renders
+// "sync aborted: undefined"; and a built-in kind, which is what a bug of ours throws, is
+// named, so a TypeError from a resolver bug is not indistinguishable from a bad repository.
+test("errorText renders what was thrown, whatever it is, and names the built-in kinds a bug throws", () => {
+  assert.equal(errorText(new Error("plain")), "plain");
+  assert.equal(errorText(new TypeError("x is not a function")), "TypeError: x is not a function");
+  assert.equal(errorText(new RangeError("Invalid time zone specified: zz")), "RangeError: Invalid time zone specified: zz");
+  for (const kind of [ReferenceError, SyntaxError, EvalError, URIError]) {
+    assert.equal(errorText(new kind("boom")), `${kind.name}: boom`, kind.name);
+  }
+  // The plugin's own classes write their whole message for the user (spec 5.6's
+  // stranded-lock sentence is one): naming their kind would only get in the way.
+  class GitError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = "GitError";
+    }
+  }
+  assert.equal(errorText(new GitError("git left a lock file behind: ...")), "git left a lock file behind: ...");
+  for (const [thrown, reads] of [
+    ["a bare string", "a bare string"],
+    [null, "null"],
+    [undefined, "undefined"],
+    [42, "42"],
+    [{ message: "not an Error" }, "[object Object]"],
+  ] as Array<[unknown, string]>) {
+    assert.equal(errorText(thrown), reads, JSON.stringify(thrown));
+  }
+});
+
+// D1 (the gauntlet fix wave): recovery.ts's intent record is written before `reset --keep`
+// changes a single note, so its absence loses work that is already on disk. Write-plus-
+// rename survives a crash, not a power loss: neither the bytes nor the directory entry
+// need have reached the platter. What the flushes themselves guarantee is only visible
+// across a power loss (the mutations for them are declared survivors); what is testable
+// is that the write is otherwise writeAtomic's, replacement and all.
+test("writeDurable replaces a file whole, creates its directory, and leaves no temp sibling", async () => {
+  const dir = join(await tempDir(), "nested", "deeper");
+  const path = join(dir, "record.json");
+  await writeDurable(path, '{"from":"a"}');
+  assert.equal(await readFile(path, "utf8"), '{"from":"a"}');
+  await writeDurable(path, '{"from":"b","to":"c"}');
+  assert.equal(await readFile(path, "utf8"), '{"from":"b","to":"c"}');
+  assert.deepEqual((await readdir(dir)).sort(), ["record.json"]);
+  // A long value and an empty one both land whole.
+  await writeDurable(path, "");
+  assert.equal(await readFile(path, "utf8"), "");
+  const long = "x".repeat(200_000);
+  await writeDurable(path, long);
+  assert.equal(await readFile(path, "utf8"), long);
+  assert.deepEqual((await readdir(dir)).sort(), ["record.json"]);
+});
+
+// B2 (round 2): everything up to and including the rename fails closed, but once the
+// record is in place a directory flush that cannot run is not worth stranding sync for:
+// some FUSE and network mounts answer EINVAL on a directory fd, and every cycle would then
+// abort identically over a file that was written.
+test(
+  "a writeDurable whose directory cannot be flushed leaves the file in place and says what it could not promise",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const dir = await tempDir();
+    const path = join(dir, "record.json");
+    assert.equal(await writeDurable(path, "first"), null, "a directory that can be flushed reports nothing");
+    // Writable and searchable, not readable: the file still lands, opening the directory
+    // to flush it does not.
+    await chmod(dir, 0o300);
+    let problem: string | null;
+    try {
+      problem = await writeDurable(path, "second");
+    } finally {
+      await chmod(dir, 0o755);
+    }
+    assert.match(problem ?? "", /^flushing .* failed: .*EACCES/, problem ?? "(nothing reported)");
+    assert.equal(await readFile(path, "utf8"), "second", "and the record is in place all the same");
+    assert.equal(await writeDurable(path, "third"), null);
+    assert.deepEqual(await readdir(dir), ["record.json"], "no temp sibling is left behind either way");
+  },
+);
+
+test("a writeDurable whose rename fails takes its temp sibling with it and throws", async () => {
+  const dir = await tempDir();
+  // A directory where the file goes: the rename cannot replace it.
+  await mkdir(join(dir, "record.json"));
+  await assert.rejects(() => writeDurable(join(dir, "record.json"), "x"));
+  assert.deepEqual(await readdir(dir), ["record.json"], "no temp sibling is left behind");
 });
