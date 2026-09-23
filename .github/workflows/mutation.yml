@@ -1,13 +1,15 @@
 name: mutation
 
-# The mutation gate (tests/mutation/gate.py): every mutation of core/ must be caught by a test,
+# The mutation gate (tests/mutation/gate.py): every mutation of core/ and adapters/ must be caught by a test,
 # except the few declared to survive on a platform. It runs in interleaved shards, sized per
 # platform, and only when a pull request touches what it tests (or by hand, from the Actions tab).
 on:
   pull_request:
     paths:
       - "core/**"
+      - "adapters/**"
       - "tests/core/**"
+      - "tests/adapters/**"
       - "tests/mutation/**"
       - "package.json"
       - "package-lock.json"
@@ -27,15 +29,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Each shard is sized to finish in about 40 minutes on a runner twice as slow as the
-        # machine measured (the job's limit is 60). macOS, measured on a laptop after every
-        # sync-cycle mutation got its pattern (2026-09-22, 226 mutations): the whole gate took
-        # 26 minutes as one shard; in three interleaved shards the slowest takes about 15 (one
-        # lock mutation that runs five times is 6 of them). Linux, measured on astrolinux before
-        # the patterns (22 minutes for 204), which the patterns only shorten: about 11 each in
-        # two. Every shard 1..N of a platform, once, with that N: test_gate.py checks it. Three
-        # macOS shards and ci.yml's two macOS jobs fit the five concurrent macOS jobs GitHub
-        # allows this plan.
+        # Each shard must finish well inside the job's limit (60 minutes). Measured on GitHub's
+        # runners (PR #4, 2026-09-23, 349 mutations): the slowest macOS shard of three took
+        # 20.5 minutes, the slowest Linux shard of two 18. Every shard 1..N of a platform, once,
+        # with that N: test_gate.py checks it. Three macOS shards and ci.yml's two macOS jobs
+        # fit the five concurrent macOS jobs GitHub allows this plan.
         include:
           - { os: ubuntu-latest, shard: 1, of: 2 }
           - { os: ubuntu-latest, shard: 2, of: 2 }

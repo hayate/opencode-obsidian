@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Vault-backed memory, handoffs, specs and plans for OpenCode, with the superpowers process skills",
   "type": "module",
+  "main": "adapters/opencode/index.ts",
   "license": "MIT",
   "engines": {
     "node": ">=22.23"

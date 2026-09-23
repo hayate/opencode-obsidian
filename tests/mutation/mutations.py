@@ -715,3 +715,12 @@ mutate(OS, "    // Memory off: the answer is why, which the session may also hav
        "    if (ctx === null) return lines(result.context === null ? result.status : [...result.status, ...(await result.background)]);\n", AS, pattern="pull disabled memory is taken out")
 mutate(OS, "    if (ctx !== null) this.alert(fresh);", "    this.alert(fresh);", AS, pattern="pull disabled memory is taken out")
 mutate(OS, "  forget(sessionId: string): void {\n    this.entries.delete(sessionId);", "  forget(sessionId: string): void {\n    void 0;", AS, pattern="deleted session")
+
+# The OpenCode adapter (spec 8): its entry.
+OI = "adapters/opencode/index.ts"; AI = "tests/adapters/opencode/index.test.ts"
+mutate(OI, "args.adopt_rewrite === true", "true", AI, pattern="only when the adopt option")
+mutate(OI, '      if (event.type === "session.deleted") sessions.forget(event.properties.info.id);\n', "", AI, pattern="deleted session")
+# Spec 7.6: a hook, or the tool, never throws into OpenCode.
+mutate(OI, '        report("loading project memory", err);', "        throw err;", AI, pattern="never throws")
+mutate(OI, "        return message;\n", "        throw err;\n", AI, pattern="fails answers")
+mutate(OI, "        await notify(message).catch(() => undefined);", "        await notify(message);", AI, pattern="toast fails too")
