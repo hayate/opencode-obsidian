@@ -374,7 +374,7 @@ test("statusFromCycle waits at warn for an update another session is still runni
   };
   // The record's boot stamp is this boot's in every case below; the mismatch has its own
   // line and its own test.
-  const here = { thisBoot: true, record: "/state/interrupted-update.json" };
+  const here = { thisBoot: true, record: "/state/interrupted-update.json", safeToDelete: false };
   assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 12_400, hung: false, ...here } }), [
     { level: "warn", text: "unsynced: an earlier vault update is still running (process group 4242, 12 s so far); sync waits for it. If it is hung, end that process" },
   ]);
@@ -414,22 +414,24 @@ test("statusFromCycle waits at warn for an update another session is still runni
   ]);
 });
 
-// Spec 5.4 step 5 (the gauntlet fix wave): the boot stamp is derived from os.uptime(), so
-// a clock correction larger than its tolerance reads as another boot. A live group is
-// waited for either way; a stamp that does not match only makes the line a notify, and
-// gives the one way out that costs nothing when the wait is right.
-test("statusFromCycle waits at notify for an update whose record is not this boot's, naming the record to delete", () => {
+// Spec 5.4 step 5 (the gauntlet fix wave; A1 of round 2): the boot stamp is derived from
+// os.uptime(), so a clock correction larger than its tolerance reads as another boot. A
+// live group is waited for either way; a stamp that does not match only makes the line a
+// notify, and adds a way out. That way out is how to look at the process and what ending
+// it does - never deleting a record that may be the only thing that can still repair the
+// vault, which is a judgement only the cycle, never the user, is in a position to make.
+test("statusFromCycle waits at notify for an update whose record is not this boot's, says how to look at the process, and refuses to offer a delete that would strand the vault", () => {
   const base = {
     outcome: "unsynced" as const,
     reason: "an earlier vault update is still running",
     committed: null, heldBack: [], deferred: [], pushed: false, liveUpdated: false, blockedBy: [], blockedCycles: 0,
     conflicts: [], embedded: [], caseCollisions: [], notices: [], timedOut: null,
   };
-  const elsewhere = { thisBoot: false, record: "/state/interrupted-update.json" };
+  const elsewhere = { thisBoot: false, record: "/state/interrupted-update.json", safeToDelete: false };
   assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 4242, runningMs: 12_400, hung: false, ...elsewhere } }), [
     {
       level: "error",
-      text: 'unsynced: an earlier vault update is still running (process group 4242, 12 s so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. If it is not that update, delete "/state/interrupted-update.json" to let sync carry on',
+      text: 'unsynced: an earlier vault update is still running (process group 4242, 12 s so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. `ps -g 4242` shows what it is; if it is not this vault\'s update, ending it lets sync carry on by itself. Do not delete "/state/interrupted-update.json": it is what lets the next sync finish an update that stopped part way, and without it the changes that update left would be sent as yours.',
     },
   ]);
   // Hung or not, the mismatch is what the line is about: the age alone cannot say whether
@@ -437,17 +439,24 @@ test("statusFromCycle waits at notify for an update whose record is not this boo
   assert.deepEqual(statusFromCycle({ ...base, waiting: { group: 9, runningMs: 86_400_000, hung: true, ...elsewhere } }), [
     {
       level: "error",
-      text: 'unsynced: an earlier vault update is still running (process group 9, 1 day so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. If it is not that update, delete "/state/interrupted-update.json" to let sync carry on',
+      text: 'unsynced: an earlier vault update is still running (process group 9, 1 day so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. `ps -g 9` shows what it is; if it is not this vault\'s update, ending it lets sync carry on by itself. Do not delete "/state/interrupted-update.json": it is what lets the next sync finish an update that stopped part way, and without it the changes that update left would be sent as yours.',
     },
   ]);
   // A problem runCycle recorded with the reason comes last here too, and the record's name
   // is quoted like any other name a status line carries.
   const lock = { ...base, reason: "an earlier vault update is still running; releasing the sync lock failed: EACCES" };
-  const [line] = statusFromCycle({ ...lock, waiting: { group: 9, runningMs: 0, hung: false, thisBoot: false, record: "/state/a\nb.json" } });
+  const [line] = statusFromCycle({ ...lock, waiting: { group: 9, runningMs: 0, hung: false, thisBoot: false, record: "/state/a\nb.json", safeToDelete: false } });
   assert.equal(
     line?.text,
-    'unsynced: an earlier vault update is still running (process group 9, 0 s so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. If it is not that update, delete "/state/a\\nb.json" to let sync carry on; releasing the sync lock failed: EACCES',
+    'unsynced: an earlier vault update is still running (process group 9, 0 s so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. `ps -g 9` shows what it is; if it is not this vault\'s update, ending it lets sync carry on by itself. Do not delete "/state/a\\nb.json": it is what lets the next sync finish an update that stopped part way, and without it the changes that update left would be sent as yours.; releasing the sync lock failed: EACCES',
   );
+  // Only where the cycle established that the record protects nothing is a delete offered
+  // at all, and then it is offered as a way out rather than refused as a warning.
+  const [offered] = statusFromCycle({ ...base, waiting: { group: 9, runningMs: 0, hung: false, thisBoot: false, record: "/state/r.json", safeToDelete: true } });
+  assert.equal(offered?.level, "error");
+  assert.ok((offered?.text ?? "").endsWith('Nothing of that update has reached the vault, so deleting "/state/r.json" also lets sync carry on.'), offered?.text);
+  assert.doesNotMatch(offered?.text ?? "", /Do not delete/);
+  assert.match(offered?.text ?? "", /`ps -g 9` shows what it is/);
 });
 
 async function identityWorld(): Promise<{ vaultRoot: string; remote: string; code: string; stateRoot: string }> {

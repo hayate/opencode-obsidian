@@ -60,7 +60,7 @@ export interface CycleResult {
   // makes it hung rather than slow and escalates the status to a notify; plus whether the
   // record's boot stamp is this boot's and the record's own path, which the status names
   // as the way out when it is not. Null otherwise.
-  waiting: { group: number; runningMs: number; hung: boolean; thisBoot: boolean; record: string } | null;
+  waiting: { group: number; runningMs: number; hung: boolean; thisBoot: boolean; record: string; safeToDelete: boolean } | null;
 }
 
 // The remote head this machine last integrated with (spec 5.3).
@@ -755,7 +755,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     // this machine's change, so this cycle does nothing at all: it repairs nothing,
     // snapshots nothing, pushes nothing, and, like a cycle that found the lock busy, it
     // leaves the blocked-cycle streak alone.
-    const running = await runningUpdate(input.stateDir);
+    const running = await runningUpdate(input.stateDir, dir);
     if (running !== null) {
       result.outcome = "unsynced";
       result.reason = STILL_RUNNING;

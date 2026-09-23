@@ -417,7 +417,7 @@ WAIT_BLOCK = """    // Spec 5.4 step 5: an update whose session died keeps runni
     // this machine's change, so this cycle does nothing at all: it repairs nothing,
     // snapshots nothing, pushes nothing, and, like a cycle that found the lock busy, it
     // leaves the blocked-cycle streak alone.
-    const running = await runningUpdate(input.stateDir);
+    const running = await runningUpdate(input.stateDir, dir);
     if (running !== null) {
       result.outcome = "unsynced";
       result.reason = STILL_RUNNING;
@@ -451,12 +451,22 @@ REBOOT = "stamped with another boot"; HUNG = "longest limit a live update gets i
 # loudly, plus whether the record to delete is named.
 mutate(F_RC, "  if (!groupAlive(record.group)) return null;\n",
        "  if (!groupAlive(record.group) || record.boot === undefined || Math.abs(bootInstant() - record.boot) > BOOT_TOLERANCE_MS) return null;\n", C, pattern=REBOOT)
-mutate(F_RC, "    thisBoot: record.boot !== undefined && Math.abs(bootInstant() - record.boot) <= BOOT_TOLERANCE_MS,\n", "    thisBoot: true,\n", C, pattern=REBOOT)
+mutate(F_RC, "  const thisBoot = record.boot !== undefined && Math.abs(bootInstant() - record.boot) <= BOOT_TOLERANCE_MS;", "  const thisBoot = true;", C, pattern=REBOOT)
 mutate(F_RC, "    record: path,\n", '    record: "",\n', C, pattern=REBOOT)
 mutate(F_RC, "const BOOT_TOLERANCE_MS = 5000;", "const BOOT_TOLERANCE_MS = 604_800_000;", C, pattern=REBOOT)
 NOT_THIS_BOOT = "not this boot's"
 mutate("core/session.ts", "    if (!thisBoot) {", "    if (false) {", SE, pattern=NOT_THIS_BOOT)
-mutate("core/session.ts", "delete ${quoted(record)} to let sync carry on", "delete ${record} to let sync carry on", SE, pattern=NOT_THIS_BOOT)
+mutate("core/session.ts", "        : `Do not delete ${quoted(record)}", "        : `Do not delete ${record}", SE, pattern=NOT_THIS_BOOT)
+# A1 of round 2: the way out is how to look at the process, and a delete is offered only
+# where the cycle established that the record protects nothing.
+STALE_OVER = "a stale group over"
+mutate("core/session.ts", "      const out = safeToDelete\n", "      const out = true\n", SE, pattern=NOT_THIS_BOOT)
+mutate(F_RC, "    safeToDelete: thisBoot ? false : await nothingApplied(dir, record),", "    safeToDelete: true,", C, pattern=STALE_OVER)
+mutate(F_RC, '  if (head.code !== 0 || head.timedOut || head.stdout.trim() !== record.from) return false;\n', "", C, pattern=STALE_OVER)
+mutate(F_RC, "  return clean.code === 0 && !clean.timedOut;", "  return true;", C, pattern=STALE_OVER)
+mutate(F_RC, '  const clean = await git([`--attr-source=${EMPTY_TREE}`, "diff-index", "--quiet", record.from, "--"], { cwd: dir });\n  return clean.code === 0 && !clean.timedOut;',
+       '  const clean = await git([`--attr-source=${EMPTY_TREE}`, "diff-index", "--quiet", "--cached", record.from, "--"], { cwd: dir });\n  return clean.code === 0 && !clean.timedOut;', C,
+       pattern=STALE_OVER)
 mutate(F_RC, '  const record: Record_ = group === undefined ? { from, to } : { from, to, group, boot: bootInstant(), startedAt: Date.now() };',
        "  const record: Record_ = group === undefined ? { from, to } : { from, to, group };", C, pattern="records its process group")
 mutate(F_RC, '  if (process.platform === "win32") return false;\n', "", RC, pattern="no process groups the check answers gone")

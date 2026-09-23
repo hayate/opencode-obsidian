@@ -180,15 +180,21 @@ function unsynced(r: CycleResult): StatusItem {
   const said = r.reason ?? "push did not happen";
   const rest = (lead: string): string => (said.startsWith(lead) ? said.slice(lead.length) : `; ${said}`);
   if (r.waiting !== null) {
-    const { group, runningMs, hung, thisBoot, record } = r.waiting;
+    const { group, runningMs, hung, thisBoot, record, safeToDelete } = r.waiting;
     const also = rest(STILL_RUNNING);
     // A stamp that is not this boot's: the wait still happens (liveness decides), but the
-    // process holding that id may be anything, so this is a notify and it names the one
-    // file the user deletes to carry on. Rewriting or ending anything else is not asked.
+    // process holding that id may be anything, so this is a notify and it says how to look
+    // at that process and what ending it does. It offers deleting the record only where
+    // the cycle established that the record protects nothing: following that advice while
+    // the vault is half updated would leave the next snapshot sending what the interrupted
+    // update left as the user's own change, which is the one thing this must never cause.
     if (!thisBoot) {
+      const out = safeToDelete
+        ? `Nothing of that update has reached the vault, so deleting ${quoted(record)} also lets sync carry on.`
+        : `Do not delete ${quoted(record)}: it is what lets the next sync finish an update that stopped part way, and without it the changes that update left would be sent as yours.`;
       return {
         level: "error",
-        text: `unsynced: ${STILL_RUNNING} (process group ${group}, ${age(runningMs)} so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. If it is not that update, delete ${quoted(record)} to let sync carry on${also}`,
+        text: `unsynced: ${STILL_RUNNING} (process group ${group}, ${age(runningMs)} so far), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else. Sync waits for it. \`ps -g ${group}\` shows what it is; if it is not this vault's update, ending it lets sync carry on by itself. ${out}${also}`,
       };
     }
     if (!hung) {

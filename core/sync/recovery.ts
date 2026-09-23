@@ -11,6 +11,7 @@ import { uptime } from "node:os";
 import { lstat, mkdir, readdir, readFile, readlink, rename, rm, rmdir, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { git, GitError, gitOk, literal, type GitResult } from "../git.ts";
+import { EMPTY_TREE } from "../secrets.ts";
 import { writeAtomic, writeDurable } from "../store.ts";
 import { fold } from "./copies.ts";
 import { ignoresCase, isEffectivelyEmpty, isFinderLitter } from "./state.ts";
@@ -486,6 +487,27 @@ function groupAlive(group: number): boolean {
   }
 }
 
+// Whether the vault can be seen to hold none of this update's work: HEAD is still the
+// record's own `from`, and the worktree matches it. Then a repair would write nothing, the
+// record protects nothing, and the status may offer deleting it. Anything else, a check
+// that could not answer included, means the record may be the only thing that lets the
+// next cycle finish a half-applied update, and the status must not offer deleting it: the
+// snapshot after such a delete would send what the update left as the user's own change.
+//
+// diff-index and an empty attribute source are what make this safe to ask beside an update
+// that may still be running (measured, git 2.50.1): diff-index judges against the index
+// without refreshing or rewriting it, where `git diff` rewrites the index, and the empty
+// attribute source means the vault's own .gitattributes declares no filter here, so no
+// clean filter runs. With no filter a file's hash is its blob id, so the answer is exact
+// for a vault that has none; where a filter rewrites content the hashes differ and this
+// answers "may hold work", which is the side that withholds the offer.
+async function nothingApplied(dir: string, record: Record_): Promise<boolean> {
+  const head = await git(["rev-parse", "-q", "--verify", "HEAD^{commit}"], { cwd: dir });
+  if (head.code !== 0 || head.timedOut || head.stdout.trim() !== record.from) return false;
+  const clean = await git([`--attr-source=${EMPTY_TREE}`, "diff-index", "--quiet", record.from, "--"], { cwd: dir });
+  return clean.code === 0 && !clean.timedOut;
+}
+
 export interface RunningUpdate {
   // The update's process group, which the status names.
   group: number;
@@ -497,9 +519,13 @@ export interface RunningUpdate {
   // derived instant cannot tell apart from one. The wait happens either way; this decides
   // how loudly it is reported, and whether the way out below is offered.
   thisBoot: boolean;
-  // The record file. Deleting it is the user's way out of a wait on a process that is not
-  // this update, so the status names it whenever the boot stamp does not match.
+  // The record file, which the status names whenever the boot stamp does not match: either
+  // to offer deleting it, or to say it must not be deleted.
   record: string;
+  // Whether deleting the record would lose nothing (nothingApplied above). Only ever asked
+  // for a stamp that is not this boot's, which is the only line that offers a way out; it
+  // is false wherever the answer is not a confident yes, the ordinary wait included.
+  safeToDelete: boolean;
 }
 
 // The live update that may still be running, or null: no record, a record with no group,
@@ -511,16 +537,18 @@ export interface RunningUpdate {
 // the two failure modes pull opposite ways, and waiting on a recycled id after a reboot
 // only strands sync until the user deletes the record, while going ahead during a clock
 // step loses notes. So the stamp is reported, never obeyed.
-export async function runningUpdate(stateDir: string): Promise<RunningUpdate | null> {
+export async function runningUpdate(stateDir: string, dir: string): Promise<RunningUpdate | null> {
   const path = join(stateDir, RECORD);
   const record = await readRecord(path);
   if (record?.group === undefined) return null;
   if (!groupAlive(record.group)) return null;
+  const thisBoot = record.boot !== undefined && Math.abs(bootInstant() - record.boot) <= BOOT_TOLERANCE_MS;
   return {
     group: record.group,
     runningMs: Math.max(0, Date.now() - (record.startedAt ?? Date.now())),
-    thisBoot: record.boot !== undefined && Math.abs(bootInstant() - record.boot) <= BOOT_TOLERANCE_MS,
+    thisBoot,
     record: path,
+    safeToDelete: thisBoot ? false : await nothingApplied(dir, record),
   };
 }
 

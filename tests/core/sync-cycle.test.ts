@@ -953,6 +953,83 @@ test("a read of remote-seen that has to be killed is 'could not tell', never 'th
   assert.equal((await cycle(remote, a)).outcome, "synced", "and the next cycle runs normally");
 });
 
+// A1 (round 2): the notify's way out must never be one that disables recovery. Following
+// "delete the record" while the vault is half updated makes finishInterrupted return null,
+// and the next snapshot sends what the interrupted update left - a note it had unlinked, a
+// partial write - as the user's own change. The cycle, not the user, decides whether a
+// delete is safe, and it only ever says so when the record protects nothing.
+test("a stale group over a half-updated vault is never told to delete the record, and the repair still sets the damage back rather than publishing it", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/s.md", "s from a\n");
+  await writeRel(a.projects, "x/t.md", "t from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  const pushedByA = await gitOk(["rev-parse", "main"], { cwd: remote });
+  // git writes x/s.md, unlinks x/t.md, then its smudge fails: real damage on disk.
+  for (const [key, value] of [["filter.bad.clean", "cat"], ["filter.bad.smudge", "false"], ["filter.bad.required", "true"]]) {
+    await gitOk(["config", key ?? "", value ?? ""], { cwd: b.projects });
+  }
+  await writeFile(join(b.projects, ".git", "info", "attributes"), "x/t.md filter=bad\n");
+  const failed = await cycle(remote, b);
+  assert.equal(failed.outcome, "unsynced", failed.reason ?? "");
+  assert.match(failed.reason ?? "", /updating the vault failed/);
+  assert.ok(await absent(b, "x/t.md"), "the failed update left the vault half applied");
+
+  // A live process that is not this update, under a boot stamp that is not this one.
+  const alive = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  alive.unref();
+  const group = alive.pid ?? 0;
+  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group, boot: bootInstant() - 86_400_000, startedAt: Date.now() }));
+  const waiting = await cycle(remote, b);
+  assert.equal(waiting.reason, "an earlier vault update is still running", waiting.reason ?? "");
+  assert.equal(waiting.waiting?.safeToDelete, false, "the vault is half updated, so no delete is safe");
+  const [line] = statusFromCycle(waiting);
+  assert.equal(line?.level, "error");
+  assert.doesNotMatch(line?.text ?? "", /so deleting .* also lets sync carry on/, "no delete is offered");
+  assert.match(line?.text ?? "", new RegExp(`\`ps -g ${group}\` shows what it is; if it is not this vault's update, ending it lets sync carry on by itself\\.`));
+  assert.match(line?.text ?? "", /Do not delete .*: it is what lets the next sync finish an update that stopped part way/);
+  assert.equal(waiting.committed, null, "and nothing is snapshotted while it waits");
+
+  // The advice the line does give: end that process, and sync carries on by itself.
+  await endHelper(alive, "group");
+  await gitOk(["config", "filter.bad.smudge", "cat"], { cwd: b.projects });
+  const after = await cycle(remote, b);
+  assert.equal(after.outcome, "synced", after.reason ?? "");
+  assert.deepEqual(after.notices, ["finished an interrupted vault update; 2 files set back to update again"]);
+  assert.equal(after.committed, null, "the update's own work is never snapshotted as this machine's change");
+  assert.equal(await read(b, "x/t.md"), "t from a\n", "the note the failed update had unlinked is back");
+  assert.equal(await read(b, "x/s.md"), "s from a\n");
+  assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), pushedByA, "and nothing of the damage reached the remote");
+});
+
+test("a stale group over a vault that holds none of the update's work is told the record can go, and deleting it lets the next cycle sync", async () => {
+  const { remote, m } = await setup(["a", "b"]);
+  const [a, b] = m as [Machine, Machine];
+  await writeRel(a.projects, "x/t.md", "from a\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  // A record naming an update that never wrote anything: HEAD is still its `from`, and
+  // the vault matches it. A session that died between the record and git's first write
+  // leaves exactly this.
+  await fingerprintFree(remote, b);
+  const alive = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  alive.unref();
+  const group = alive.pid ?? 0;
+  await writeRel(b.state, RECORD, JSON.stringify({ ...(await recordOf(b)), group, boot: bootInstant() - 86_400_000, startedAt: Date.now() }));
+  const waiting = await cycle(remote, b);
+  assert.equal(waiting.reason, "an earlier vault update is still running", waiting.reason ?? "");
+  assert.equal(waiting.waiting?.safeToDelete, true, "nothing of that update reached the vault");
+  const [line] = statusFromCycle(waiting);
+  assert.equal(line?.level, "error");
+  assert.ok((line?.text ?? "").endsWith(`Nothing of that update has reached the vault, so deleting ${quoted(join(b.state, RECORD))} also lets sync carry on.`), line?.text);
+  assert.doesNotMatch(line?.text ?? "", /Do not delete/);
+  // Following that advice, with the process still alive, is safe and lets sync finish.
+  await rm(join(b.state, RECORD));
+  const after = await cycle(remote, b);
+  assert.equal(after.outcome, "synced", after.reason ?? "");
+  assert.equal(await read(b, "x/t.md"), "from a\n");
+  await endHelper(alive, "group");
+});
+
 // B3 (the gauntlet fix wave): show-ref answers 1 for a ref it cannot look up and 2 for one
 // that is not there. Any other exit says nothing about the ref, so it must not be read as
 // "the ref is corrupt, delete it" - that is the one command that turns off the force-push
@@ -2539,7 +2616,7 @@ test("a record naming a process group that is gone is repaired like any other, a
 // os.uptime(), so a wall-clock correction larger than the tolerance reads as another
 // boot; on Linux /proc/uptime is boot-based, so a clock step moves it there too. A live
 // group is therefore always waited for, and the stamp only decides how loudly.
-test("a live group stamped with another boot (a reboot, or a clock stepped since) is still waited for: nothing is repaired or snapshotted, and the notify says which file to delete to carry on", async () => {
+test("a live group stamped with another boot (a reboot, or a clock stepped since) is still waited for: nothing is repaired or snapshotted, and the notify says how to look at that process", async () => {
   const { remote, b, slow } = await behindSlowFilter("sleep 10; cat", 500);
   assert.equal((await runCycle(slow)).outcome, "unsynced");
   const pushed = await gitOk(["rev-parse", "main"], { cwd: remote });
@@ -2562,10 +2639,13 @@ test("a live group stamped with another boot (a reboot, or a clock stepped since
   assert.match(
     line?.text ?? "",
     new RegExp(
-      `^unsynced: an earlier vault update is still running \\(process group ${group}, \\d+ s so far\\), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else\\. Sync waits for it\\. If it is not that update, delete `,
+      `^unsynced: an earlier vault update is still running \\(process group ${group}, \\d+ s so far\\), but its record is from an earlier boot of this machine, or from before its clock was corrected: the process holding that id may be something else\\. Sync waits for it\\. \`ps -g ${group}\` shows what it is; if it is not this vault's update, ending it lets sync carry on by itself\\. `,
     ),
   );
-  assert.ok((line?.text ?? "").endsWith(`delete ${quoted(join(b.state, RECORD))} to let sync carry on`), line?.text);
+  // A2 of round 2: this vault is half updated, so the record is the only thing that can
+  // still repair it and the line must not offer deleting it.
+  assert.equal(waiting.waiting?.safeToDelete, false);
+  assert.ok((line?.text ?? "").endsWith(`Do not delete ${quoted(join(b.state, RECORD))}: it is what lets the next sync finish an update that stopped part way, and without it the changes that update left would be sent as yours.`), line?.text);
   // Once that process is gone the record is judged as any other: the repair runs.
   await endHelper(alive, "group");
   await gitOk(["config", "--unset", "filter.slow.smudge"], { cwd: b.projects });

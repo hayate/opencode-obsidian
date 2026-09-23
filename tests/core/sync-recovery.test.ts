@@ -1033,13 +1033,13 @@ test("where the platform has no process groups the check answers gone, so nothin
   alive.unref();
   const group = alive.pid ?? 0;
   await recordIntent(w.state, w.from, w.to, group);
-  const running = await runningUpdate(w.state);
+  const running = await runningUpdate(w.state, w.dir);
   assert.equal(running?.group, group, "alive on this platform");
   assert.ok((running?.runningMs ?? -1) >= 0 && (running?.runningMs ?? Infinity) < 5000, `just started: ${running?.runningMs} ms`);
   const platform = process.platform;
   Object.defineProperty(process, "platform", { value: "win32", configurable: true });
   try {
-    assert.equal(await runningUpdate(w.state), null);
+    assert.equal(await runningUpdate(w.state, w.dir), null);
   } finally {
     Object.defineProperty(process, "platform", { value: platform, configurable: true });
   }
