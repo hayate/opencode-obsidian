@@ -82,3 +82,17 @@ test("addDays crosses month and year boundaries", () => {
   assert.equal(addDays("2026-01-01", -1), "2025-12-31");
   assert.equal(addDays("2026-09-21", -7), "2026-09-14");
 });
+
+// An exported but empty TZ makes node report "Etc/Unknown", a zone Intl itself refuses:
+// every stamp the cycle writes would throw, and every sync would abort.
+test("a system zone Intl refuses (an empty TZ reads as Etc/Unknown) falls back to UTC", () => {
+  const saved = process.env.TZ;
+  try {
+    process.env.TZ = "";
+    assert.equal(Intl.DateTimeFormat().resolvedOptions().timeZone, "Etc/Unknown", "the premise: node reads an empty TZ so");
+    assert.equal(systemTimezone(), "UTC");
+  } finally {
+    if (saved === undefined) delete process.env.TZ;
+    else process.env.TZ = saved;
+  }
+});

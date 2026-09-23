@@ -79,8 +79,8 @@ mutate("core/project.ts", "  if (!trimmed) throw new UnreadableClaimError", "  i
 mutate("core/project.ts", "    throw new UnreadableClaimError(`${shown} cannot be read (${why}): fix or remove this file, then retry`);", "    return null;", P)
 mutate("core/session.ts", "    const project = await resolveSafely(vault, opts.sessionDir);\n    shared.resolved = project;", "    const project = early;\n    shared.resolved = project;", SE)
 mutate("core/session.ts", "    shared.resolved = project;\n", "", SE)
-mutate("core/session.ts", 'join(stateDir, "prepare.lock")', "join(stateDir, `prepare-${opts.sessionId}.lock`)", SE)
-mutate("core/session.ts", "    if (cfg.remote) {\n      const vis = await remoteVisibility(cfg.remote);", "    if (false) {\n      const vis = await remoteVisibility(cfg.remote);", SE, network=True)
+mutate("core/session.ts", 'join(stateDir, "prepare.lock")', "join(stateDir, `prepare-${Math.random()}.lock`)", SE)
+mutate("core/session.ts", "    if (cfg.remote && vis) {", "    if (false) {", SE, network=True)
 # The gauntlet fix wave.
 mutate("core/secrets.ts", "    if (oldLeft === 0 && newLeft === 0) {\n      if (line.startsWith(\"+++ \")) file = diffPath(line);", "    if (line.startsWith(\"+++ \")) { file = diffPath(line); continue; }\n    if (oldLeft === 0 && newLeft === 0) {\n      if (line.startsWith(\"+++ \")) file = diffPath(line);", SEC)
 mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit", "-q", "--no-verify", "-m", message]', '[...NO_SIGN, "commit", "-q", "-m", message]', C, pattern='a pre-commit hook cannot add unscanned content to the snapshot')
@@ -555,9 +555,9 @@ mutate("core/session.ts", '      level: streak === null || streak >= ESCALATE_AT
        pattern="statusFromCycle turns every non-clean outcome")
 mutate(CY, "    if (reset.lockNote) result.notices.push(reset.lockNote);\n", "", C, pattern="the note about the index.lock")
 mutate("core/git.ts", "      result.lockNote = note;\n", "", C, pattern="the note about the index.lock")
-mutate("core/session.ts", "      if (released !== null && prepared.err instanceof Error) prepared.err.message = `${prepared.err.message}; ${released}`;\n", "", SE,
+mutate("core/session.ts", "    if (released !== null && prepared.err instanceof Error) prepared.err.message = `${prepared.err.message}; ${released}`;\n", "", SE,
        pattern="prepare that fails while the lock")
-mutate("core/session.ts", '    if (released !== null) out.push({ level: "warn", text: released });\n', "", SE, pattern="prepare lock that cannot be released")
+mutate("core/session.ts", '  if (released !== null) out.push({ level: "warn", text: released });\n', "", SE, pattern="prepare lock that cannot be released")
 
 # D1 (the gauntlet fix wave): the intent record is the one file on the branch whose absence
 # loses work already on disk, so it is written durably. What the two flushes guarantee is
@@ -641,3 +641,19 @@ mutate("core/session.ts", 'const how = streak === null ? " (and how many cycles 
        'const how = streak !== null && streak > 1 ? ` (${streak} cycles in a row)` : "";', C, pattern="blocked-cycle count that")
 mutate("core/session.ts", "      level: streak === null || streak >= ESCALATE_AT ? \"error\" : \"warn\",", '      level: streak !== null && streak >= ESCALATE_AT ? "error" : "warn",', C,
        pattern="blocked-cycle count that")
+
+# The session's later syncs (syncSession, idleSession, the settled context): the privacy
+# refusal, remember_sync's adopt option reaching the cycle, no sync on idle when sync is off,
+# the journal before the sync and past the quiet window, and a context the pull changed.
+mutate("core/vault.ts", '  return isValidTimezone(zone) ? zone : "UTC";', "  return zone;", V, pattern="Etc/Unknown")
+mutate("core/session.ts", '    if (ctx.remote && vis?.visibility === "public") return statusFromPrivacy(ctx.remote, vis);\n', "", SE, pattern="privacy check found public")
+mutate("core/session.ts", "stateDir, machine, timezone, adoptRewrite: input.adoptRewrite }", "stateDir, machine, timezone }", SE, pattern="adopt option")
+mutate("core/session.ts", "      adoptRewrite: opts.adoptRewrite,\n", "", SE, pattern="adopt option")
+mutate("core/session.ts", "  if (ctx.remote === null) return out;\n", "", SE, pattern="with sync off only journals")
+mutate("core/session.ts", "    opts.sessionId,\n  );\n  try {", "    `${opts.sessionId}-x`,\n  );\n  try {", SE, pattern="once per cooldown")
+# The journal is bounded: past the wait the sync goes ahead, says so, and a late failure is let go.
+mutate("core/session.ts", "      out.push({ level: \"warn\", text: `journal: the model did not answer within", "      void ({ level: \"warn\", text: `journal: the model did not answer within", SE, pattern="never answers syncs anyway")
+mutate("core/session.ts", "  await new Promise((resolve) => setTimeout(resolve, opts.quietMs ?? QUIET_MS + 500));\n", "", SE, pattern="past the quiet window")
+mutate("core/session.ts", "later.kind === \"ok\" && later.name === ctx.project ? { ...ctx", "later.kind === \"ok\" ? { ...ctx", SE, pattern="maps to another folder")
+mutate("core/session.ts", "    shared.resolved = project;\n    markPulled();\n", "    shared.resolved = project;\n", SE, pattern="does not wait for the journal")
+mutate("core/session.ts", "? { ...ctx, timezone: started.shared.timezone } : null", "? ctx : null", SE, pattern="settled context carries the zone")

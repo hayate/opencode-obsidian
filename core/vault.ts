@@ -44,8 +44,11 @@ export async function resolveVault(env: Record<string, string | undefined> = pro
   return { root, projectsDir: join(root, "Projects") };
 }
 
+// This machine's zone as Intl reports it, or UTC when Intl reports one it then refuses (an
+// exported but empty TZ reads as "Etc/Unknown"): every stamp would throw on it.
 export function systemTimezone(): string {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return isValidTimezone(zone) ? zone : "UTC";
 }
 
 export function isValidTimezone(timeZone: string): boolean {
