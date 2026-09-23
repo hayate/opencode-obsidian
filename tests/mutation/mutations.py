@@ -569,8 +569,9 @@ mutate("core/sync/recovery.ts", "  return writeDurable(join(stateDir, RECORD), J
 mutate("core/store.ts", "    await handle.sync();\n  } finally {\n    await handle.close();\n  }\n  try {\n    await rename(tmp, path);", "  } finally {\n    await handle.close();\n  }\n  try {\n    await rename(tmp, path);",
        "tests/core/store.test.ts", pattern="writeDurable", survives=("linux", "darwin"),
        why="a flush to the platter is not observable from node: what it guarantees appears only across a power loss")
-mutate("core/store.ts", "    await flush(dir);\n    return null;\n", "    return null;\n", "tests/core/store.test.ts", pattern="writeDurable", survives=("linux", "darwin"),
-       why="a flush to the platter is not observable from node: what it guarantees appears only across a power loss")
+# The directory's own flush is observable after all: the degrade test beside it stages a
+# directory that cannot be opened, and without the flush nothing there fails.
+mutate("core/store.ts", "    await flush(dir);\n    return null;\n", "    return null;\n", "tests/core/store.test.ts", pattern="directory cannot be flushed")
 mutate("core/store.ts", "    await rm(tmp, { force: true });\n    throw err;\n  }\n  try {\n    await flush(dir);", "    throw err;\n  }\n  try {\n    await flush(dir);",
        "tests/core/store.test.ts", pattern="temp sibling with it and throws")
 
@@ -637,6 +638,6 @@ mutate("core/session.ts", "      out.push({ level: \"warn\", text: `journal roll
 mutate(CY, "  result.blockedCycles = streak === null ? null : streak + 1;", "  result.blockedCycles = (streak ?? ESCALATE_AT - 1) + 1;", C, pattern="blocked-cycle count that")
 mutate(CY, "  await writeBlocked(input.stateDir, (streak ?? 0) + 1);", "  await writeBlocked(input.stateDir, result.blockedCycles ?? 0);", C, pattern="blocked-cycle count that cannot be read")
 mutate("core/session.ts", 'const how = streak === null ? " (and how many cycles in a row that is could not be read)" : streak > 1 ? ` (${streak} cycles in a row)` : "";',
-       'const how = streak !== null && streak > 1 ? ` (${streak} cycles in a row)` : "";', SE, pattern="statusFromCycle turns every non-clean outcome")
+       'const how = streak !== null && streak > 1 ? ` (${streak} cycles in a row)` : "";', C, pattern="blocked-cycle count that")
 mutate("core/session.ts", "      level: streak === null || streak >= ESCALATE_AT ? \"error\" : \"warn\",", '      level: streak !== null && streak >= ESCALATE_AT ? "error" : "warn",', C,
        pattern="blocked-cycle count that")

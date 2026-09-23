@@ -1022,7 +1022,15 @@ test("a stale group over a vault that holds none of the update's work is told th
   assert.equal(line?.level, "error");
   assert.ok((line?.text ?? "").endsWith(`Nothing of that update has reached the vault, so deleting ${quoted(join(b.state, RECORD))} also lets sync carry on.`), line?.text);
   assert.doesNotMatch(line?.text ?? "", /Do not delete/);
+  // A record whose own `from` is no longer HEAD is a different matter: the repair cannot
+  // judge it at all any more, so nothing about it is offered as harmless.
+  await gitOk(["commit", "-q", "--allow-empty", "-m", "by hand"], { cwd: b.projects });
+  const moved = await cycle(remote, b);
+  assert.equal(moved.waiting?.safeToDelete, false, "HEAD is no longer the record's own from");
+  assert.match(statusFromCycle(moved)[0]?.text ?? "", /Do not delete /);
+  await gitOk(["reset", "-q", "--hard", "HEAD~1"], { cwd: b.projects });
   // Following that advice, with the process still alive, is safe and lets sync finish.
+  assert.equal((await cycle(remote, b)).waiting?.safeToDelete, true, "and it is offered again once the history is back");
   await rm(join(b.state, RECORD));
   const after = await cycle(remote, b);
   assert.equal(after.outcome, "synced", after.reason ?? "");
