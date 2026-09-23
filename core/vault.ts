@@ -33,7 +33,7 @@ async function isDirectory(path: string): Promise<boolean> {
 export async function resolveVault(env: Record<string, string | undefined> = process.env): Promise<Vault> {
   const raw = env.OBSIDIAN_VAULT_PATH?.trim();
   if (!raw) {
-    throw new VaultError("OBSIDIAN_VAULT_PATH is not set: set it to the absolute path of your Obsidian vault");
+    throw new VaultError("OBSIDIAN_VAULT_PATH is not set: this plugin needs it set to the absolute path of your Obsidian vault");
   }
   if (!isAbsolute(raw)) throw new VaultError(`OBSIDIAN_VAULT_PATH must be absolute, got "${raw}"`);
   if (!(await isDirectory(raw))) throw new VaultError(`OBSIDIAN_VAULT_PATH "${raw}" does not exist or is not a directory`);

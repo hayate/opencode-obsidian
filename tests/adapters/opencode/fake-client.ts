@@ -39,6 +39,7 @@ export class FakeClient implements OpenCodeClient {
   deleted: string[] = [];
   prompted: Prompted[] = [];
   toasts: Array<{ message: string; variant: string }> = [];
+  logs: Array<{ service: string; level: string; message: string }> = [];
   // No TUI (headless opencode run): every toast is refused.
   toastFails = false;
   private next = 0;
@@ -78,6 +79,13 @@ export class FakeClient implements OpenCodeClient {
   };
 
   tool: OpenCodeClient["tool"] = { ids: () => ok(this.toolIds) };
+
+  app: OpenCodeClient["app"] = {
+    log: (o) => {
+      this.logs.push({ service: o.body.service, level: o.body.level, message: o.body.message });
+      return ok(true);
+    },
+  };
 
   tui: OpenCodeClient["tui"] = {
     showToast: (o) => {

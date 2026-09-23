@@ -27,6 +27,7 @@ export interface OpenCodeClient {
   tool: { ids(): Result<string[]> };
   config: { get(): Result<{ model?: string; small_model?: string }> };
   tui: { showToast(o: { body: { title?: string; message: string; variant: "info" | "success" | "warning" | "error" } }): Result<unknown> };
+  app: { log(o: { body: { service: string; level: "debug" | "info" | "warn" | "error"; message: string } }): Result<unknown> };
 }
 
 // A failure as text: an Error as its message; any other object (the error body the SDK parsed,
@@ -206,5 +207,10 @@ export class OpenCodeHarness implements Harness {
   // status reaches the model and the next session's payload.
   async notify(message: string): Promise<void> {
     await data(this.client.tui.showToast({ body: { title: "superpower-remember-obsidian", message, variant: "error" } }), "showing a toast");
+  }
+
+  // OpenCode's own log, which keeps what a toast sent too early would lose.
+  async logError(message: string): Promise<void> {
+    await data(this.client.app.log({ body: { service: "superpower-remember-obsidian", level: "error", message } }), "writing to the OpenCode log");
   }
 }

@@ -173,3 +173,8 @@ together.
 - **A session says memory and sync are disabled.** The line says why: the
   vault variable is missing or points at a folder without `.obsidian/`, the
   repository is bare, or one of the procedures above applies.
+- **The vault is missing or unusable.** `OBSIDIAN_VAULT_PATH` is the one setting
+  the plugin cannot work without, so it says so as soon as it loads, before any
+  message: an error in OpenCode's log straight away, and a toast once the TUI is
+  up. The first message says it again. `OBSIDIAN_PROJECTS_REMOTE` is different:
+  leaving it unset only turns sync off.

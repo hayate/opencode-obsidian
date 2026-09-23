@@ -24,7 +24,7 @@ test("resolveVault returns the real path and its Projects dir", async () => {
 test("resolveVault fails loudly: unset, relative, missing, not a vault", async () => {
   const notVault = await tempDir();
   const cases: Array<[Record<string, string | undefined>, RegExp]> = [
-    [{}, /is not set/],
+    [{}, /^OBSIDIAN_VAULT_PATH is not set: this plugin needs it set to the absolute path of your Obsidian vault$/],
     [{ OBSIDIAN_VAULT_PATH: "   " }, /is not set/],
     [{ OBSIDIAN_VAULT_PATH: "relative/vault" }, /must be absolute/],
     [{ OBSIDIAN_VAULT_PATH: join(notVault, "missing") }, /does not exist/],

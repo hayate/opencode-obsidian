@@ -4,6 +4,9 @@ import type { PluginInput } from "@opencode-ai/plugin";
 import plugin, { assemble, BOOTSTRAP, rememberSync, SuperpowerRememberObsidian } from "../../../adapters/opencode/index.ts";
 import { PAYLOAD_MARKER } from "../../../core/inject.ts";
 import { FakeClient } from "./fake-client.ts";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { tempDir } from "../../core/helpers.ts";
 import type { Message } from "../../../adapters/opencode/sessions.ts";
 
 // The plugin reads process.env: no test may ever reach the vault of the machine it runs on.
@@ -14,6 +17,10 @@ async function hooks(client: FakeClient) {
   // The tests' fake client stands in for the SDK client; nothing else of PluginInput is read.
   return SuperpowerRememberObsidian({ client, directory: "/code" } as unknown as PluginInput, { journalModel: "p/m" });
 }
+
+// These tests run with no vault, so the plugin's load-time toast (tested below) is left out of
+// counts that are about something else.
+const besidesVault = (toasts: Array<{ message: string }>) => toasts.filter((t) => !t.message.startsWith("memory and sync are off: "));
 
 function user(sessionID: string): Message[] {
   return [{ info: { id: "u1", sessionID, role: "user" }, parts: [{ id: "p1", sessionID, messageID: "u1", type: "text", text: "hello" }] }];
@@ -58,7 +65,7 @@ test("a hook never throws into OpenCode: a failure is told to the user", async (
   assert.match(client.toasts[0]?.message ?? "", /^loading project memory failed: /);
   await h.event?.({ event: { type: "session.idle", properties: { sessionID: "never-seen" } } } as never);
   await h.event?.({ event: { type: "session.created", properties: {} } } as never);
-  assert.equal(client.toasts.length, 1);
+  assert.equal(besidesVault(client.toasts).length, 1);
 });
 
 test("remember_sync adopts a rewritten remote only when the adopt option is given as true", async () => {
@@ -103,5 +110,60 @@ test("a malformed session.deleted event never throws into OpenCode", async () =>
   const client = new FakeClient();
   const h = await hooks(client);
   await h.event?.({ event: { type: "session.deleted", properties: {} } } as never);
-  assert.deepEqual(client.toasts.map((t) => t.message).filter((m) => !/failed/.test(m)), []);
+  assert.deepEqual(besidesVault(client.toasts).map((t) => t.message).filter((m) => !/failed/.test(m)), []);
+});
+
+// Measured with the real TUI (2026-09-23, OpenCode 1.18.32, 5 runs each): a toast sent while the
+// plugin loads is never drawn; one sent on the first event that is not the TUI's own always is.
+// A tui.* event can come first (another plugin's toast at load), and is not that signal.
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+async function until(what: string, cond: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !cond(); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(cond(), `timed out waiting for ${what}`);
+}
+
+test("a missing vault is told as the plugin loads: logged at once, and a toast on the first event that is not the TUI's own", async () => {
+  const client = new FakeClient();
+  const h = await hooks(client);
+  await settle();
+  assert.deepEqual(client.logs, [
+    { service: "superpower-remember-obsidian", level: "error", message: "memory and sync are off: OBSIDIAN_VAULT_PATH is not set: this plugin needs it set to the absolute path of your Obsidian vault" },
+  ]);
+  assert.deepEqual(client.toasts, [], "nothing is drawn yet: the TUI may not be listening");
+  await h.event?.({ event: { type: "tui.toast.show", properties: {} } } as never);
+  assert.deepEqual(client.toasts, []);
+  await h.event?.({ event: { type: "plugin.added", properties: {} } } as never);
+  await h.event?.({ event: { type: "catalog.updated", properties: {} } } as never);
+  assert.deepEqual(client.toasts, [{ message: client.logs[0]?.message ?? "", variant: "error" }], "once");
+});
+
+test("a usable vault is not told at load", async () => {
+  const vault = await tempDir();
+  await mkdir(join(vault, ".obsidian"));
+  process.env.OBSIDIAN_VAULT_PATH = vault;
+  try {
+    const client = new FakeClient();
+    const h = await hooks(client);
+    await h.event?.({ event: { type: "plugin.added", properties: {} } } as never);
+    // The check reads the disk; give it far longer than it takes before saying nothing came.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual([client.logs, client.toasts], [[], []]);
+  } finally {
+    delete process.env.OBSIDIAN_VAULT_PATH;
+  }
+});
+
+test("a vault path that is not a vault is told at load with core's own reason", async () => {
+  process.env.OBSIDIAN_VAULT_PATH = await tempDir(); // a directory with no .obsidian/
+  try {
+    const client = new FakeClient();
+    const h = await hooks(client);
+    await until("the log", () => client.logs.length > 0);
+    await h.event?.({ event: { type: "plugin.added", properties: {} } } as never);
+    await until("the toast", () => client.toasts.length > 0);
+    assert.match(client.logs[0]?.message ?? "", /^memory and sync are off: OBSIDIAN_VAULT_PATH ".*" is not an Obsidian vault \(no \.obsidian\/ folder\)$/);
+    assert.equal(client.toasts[0]?.message, client.logs[0]?.message);
+  } finally {
+    delete process.env.OBSIDIAN_VAULT_PATH;
+  }
 });

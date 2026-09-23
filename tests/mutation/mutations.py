@@ -758,6 +758,16 @@ mutate(OI, "option === undefined ? undefined : String(option)", "undefined", AI,
 mutate(OI, '        report("loading project memory", err);', "        throw err;", AI, pattern="never throws")
 mutate(OI, "        return message;\n", "        throw err;\n", AI, pattern="fails answers")
 mutate(OI, "        await notify(message).catch(() => undefined);", "        await notify(message);", AI, pattern="toast fails too")
+# The vault is told as the plugin loads: the log at once, the toast on the first event that is not
+# the TUI's own, once; a usable vault is not told.
+mutate(OI, '    if (told || eventType.startsWith("tui.")) return;', "    if (told) return;", AI, pattern="told as the plugin loads")
+mutate(OI, "    told = true;\n", "", AI, pattern="told as the plugin loads")
+mutate(OI, "  void problem.then((p) => (p === null ? undefined : harness.logError(p))).catch(() => undefined);\n", "", AI, pattern="told as the plugin loads")
+mutate(OI, "    void problem.then((p) => (p === null ? undefined : harness.notify(p))).catch(() => undefined);\n", "", AI, pattern="told as the plugin loads")
+mutate(OI, "        tellVault(event.type);\n", "", AI, pattern="told as the plugin loads")
+mutate(OI, "    () => null,\n", '    () => "memory and sync are off: fine",\n', AI, pattern="usable vault is not told")
+mutate(OI, "const problem = resolveVault(env).then(", "const problem = resolveVault({}).then(", AI, pattern="not a vault is told at load")
+mutate("core/vault.ts", "this plugin needs it set to the absolute path", "set it to the absolute path", "tests/core/vault.test.ts")
 
 # The journal (gauntlet fix pass): one run per session in this process, and the position merged
 # under the machine's lock, never replacing a later one.
