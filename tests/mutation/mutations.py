@@ -549,9 +549,9 @@ mutate("core/sync/state.ts", '  if (r.code !== 0 || r.timedOut) throw new Error(
        pattern="a core.ignorecase lookup that fails")
 mutate("core/sync/state.ts", 'throw new Error(`git config core.ignorecase failed: ${r.stderr.trim() || (r.timedOut ? "timed out" : `exit ${r.code}`)}`);',
        "throw new Error(`git config core.ignorecase failed: ${r.stderr.trim()}`);", C, pattern="a core.ignorecase lookup that fails")
-mutate(CY, '    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;\n    return ESCALATE_AT - 1;\n', "    return 0;\n", C, pattern="blocked-cycle count that")
-mutate(CY, "return /^[0-9]{1,9}$/.test(text) ? Number(text) : ESCALATE_AT - 1;", "return Number(text) || 0;", C, pattern="blocked-cycle count that cannot be read")
-mutate("core/session.ts", 'level: r.blockedCycles >= ESCALATE_AT ? "error" : "warn",', 'level: r.blockedCycles > ESCALATE_AT ? "error" : "warn",', SE,
+mutate(CY, '    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;\n    return null;\n', "    return 0;\n", C, pattern="blocked-cycle count that")
+mutate(CY, "return /^[0-9]{1,9}$/.test(text) ? Number(text) : null;", "return Number(text) || 0;", C, pattern="blocked-cycle count that cannot be read")
+mutate("core/session.ts", '      level: streak === null || streak >= ESCALATE_AT ? "error" : "warn",', '      level: streak === null || streak > ESCALATE_AT ? "error" : "warn",', SE,
        pattern="statusFromCycle turns every non-clean outcome")
 mutate(CY, "    if (reset.lockNote) result.notices.push(reset.lockNote);\n", "", C, pattern="the note about the index.lock")
 mutate("core/git.ts", "      result.lockNote = note;\n", "", C, pattern="the note about the index.lock")
@@ -623,3 +623,20 @@ mutate(CY, "    if (err.result.lockNote) result.notices.push(err.result.lockNote
 mutate(CY, ' || err.args[0] !== "add"', ' || err.args[0] === "add"', C, pattern=SNAP_ADD)
 mutate("core/store.ts", "    return `flushing ${dir} failed: ${errorText(err)}`;", "    throw err;", "tests/core/store.test.ts", pattern="directory cannot be flushed")
 mutate(CY, "  if (unflushed !== null) {\n", "  if (false) {\n", C, pattern="a state directory that cannot be flushed")
+
+# C1 to C4 (round 2): the first push's two whole-vault calls get their own bound and say
+# which limit they hit; the adapter's own rejections render whatever they are; and a streak
+# the cycle could not read escalates without stating a count nobody has.
+mutate("core/sync/state.ts", "const FIRST_PUSH_TIMEOUT_MS = 10 * 60_000;", "const FIRST_PUSH_TIMEOUT_MS = 1;", S, pattern="an empty remote is bootstrapped|absent Projects/ is cloned")
+mutate("core/sync/state.ts", '  if (r.timedOut) return `it ran past ${limitMs / 60_000} min, the limit for ${what}`;\n', "", S, pattern="a first-push failure names the limit")
+mutate("core/sync/state.ts", "  return firstLines(r.stderr) || `git exited ${r.code}`;\n}", "  return firstLines(r.stderr);\n}", S, pattern="a first-push failure names the limit")
+mutate("core/session.ts", "      out.push({ level: \"warn\", text: `journal catch-up: ${errorText(err)}` });", '      out.push({ level: "warn", text: `journal catch-up: ${(err as Error).message}` });', SE,
+       pattern="a harness that rejects with something that is not an Error")
+mutate("core/session.ts", "      out.push({ level: \"warn\", text: `journal rollups: ${errorText(err)}` });", '      out.push({ level: "warn", text: `journal rollups: ${(err as Error).message}` });', SE,
+       pattern="a harness that rejects with something that is not an Error")
+mutate(CY, "  result.blockedCycles = streak === null ? null : streak + 1;", "  result.blockedCycles = (streak ?? ESCALATE_AT - 1) + 1;", C, pattern="blocked-cycle count that")
+mutate(CY, "  await writeBlocked(input.stateDir, (streak ?? 0) + 1);", "  await writeBlocked(input.stateDir, result.blockedCycles ?? 0);", C, pattern="blocked-cycle count that cannot be read")
+mutate("core/session.ts", 'const how = streak === null ? " (and how many cycles in a row that is could not be read)" : streak > 1 ? ` (${streak} cycles in a row)` : "";',
+       'const how = streak !== null && streak > 1 ? ` (${streak} cycles in a row)` : "";', SE, pattern="statusFromCycle turns every non-clean outcome")
+mutate("core/session.ts", "      level: streak === null || streak >= ESCALATE_AT ? \"error\" : \"warn\",", '      level: streak !== null && streak >= ESCALATE_AT ? "error" : "warn",', C,
+       pattern="blocked-cycle count that")

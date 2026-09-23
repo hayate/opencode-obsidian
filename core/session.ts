@@ -245,10 +245,14 @@ export function statusFromCycle(r: CycleResult): StatusItem[] {
     });
   }
   if (r.blockedBy.length) {
-    // Spec 5.4 step 5: after ESCALATE_AT blocked cycles in a row the status escalates (the adapter notifies on errors).
+    // Spec 5.4 step 5: after ESCALATE_AT blocked cycles in a row the status escalates (the
+    // adapter notifies on errors). A streak the cycle could not read escalates too, and
+    // says so: "(3 cycles in a row)" would be a count nobody has.
+    const streak = r.blockedCycles;
+    const how = streak === null ? " (and how many cycles in a row that is could not be read)" : streak > 1 ? ` (${streak} cycles in a row)` : "";
     out.push({
-      level: r.blockedCycles >= ESCALATE_AT ? "error" : "warn",
-      text: `live update blocked by local edits to: ${files(r.blockedBy)}${r.blockedCycles > 1 ? ` (${r.blockedCycles} cycles in a row)` : ""}`,
+      level: streak === null || streak >= ESCALATE_AT ? "error" : "warn",
+      text: `live update blocked by local edits to: ${files(r.blockedBy)}${how}`,
     });
   }
   return out.map((item) => ({ ...item, text: oneLine(item.text) }));
@@ -434,7 +438,9 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
       const caught = await catchUp(journal, others);
       for (const f of caught.failed) out.push({ level: "warn", text: `journal catch-up failed for session ${f.session}: ${f.error}` });
     } catch (err) {
-      out.push({ level: "warn", text: `journal catch-up: ${(err as Error).message}` });
+      // errorText: catchUp calls the adapter's readTranscript, which is the host's code
+      // and can reject with anything; `.message` on a non-Error renders "catch-up: undefined".
+      out.push({ level: "warn", text: `journal catch-up: ${errorText(err)}` });
     }
     try {
       await buildRollups({
@@ -450,7 +456,8 @@ async function start(opts: SessionOptions, now: () => Date): Promise<Start> {
           }),
       });
     } catch (err) {
-      out.push({ level: "warn", text: `journal rollups: ${(err as Error).message}` });
+      // errorText: buildRollups calls the adapter's callModel, the same way.
+      out.push({ level: "warn", text: `journal rollups: ${errorText(err)}` });
     }
     return { items: out, project };
   })();

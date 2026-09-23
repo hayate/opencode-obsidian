@@ -42,7 +42,10 @@ export interface CycleResult {
   pushed: boolean;
   liveUpdated: boolean;
   blockedBy: string[];
-  blockedCycles: number;
+  // How many cycles in a row ended blocked, this one included, or null when the count on
+  // disk could not be read at all. Null escalates as the threshold does, and the status
+  // says that rather than stating a number it does not have.
+  blockedCycles: number | null;
   conflicts: Conflict[];
   embedded: string[];
   caseCollisions: string[];
@@ -181,21 +184,22 @@ async function dropEmbeddedRepos(dir: string): Promise<string[]> {
 // says it louder at the threshold).
 export const ESCALATE_AT = 3;
 
-// The streak, or 0 when there is none yet. Only a count this code wrote reads as itself:
-// digits, nothing else, as readLadder reads its own file. A file that is not there is
-// "never blocked yet"; one that is there but cannot be read, or holds anything else, is
-// not, and reading it as 0 would silence the escalation the user needs for as long as it
-// stays that way. It counts as the rung below the threshold instead, so the next blocked
-// cycle escalates; every cycle that runs rewrites the file, so it costs at most that one.
-async function readBlocked(stateDir: string): Promise<number> {
+// The streak, 0 when there is none yet, or null when it could not be read. Only a count
+// this code wrote reads as itself: digits, nothing else, as readLadder reads its own file.
+// A file that is not there is "never blocked yet"; one that is there but cannot be read, or
+// holds anything else, is not, and reading it as 0 would silence the escalation the user
+// needs for as long as it stays that way. Null is what the cycle then reports: it escalates
+// as the threshold does, without claiming a number nobody has. The cycle writes the file
+// again either way, so an unreadable one costs at most that cycle.
+async function readBlocked(stateDir: string): Promise<number | null> {
   let text: string;
   try {
     text = await readFile(join(stateDir, "blocked-cycles"), "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
-    return ESCALATE_AT - 1;
+    return null;
   }
-  return /^[0-9]{1,9}$/.test(text) ? Number(text) : ESCALATE_AT - 1;
+  return /^[0-9]{1,9}$/.test(text) ? Number(text) : null;
 }
 
 async function writeBlocked(stateDir: string, count: number): Promise<void> {
@@ -677,7 +681,7 @@ const REFUSED =
 
 // Spec 5.4 step 5: the remote head now known, into the live repo's objects before
 // anything refers to it; then remote-seen; then the all-or-nothing reset.
-async function updateLive(clone: string, input: CycleInput, live: string, next: string, streak: number, ladder: Ladder, result: CycleResult): Promise<void> {
+async function updateLive(clone: string, input: CycleInput, live: string, next: string, streak: number | null, ladder: Ladder, result: CycleResult): Promise<void> {
   const dir = input.projectsDir;
   await gitOk(["update-ref", INTEGRATED, next], { cwd: clone });
   await gitOk(["fetch", "-q", clone, `+${INTEGRATED}:${INTEGRATED}`], { cwd: dir });
@@ -737,8 +741,11 @@ async function updateLive(clone: string, input: CycleInput, live: string, next: 
   }
   await clearInterrupted(input.stateDir);
   result.blockedBy = blocked;
-  result.blockedCycles = streak + 1;
-  await writeBlocked(input.stateDir, result.blockedCycles);
+  // Null stays null in the result, so the status says the count is unknown rather than
+  // inventing one; the file is written with what this cycle does know, so the next one has
+  // a count again.
+  result.blockedCycles = streak === null ? null : streak + 1;
+  await writeBlocked(input.stateDir, (streak ?? 0) + 1);
 }
 
 function describeFinished(done: Finished): string {

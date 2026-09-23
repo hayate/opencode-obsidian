@@ -1229,7 +1229,7 @@ test("a blocked live update counts consecutive cycles, for the escalation at 3",
   await writeRel(b.projects, "x/t.md", `t0\ntoken ${TOKEN}\n`);
   await writeRel(a.projects, "x/t.md", "t-from-a\n");
   await cycle(remote, a);
-  const counts: number[] = [];
+  const counts: Array<number | null> = [];
   for (let i = 0; i < 3; i++) counts.push((await cycle(remote, b)).blockedCycles);
   assert.deepEqual(counts, [1, 2, 3]);
   assert.deepEqual((await readdir(b.state)).filter((n) => n.endsWith(".sro-tmp")), []);
@@ -1255,9 +1255,13 @@ test("a blocked-cycle count that cannot be read escalates rather than silently s
   for (const garbled of ["", "x", "-1", "2.5", " 2", "2\n", "12345678901"]) {
     await writeRel(b.state, "blocked-cycles", garbled);
     const r = await cycle(remote, b);
-    assert.equal(r.blockedCycles, 3, JSON.stringify(garbled));
+    // C4 of round 2: it escalates, and says the count is unknown rather than stating one.
+    assert.equal(r.blockedCycles, null, JSON.stringify(garbled));
     assert.equal(statusFromCycle(r).at(-1)?.level, "error", JSON.stringify(garbled));
-    assert.match(statusFromCycle(r).at(-1)?.text ?? "", /\(3 cycles in a row\)$/);
+    assert.match(statusFromCycle(r).at(-1)?.text ?? "", / \(and how many cycles in a row that is could not be read\)$/);
+    assert.doesNotMatch(statusFromCycle(r).at(-1)?.text ?? "", /\d+ cycles in a row/, "never a count nobody has");
+    // The file is written again with what this cycle does know, so the next one counts.
+    assert.equal(await streak(b), "1", JSON.stringify(garbled));
   }
   // A count this code wrote still reads as itself.
   for (const [written, reads] of [["0", 1], ["4", 5], ["999999999", 1000000000]] as Array<[string, number]>) {
@@ -1284,8 +1288,9 @@ test(
       await chmod(join(b.state, "blocked-cycles"), 0o644).catch(() => undefined);
     }
     assert.deepEqual(r.blockedBy, ["x/t.md"], r.reason ?? "");
-    assert.equal(r.blockedCycles, 3, "an unreadable count is not 'never blocked yet'");
+    assert.equal(r.blockedCycles, null, "an unreadable count is not 'never blocked yet'");
     assert.equal(statusFromCycle(r).at(-1)?.level, "error");
+    assert.match(statusFromCycle(r).at(-1)?.text ?? "", / \(and how many cycles in a row that is could not be read\)$/);
   },
 );
 

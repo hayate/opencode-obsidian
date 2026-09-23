@@ -4,7 +4,7 @@
 import { randomBytes } from "node:crypto";
 import { lstat, readFile, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { git, gitOk, NETWORK_TIMEOUT_MS } from "../git.ts";
+import { git, GitError, gitOk, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { redactUrlCredentials, scanStaged } from "../secrets.ts";
 import { createAt, quoted, writeAtomic } from "../store.ts";
 import { CONFIG_FILE, type Vault } from "../vault.ts";
@@ -94,6 +94,26 @@ async function clearLitter(dir: string): Promise<void> {
 // once, where sync state is detected, so the answer is one sentence naming the minimum and
 // what this machine has, before anything touches Projects/.
 const MIN_GIT = { major: 2, minor: 47 };
+
+// The two calls of the first push that run the vault's own filters over every note at
+// once, with no ladder behind them: the bootstrap and import staging (`git add -A` through
+// the clean filters, the one time the plugin hashes a whole vault in one go) and the clone
+// (its checkout writes every note through the smudge filters after a network fetch). A
+// failure of either removes the Projects/.git this call created and the next session starts
+// over identically, so git.ts's fixed local and network limits, sized for one cycle's work,
+// are the wrong shape here: the import is exactly where a whole vault can outlast 30 s.
+// 10 minutes each, the bound clone.ts already uses for a rebuild: at a slow disk's 20 MB/s
+// that is 12 GB, far past a notes vault, and a hung filter or a dead network still gives
+// the session an answer within it.
+const FIRST_PUSH_TIMEOUT_MS = 10 * 60_000;
+
+// Why a git call of the first push failed, in one phrase: the limit it ran past, named, or
+// git's own words. The limits above are generous and fixed, so no test can reach one; this
+// is where their wording is pinned.
+export function firstPushFailure(r: { code: number; stderr: string; timedOut: boolean }, limitMs: number, what: string): string {
+  if (r.timedOut) return `it ran past ${limitMs / 60_000} min, the limit for ${what}`;
+  return firstLines(r.stderr) || `git exited ${r.code}`;
+}
 const MIN_GIT_TEXT = `${MIN_GIT.major}.${MIN_GIT.minor}`;
 
 async function gitVersionProblem(cwd: string): Promise<string | null> {
@@ -162,7 +182,19 @@ async function commitAndPushNew(projectsDir: string, timezone: string, message: 
   if (identity) return identity;
   await ensureGitignore(projectsDir);
   await createAt(join(projectsDir, CONFIG_FILE), `${JSON.stringify({ timezone }, null, 2)}\n`);
-  await gitOk(["add", "-A"], { cwd: projectsDir });
+  // Only the limit is turned into a reason here: every other failure throws as it always
+  // has, so firstPush still removes the .git it created and session.ts still reports git's
+  // own words (and gitOk's stranded-lock sentence with them, spec 5.6).
+  const slow = await gitOk(["add", "-A"], { cwd: projectsDir, timeoutMs: FIRST_PUSH_TIMEOUT_MS }).then(
+    () => null,
+    (err: unknown) => {
+      if (err instanceof GitError && err.result.timedOut) {
+        return `staging Projects/ failed: ${firstPushFailure(err.result, FIRST_PUSH_TIMEOUT_MS, "the first staging of a whole vault")}`;
+      }
+      throw err;
+    },
+  );
+  if (slow !== null) return slow;
   // Spec 7.5: every staged diff is scanned before commit. At bootstrap there is
   // no later cycle to hold a hit back in, so any hit stops the whole import.
   const hits = await scanStaged(projectsDir);
@@ -238,9 +270,9 @@ async function cloneIntoPlace(root: string, projectsDir: string, remote: string)
   await sweepLeftoverClones(root, projectsDir);
   const tmp = join(root, `.${basename(projectsDir)}.${randomBytes(4).toString("hex")}.sro-tmp`);
   try {
-    const clone = await git(["clone", "-q", remote, tmp], { cwd: root, timeoutMs: NETWORK_TIMEOUT_MS });
+    const clone = await git(["clone", "-q", remote, tmp], { cwd: root, timeoutMs: FIRST_PUSH_TIMEOUT_MS });
     if (clone.code !== 0 || clone.timedOut) {
-      return `clone of ${remote} failed: ${clone.stderr.trim() || (clone.timedOut ? "timed out" : `git exited ${clone.code}`)}`;
+      return `clone of ${remote} failed: ${firstPushFailure(clone, FIRST_PUSH_TIMEOUT_MS, "a clone and the checkout after it")}`;
     }
     const format = await objectFormatProblem(tmp, "the remote");
     if (format) return format;

@@ -927,14 +927,15 @@ test("a git call that hangs before the sync starts still returns within the wait
   const w = await world();
   const marker = join(await tempDir(), "slept");
   // The first git command in the session directory (the early identity) hangs 3 s.
-  const slowOnce = `if [ "$here" = ${JSON.stringify(w.code)} ] && mkdir ${JSON.stringify(marker)} 2>/dev/null; then sleep 3; fi`;
+  const slowOnce = `if [ "$here" = ${JSON.stringify(w.code)} ] && mkdir ${JSON.stringify(marker)} 2>/dev/null; then sleep 10; fi`;
   await withGitWrapper(slowOnce, async () => {
     const t0 = Date.now();
     const r = await initializeSession(opts(w, { waitMs: 1_000 }));
     const elapsed = Date.now() - t0;
-    // Well inside the 3 s the wrapper sleeps, and far outside any scheduling delay: what
-    // this pins is that the deadline is honoured at all, never a millisecond budget.
-    assert.ok(elapsed < 2_500, `initializeSession returned after ${elapsed} ms for a 1000 ms wait`);
+    // Five times the wait, and a fifth of the 10 s the wrapper sleeps: what this pins is
+    // that the deadline is honoured at all, never a millisecond budget, and no scheduling
+    // delay on a loaded machine can reach either end of that.
+    assert.ok(elapsed < 5_000, `initializeSession returned after ${elapsed} ms for a 1000 ms wait`);
     assert.equal(r.context, null);
     assert.ok(r.payload.startsWith(`${PAYLOAD_MARKER}\nBOOTSTRAP\n`), "the bootstrap is still sent");
     assert.match(r.payload, /memory initialization timed out/);
@@ -1003,3 +1004,43 @@ test(
     assert.match(lines, /injected failure.*; releasing the prepare lock failed: /, lines);
   },
 );
+
+// C2 (round 2): catchUp and buildRollups run the adapter's own code - listSessions,
+// readTranscript, callModel - which can reject with anything at all. `(err as Error)
+// .message` on a value that is not an Error renders "journal catch-up: undefined", which
+// says nothing and hides which of the host's entry points threw.
+function throwingHarness(thrown: unknown): Harness {
+  return {
+    async callModel(): Promise<string> {
+      throw thrown;
+    },
+    async readTranscript(sessionId: string): Promise<TranscriptChunk> {
+      return { sessionId, messages: [] };
+    },
+    async listSessions(): Promise<SessionRef[]> {
+      throw thrown;
+    },
+    async notify(): Promise<void> {},
+  };
+}
+
+test("a harness that rejects with something that is not an Error still says what it was, for the catch-up and for the rollups", async () => {
+  for (const [thrown, reads] of [
+    ["the model refused", "the model refused"],
+    [null, "null"],
+    [42, "42"],
+    [new TypeError("req.system is not a string"), "TypeError: req.system is not a string"],
+  ] as Array<[unknown, string]>) {
+    const w = await localWorld();
+    // A day before today's, so the rollups have something to digest and call the model for.
+    const then = new Date("2026-09-18T06:00:00Z");
+    await writeJournalEntry(w.projectDir, { machine: "a", session: "s", branch: "main", from: then, to: then, model: "m", summary: "older", timezone: "Asia/Tokyo" });
+    const r = await initializeSession(localOpts(w, { harness: throwingHarness(thrown) }));
+    const lines = r.status.map((s) => `[${s.level}] ${s.text}`).join("\n");
+    assert.ok(lines.includes(`journal catch-up: ${reads}`), lines);
+    assert.ok(lines.includes(`journal rollups: ${reads}`), lines);
+    assert.doesNotMatch(lines, /: undefined$/m, "never a line that says nothing at all");
+    assert.equal(r.status.filter((s) => s.text.startsWith("journal ")).length, 2, lines);
+    assert.equal(r.context?.project, "kabin-api", "and the session still starts");
+  }
+});

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ensureGitignore, prepareProjects, REQUIRED_IGNORES, syncConfig, type SyncState } from "../../core/sync/state.ts";
+import { ensureGitignore, firstPushFailure, prepareProjects, REQUIRED_IGNORES, syncConfig, type SyncState } from "../../core/sync/state.ts";
 import { git, gitOk } from "../../core/git.ts";
 import type { Vault } from "../../core/vault.ts";
 import { GIT_CONFIG, commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
@@ -652,4 +652,19 @@ test("the version check does not run when sync is off: no remote, nothing to che
     state = await prepareProjects(v, { remote: null }, TZ);
   });
   assert.deepEqual(state, { kind: "off" });
+});
+
+
+// C1 (round 2): the bootstrap and import staging and the clone's checkout run the vault's
+// own filters over every note at once, with no ladder behind them and nothing that retries
+// with more time. They have their own generous bound now, and a failure of either says
+// which limit it hit rather than "timed out".
+test("a first-push failure names the limit it ran past, or git's own words", () => {
+  assert.equal(
+    firstPushFailure({ code: -1, stderr: "", timedOut: true }, 600_000, "the first staging of a whole vault"),
+    "it ran past 10 min, the limit for the first staging of a whole vault",
+  );
+  assert.equal(firstPushFailure({ code: -1, stderr: "", timedOut: true }, 60_000, "a clone"), "it ran past 1 min, the limit for a clone");
+  assert.equal(firstPushFailure({ code: 128, stderr: "fatal: bad\nhint: try\n", timedOut: false }, 600_000, "x"), "fatal: bad");
+  assert.equal(firstPushFailure({ code: 128, stderr: "", timedOut: false }, 600_000, "x"), "git exited 128", "never a phrase that says nothing");
 });
