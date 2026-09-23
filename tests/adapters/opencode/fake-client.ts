@@ -30,6 +30,8 @@ export class FakeClient implements OpenCodeClient {
   reply: PartLike[] | Error = [{ type: "text", text: "summary" }];
   // The provider's failure, carried on an otherwise successful reply.
   replyError: unknown = undefined;
+  // An HTTP failure: the SDK resolves with the error body and the response, it does not throw.
+  replyFail: { status: number; error: unknown } | undefined = undefined;
   getCalls: string[] = [];
   created: Array<{ id: string; parentID: string }> = [];
   deleted: string[] = [];
@@ -63,6 +65,7 @@ export class FakeClient implements OpenCodeClient {
     },
     prompt: (o) => {
       this.prompted.push({ session: o.path.id, ...(o.body.model ? { model: o.body.model } : {}), system: o.body.system, tools: o.body.tools, text: o.body.parts.map((p) => p.text).join("") });
+      if (this.replyFail !== undefined) return Promise.resolve({ error: this.replyFail.error, response: { status: this.replyFail.status } });
       return this.reply instanceof Error ? Promise.reject(this.reply) : ok({ info: this.replyError === undefined ? {} : { error: this.replyError }, parts: this.reply });
     },
     delete: (o) => {

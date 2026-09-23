@@ -30,7 +30,11 @@ export interface OpenCodeClient {
 }
 
 async function data<T>(call: Result<T>, what: string): Promise<T> {
-  const r = await call;
+  // A call that throws (the server cannot be reached) is labelled like one that answers with an
+  // error: either way the message says what was being done.
+  const r = await call.catch((err: unknown) => {
+    throw new Error(`${what} failed: ${errorText(err)}`);
+  });
   if (r.error !== undefined || r.data === undefined) {
     const why = r.error === undefined ? "no data" : typeof r.error === "object" ? JSON.stringify(r.error) : errorText(r.error);
     // An empty-bodied failure reads as {}: the status is what says anything then.
@@ -48,15 +52,20 @@ export function parseModel(value: string | undefined): ModelRef | null {
 }
 
 // The journal's model: its name as the entries record it, the reference the prompt names
-// (null: OpenCode's default), and what is wrong with the setting, if anything.
-export type Chosen = { name: string; ref: ModelRef | null; problem: string | null };
+// (null: OpenCode's default), the setting it came from (named in a failure, so a model OpenCode
+// does not know can be traced to where it was set), and what is wrong with the setting, if anything.
+export type Chosen = { name: string; ref: ModelRef | null; source: string; problem: string | null };
+
+const DEFAULT_SOURCE = "OpenCode's default model";
 
 function named(setting: string, value: string): Chosen {
   const ref = parseModel(value);
-  if (ref !== null) return { name: value, ref, problem: null };
+  const source = `${setting} "${value}"`;
+  if (ref !== null) return { name: value, ref, source, problem: null };
   return {
     name: `${value} (not provider/model: OpenCode's default model ran)`,
     ref: null,
+    source,
     problem: `${setting} "${value}" is not provider/model, so OpenCode's default model writes the journal`,
   };
 }
@@ -90,17 +99,18 @@ export class OpenCodeHarness implements Harness {
       );
       if (read.problem !== null) {
         this.chosen = null;
-        return { name: "the default model", ref: null, problem: read.problem };
+        return { name: "the default model", ref: null, source: DEFAULT_SOURCE, problem: read.problem };
       }
       if (read.cfg.small_model !== undefined) return named("small_model", read.cfg.small_model);
       if (read.cfg.model !== undefined) return named("model", read.cfg.model);
-      return { name: "the default model", ref: null, problem: null };
+      return { name: "the default model", ref: null, source: DEFAULT_SOURCE, problem: null };
     })();
     return this.chosen;
   }
 
   async callModel(req: { system: string; prompt: string; parentSessionId: string }): Promise<string> {
-    const { ref } = await this.model();
+    const { ref, source } = await this.model();
+    const summarizer = `the summarizer (${source})`;
     const created = await data(
       this.client.session.create({ body: { parentID: req.parentSessionId, title: "superpower-remember-obsidian journal" } }),
       "creating the summarizer session",
@@ -119,17 +129,17 @@ export class OpenCodeHarness implements Harness {
           path: { id: created.id },
           body: { ...(ref === null ? {} : { model: ref }), system: req.system, tools, parts: [{ type: "text", text: req.prompt }] },
         }),
-        "the summarizer",
+        summarizer,
       );
       // A reply can arrive with the provider's failure on it instead of text: that is a
       // failure, never an empty summary (journal.ts would write it and move past the
       // transcript for good).
-      if (reply.info.error !== undefined) throw new Error(`the summarizer failed: ${JSON.stringify(reply.info.error)}`);
+      if (reply.info.error !== undefined) throw new Error(`${summarizer} failed: ${JSON.stringify(reply.info.error)}`);
       const text = reply.parts
         .filter((p) => p.type === "text" && typeof p.text === "string")
         .map((p) => p.text)
         .join("\n");
-      if (text.trim() === "") throw new Error("the summarizer returned no text");
+      if (text.trim() === "") throw new Error(`${summarizer} returned no text`);
       return text;
     } finally {
       // Housekeeping only: a helper left behind (the delete failed, or its answer did) is a

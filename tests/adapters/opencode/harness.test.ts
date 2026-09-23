@@ -12,12 +12,12 @@ test("parseModel splits at the first slash, and refuses a value with no provider
 test("the journal model is the option, else small_model, else the default model, else none named", async () => {
   const client = new FakeClient();
   client.cfg = { model: "a/default", small_model: "a/small" };
-  assert.deepEqual(await new OpenCodeHarness(client, "b/option").model(), { name: "b/option", ref: { providerID: "b", modelID: "option" }, problem: null });
-  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "a/small", ref: { providerID: "a", modelID: "small" }, problem: null });
+  assert.deepEqual(await new OpenCodeHarness(client, "b/option").model(), { name: "b/option", ref: { providerID: "b", modelID: "option" }, source: 'journalModel "b/option"', problem: null });
+  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "a/small", ref: { providerID: "a", modelID: "small" }, source: 'small_model "a/small"', problem: null });
   client.cfg = { model: "a/default" };
-  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "a/default", ref: { providerID: "a", modelID: "default" }, problem: null });
+  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "a/default", ref: { providerID: "a", modelID: "default" }, source: 'model "a/default"', problem: null });
   client.cfg = {};
-  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "the default model", ref: null, problem: null });
+  assert.deepEqual(await new OpenCodeHarness(client, undefined).model(), { name: "the default model", ref: null, source: "OpenCode's default model", problem: null });
   client.cfg = null; // the config cannot be read: OpenCode's default, never a failure (D7), and told
   assert.equal((await new OpenCodeHarness(client, undefined).model()).ref, null);
 });
@@ -50,11 +50,30 @@ test("a reply carrying the provider's failure, or no text, is a failure, never a
   const client = new FakeClient();
   const harness = new OpenCodeHarness(client, undefined);
   client.replyError = { name: "APIError", data: { message: "overloaded" } };
-  await assert.rejects(harness.callModel({ system: "S", prompt: "P", parentSessionId: "ses_p" }), /the summarizer failed: .*overloaded/);
+  await assert.rejects(harness.callModel({ system: "S", prompt: "P", parentSessionId: "ses_p" }), /the summarizer \(OpenCode's default model\) failed: .*overloaded/);
   client.replyError = undefined;
   client.reply = [{ type: "text", text: "  \n" }, { type: "reasoning", text: "thinking" }];
-  await assert.rejects(harness.callModel({ system: "S", prompt: "P", parentSessionId: "ses_p" }), /the summarizer returned no text/);
+  await assert.rejects(harness.callModel({ system: "S", prompt: "P", parentSessionId: "ses_p" }), /the summarizer \(OpenCode's default model\) returned no text/);
   assert.deepEqual(client.deleted, ["ses_helper_1", "ses_helper_2"], "each helper is deleted all the same");
+});
+
+test("every way the summarizer fails names the model setting it ran on, so a wrong one can be found and fixed", async () => {
+  const client = new FakeClient();
+  client.cfg = { model: "a/default", small_model: "a/small" };
+  const call = (h: OpenCodeHarness) => h.callModel({ system: "S", prompt: "P", parentSessionId: "ses_p" });
+  // What a model OpenCode does not know gives (seen live, 2026-09-23): an HTTP 500 whose body names no model.
+  client.replyFail = { status: 500, error: { name: "UnknownError", data: { message: "Unexpected server error. Check server logs for details." } } };
+  await assert.rejects(call(new OpenCodeHarness(client, undefined)), /^Error: the summarizer \(small_model "a\/small"\) failed: HTTP 500 .*Unexpected server error/);
+  client.replyFail = undefined;
+  client.replyError = { name: "APIError", data: { message: "overloaded" } };
+  await assert.rejects(call(new OpenCodeHarness(client, "b/option")), /^Error: the summarizer \(journalModel "b\/option"\) failed: .*overloaded/);
+  client.replyError = undefined;
+  client.reply = new Error("fetch failed");
+  client.cfg = { model: "a/default" };
+  await assert.rejects(call(new OpenCodeHarness(client, undefined)), /^Error: the summarizer \(model "a\/default"\) failed: fetch failed$/);
+  client.reply = [{ type: "text", text: " " }];
+  client.cfg = {};
+  await assert.rejects(call(new OpenCodeHarness(client, undefined)), /^Error: the summarizer \(OpenCode's default model\) returned no text$/);
 });
 
 test("callModel names no model when none is configured, and deletes the helper when the prompt fails", async () => {
@@ -158,5 +177,5 @@ test("a config that cannot be read is told, and read again next time", async () 
   assert.equal(first.ref, null);
   assert.match(first.problem ?? "", /the OpenCode config could not be read/);
   client.cfg = { small_model: "p/small" };
-  assert.deepEqual(await harness.model(), { name: "p/small", ref: { providerID: "p", modelID: "small" }, problem: null });
+  assert.deepEqual(await harness.model(), { name: "p/small", ref: { providerID: "p", modelID: "small" }, source: 'small_model "p/small"', problem: null });
 });

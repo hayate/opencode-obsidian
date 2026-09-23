@@ -93,7 +93,7 @@ test("remember_sync that fails while the toast fails too still answers with the 
 
 test("the journalModel option reaches the journal's model, and one that is not a string is told", async () => {
   const client = new FakeClient();
-  assert.deepEqual(await assemble({ client, directory: "/code" }, { journalModel: "p/m" }).harness.model(), { name: "p/m", ref: { providerID: "p", modelID: "m" }, problem: null });
+  assert.deepEqual(await assemble({ client, directory: "/code" }, { journalModel: "p/m" }).harness.model(), { name: "p/m", ref: { providerID: "p", modelID: "m" }, source: 'journalModel "p/m"', problem: null });
   assert.match((await assemble({ client, directory: "/code" }, { journalModel: 42 }).harness.model()).problem ?? "", /journalModel "42" is not provider\/model/);
   client.cfg = { small_model: "a/small" };
   assert.equal((await assemble({ client, directory: "/code" }, {}).harness.model()).name, "a/small");
