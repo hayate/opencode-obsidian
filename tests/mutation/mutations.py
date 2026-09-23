@@ -90,6 +90,10 @@ mutate("core/store.ts", '  if (real !== base && !real.startsWith(base + sep)) th
        survives=("linux", "darwin"),
        why="defence in depth behind the lstat walk and the O_NOFOLLOW open: it fires only if a component becomes a symlink between the walk and the realpath, a race no deterministic test stages (Plan 1 ruling)")
 mutate("core/inject.ts", "  return escapeTag(text, BLOCK_TAG);", "  return text;", "tests/core/inject.test.ts")
+# The payload says where the project is, absolute, for a plain name and an odd one (Task 7).
+mutate("core/inject.ts", '  const where = input.projectDir === null ? "" :', '  const where = true ? "" :', "tests/core/inject.test.ts", pattern="frames recorded memory as data")
+mutate("core/inject.ts", "`${shown} (a folder in Projects/)${where}`", "`${shown} (a folder in Projects/)`", "tests/core/inject.test.ts", pattern="line break cannot add lines")
+mutate("core/session.ts", "      project: project.name,\n      projectDir: project.dir,\n      status,", "      project: project.name,\n      projectDir: null,\n      status,", SE, pattern="happy path: clone")
 mutate("core/session.ts", "  if (early.kind === \"disabled\" && early.bare) return", "  if (early.kind === \"disabled\") return", SE)
 mutate("core/session.ts", "belongs = resolveSafely(vault, s.directory).then((r) => r.kind === \"ok\" && r.name === project);", "belongs = Promise.resolve(true);", SE)
 mutate("core/session.ts", "    const pre = await Promise.race([starting.then((value) => ({ kind: \"started\" as const, value })), deadline]);", "    const pre = await starting.then((value) => ({ kind: \"started\" as const, value }));", SE)

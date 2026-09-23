@@ -21,6 +21,9 @@ export interface StatusItem {
 export interface PayloadInput {
   bootstrap: string;
   project: string | null;
+  // Where the project's folder is, absolute (null with no project): the model's file tools take
+  // literal paths, and "Projects/<name>" alone reads as a folder of the working directory.
+  projectDir: string | null;
   status: StatusItem[];
   branch: string | null;
   heads: Heads | null;
@@ -93,7 +96,8 @@ export function buildPayload(input: PayloadInput): string {
   const budget = input.budgetChars ?? DEFAULT_BUDGET;
   const status = input.status.length ? input.status.map((s) => `- [${s.level}] ${escapeBlockTags(s.text)}`) : ["- [info] all good"];
   const shown = input.project === null ? null : vaultName(input.project);
-  const project = shown === null ? "none" : shown === input.project ? `\`${shown}\` (Projects/${shown})` : `${shown} (a folder in Projects/)`;
+  const where = input.projectDir === null ? "" : `, in the Obsidian vault at \`${input.projectDir}\` (not in the working directory)`;
+  const project = shown === null ? "none" : shown === input.project ? `\`${shown}\`${where}` : `${shown} (a folder in Projects/)${where}`;
   const head = [PAYLOAD_MARKER, input.bootstrap.trim(), "", "## Project and status", `- Project: ${escapeBlockTags(project)}`, ...status].join("\n");
   if (!input.project) return head;
 

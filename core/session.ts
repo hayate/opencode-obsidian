@@ -630,6 +630,7 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
     const payload = buildPayload({
       bootstrap: opts.bootstrap,
       project: project.name,
+      projectDir: project.dir,
       status,
       branch: code.branch,
       heads,

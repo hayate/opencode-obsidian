@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { access, chmod, constants, mkdir, readFile, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { access, chmod, constants, mkdir, readFile, realpath, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { idleSession, initializeSession, statusFromCycle, statusFromPrivacy, syncSession, vaultId, type SessionContext, type SessionOptions } from "../../core/session.ts";
 import type { Harness, SessionRef, TranscriptChunk } from "../../core/harness.ts";
@@ -86,6 +86,7 @@ test("happy path: clone, sync, record the origin, inject this branch's handoff",
   const r = await initializeSession(opts(w));
   assert.ok(r.payload.startsWith(PAYLOAD_MARKER));
   assert.match(r.payload, /Project: `kabin-api`/);
+  assert.ok(r.payload.includes(`in the Obsidian vault at \`${join(await realpath(w.vaultRoot), "Projects", "kabin-api")}\``), r.payload.slice(0, 900));
   assert.match(r.payload, /Handoff for this branch \(`feat\/x`\)/);
   assert.match(r.payload, /PR #222 open; next: triage CodeRabbit/);
   assert.deepEqual(r.status.filter((s) => s.level !== "info"), []);
