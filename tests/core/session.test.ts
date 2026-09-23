@@ -507,7 +507,11 @@ test("a timeout during the journal step builds the payload for the identity reso
   await commitFile(seed, "different-local-name/HANDOFF.md", "WRONG PROJECT MEMORY\n", "unclaimed folder");
   await gitOk(["push", "-q", "origin", "HEAD"], { cwd: seed });
   const harness = new GatedHarness();
-  const r = await initializeSession(opts(w, { harness, waitMs: 2_000 }));
+  // The deadline counts from entry, and only the journal step is held: the clone, pull and identity
+  // steps before it must finish inside waitMs. 2 s was not enough on a loaded machine (four suites
+  // at once failed this assertion every time, alone it passed 5/5), so the budget sits far above
+  // what those git steps take; the test lasts waitMs, since the gate holds until the deadline.
+  const r = await initializeSession(opts(w, { harness, waitMs: 10_000 }));
   const reached = harness.reachedJournal;
   harness.release();
   const later = await r.background;
