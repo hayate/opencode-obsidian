@@ -185,7 +185,15 @@ async function flush(path: string): Promise<void> {
 // it costs one re-run that finds nothing left to move. And recovery.ts's two other writes
 // of the record replace one that is already there, so a lost rename leaves the older
 // record, which errs toward keeping the user's files.
-export async function writeDurable(path: string, content: string): Promise<void> {
+// Returns null, or what went wrong with the last step alone. Everything up to and
+// including the rename fails closed, by throwing: until then nothing is in place and the
+// caller must not go on. The directory flush is different, because by then the file is
+// there: on a filesystem whose directory fd refuses fsync (some FUSE and network mounts
+// answer EINVAL) throwing here would abort every cycle identically, with an errno naming
+// neither the record nor a remedy, over a file that was written. So it degrades: the
+// caller reports what it costs (the write is not promised across a power loss) and carries
+// on.
+export async function writeDurable(path: string, content: string): Promise<string | null> {
   const dir = dirname(path);
   await mkdir(dir, { recursive: true });
   const tmp = join(dir, `.${basename(path)}.${randomHex(4)}.sro-tmp`);
@@ -202,7 +210,12 @@ export async function writeDurable(path: string, content: string): Promise<void>
     await rm(tmp, { force: true });
     throw err;
   }
-  await flush(dir);
+  try {
+    await flush(dir);
+    return null;
+  } catch (err) {
+    return `flushing ${dir} failed: ${errorText(err)}`;
+  }
 }
 
 // A memory path that exists but cannot be used: an I/O failure, or a refusal by

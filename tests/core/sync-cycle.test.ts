@@ -2379,6 +2379,12 @@ test("the snapshot's `git add -A` under a clean filter slower than the base limi
   assert.equal(first.outcome, "unsynced", first.reason ?? "");
   assert.equal(first.reason, "updating the vault timed out");
   assert.deepEqual(first.timedOut, { nextLimitMs: 800, ceiling: false, note: null }, "staging names no note, as `reset --keep` names none");
+  // B1 (round 2): `add` is in git.ts's CLEANED_AFTER_KILL set, so a killed one carries the
+  // note about the index.lock it left. The line above promises the next sync tries again,
+  // and that sync would abort on a stale lock with nothing saying why.
+  const lock = await gitOk(["rev-parse", "--path-format=absolute", "--git-path", "index.lock"], { cwd: b.projects });
+  assert.deepEqual(first.notices, [`removed ${lock}, which this command left when it was stopped`]);
+  assert.deepEqual(statusFromCycle(first).at(-1), { level: "info", text: `removed ${lock}, which this command left when it was stopped` });
   assert.equal(first.committed, null, "nothing was committed");
   assert.equal(first.pushed, false);
   assert.equal(await rung(b), "1");
@@ -2686,6 +2692,39 @@ test("an update still running after the longest limit a live update gets is hung
   assert.equal(statusFromCycle(fresh)[0]?.level, "warn");
   await endHelper(alive, "group");
 });
+
+// B2 (round 2): the intent record's directory flush is what makes the write survive a
+// power loss. Where it cannot run at all, the record is still in place, so the cycle says
+// what it could not promise and carries on rather than aborting identically every time.
+test(
+  "a state directory that cannot be flushed does not stop the cycle: the update runs, and the notice says what the record is not promised against",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const { remote, m } = await setup(["a", "b"]);
+    const [a, b] = m as [Machine, Machine];
+    await writeRel(a.projects, "x/t.md", "from a\n");
+    assert.ok((await cycle(remote, a)).pushed);
+    // refs/sro/integrated is the live update's own first git call: the state directory
+    // goes unreadable there, just before the record is written into it.
+    let r: CycleResult | undefined;
+    try {
+      await withGitDoing("refs/sro/integrated", `  chmod 300 '${b.state}'`, async () => {
+        r = await cycle(remote, b);
+      });
+    } finally {
+      await chmod(b.state, 0o755).catch(() => undefined);
+    }
+    assert.equal(r?.outcome, "synced", r?.reason ?? "");
+    assert.ok(r?.liveUpdated, "the update ran");
+    assert.equal(await read(b, "x/t.md"), "from a\n");
+    assert.equal(r?.notices.length, 1, JSON.stringify(r?.notices));
+    assert.match(
+      r?.notices[0] ?? "",
+      /^the record that lets the next sync finish this vault update is on disk but could not be flushed to it \(flushing .* failed: .*EACCES.*\); a power loss now could lose it, and with it the knowledge that the update was unfinished$/,
+    );
+    assert.deepEqual(statusFromCycle(r as CycleResult).map((i) => i.level), ["info"]);
+  },
+);
 
 // C4 (the gauntlet fix wave): git.ts appends a note when it removed, or could not remove,
 // the index.lock a killed `add` or `reset` left (spec 5.6). The timeout branch never read

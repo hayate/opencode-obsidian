@@ -323,6 +323,33 @@ test("writeDurable replaces a file whole, creates its directory, and leaves no t
   assert.deepEqual((await readdir(dir)).sort(), ["record.json"]);
 });
 
+// B2 (round 2): everything up to and including the rename fails closed, but once the
+// record is in place a directory flush that cannot run is not worth stranding sync for:
+// some FUSE and network mounts answer EINVAL on a directory fd, and every cycle would then
+// abort identically over a file that was written.
+test(
+  "a writeDurable whose directory cannot be flushed leaves the file in place and says what it could not promise",
+  { skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false },
+  async () => {
+    const dir = await tempDir();
+    const path = join(dir, "record.json");
+    assert.equal(await writeDurable(path, "first"), null, "a directory that can be flushed reports nothing");
+    // Writable and searchable, not readable: the file still lands, opening the directory
+    // to flush it does not.
+    await chmod(dir, 0o300);
+    let problem: string | null;
+    try {
+      problem = await writeDurable(path, "second");
+    } finally {
+      await chmod(dir, 0o755);
+    }
+    assert.match(problem ?? "", /^flushing .* failed: .*EACCES/, problem ?? "(nothing reported)");
+    assert.equal(await readFile(path, "utf8"), "second", "and the record is in place all the same");
+    assert.equal(await writeDurable(path, "third"), null);
+    assert.deepEqual(await readdir(dir), ["record.json"], "no temp sibling is left behind either way");
+  },
+);
+
 test("a writeDurable whose rename fails takes its temp sibling with it and throws", async () => {
   const dir = await tempDir();
   // A directory where the file goes: the rename cannot replace it.

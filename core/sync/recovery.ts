@@ -441,13 +441,15 @@ async function setBack(
 // moment it started. The instant between the spawn and that second write is not covered:
 // a session that dies inside it leaves a record with no group, which the next cycle
 // repairs as it always has.
-export async function recordIntent(stateDir: string, from: string, to: string, group?: number): Promise<void> {
+// Returns what writeDurable could not promise, or null: the record is on disk either way,
+// and the caller says what a failed flush costs.
+export async function recordIntent(stateDir: string, from: string, to: string, group?: number): Promise<string | null> {
   const record: Record_ = group === undefined ? { from, to } : { from, to, group, boot: bootInstant(), startedAt: Date.now() };
   // writeDurable, not writeAtomic: this is the one file on the branch whose absence loses
   // work already on disk. A power loss between this write and the reset's first write
   // would otherwise leave the notes changed with no record of it, and the next snapshot
   // would publish a half-applied update as the user's own change.
-  await writeDurable(join(stateDir, RECORD), JSON.stringify(record));
+  return writeDurable(join(stateDir, RECORD), JSON.stringify(record));
 }
 
 // When this machine booted, as a wall-clock instant to the second: os.uptime() is the

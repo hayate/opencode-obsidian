@@ -328,10 +328,18 @@ async function snapshot(input: CycleInput, ladder: Ladder, result: CycleResult):
     await gitOk(["add", "-A"], { cwd: dir, timeoutMs: limit });
     result.caseCollisions = await stageCaseRenames(dir, limit);
   } catch (err) {
-    if (!(err instanceof GitError) || !err.result.timedOut) throw err;
+    // Only the two calls above that run the vault's clean filters climb the ladder, and
+    // both are an `add`. The `rm --cached` beside the second is index-only and runs no
+    // filter (B3), so a timeout of it is a failure like any other and is rethrown.
+    if (!(err instanceof GitError) || !err.result.timedOut || err.args[0] !== "add") throw err;
     // The index is left exactly as the killed command left it: the next cycle stages
     // from scratch anyway, and nothing is committed or pushed from a cycle that ends here.
     await timedOut(input.stateDir, ladder, result);
+    // git.ts removed, or could not remove, the index.lock this killed `add` left (spec
+    // 5.6): `add` is in its CLEANED_AFTER_KILL set. The line timedOut() writes promises
+    // that the next sync tries again, and without this that next sync would abort on the
+    // stale lock with nothing saying why (B1, the same as the live update's own timeout).
+    if (err.result.lockNote) result.notices.push(err.result.lockNote);
     return { ok: false, pushAllowed: false };
   }
 
@@ -678,7 +686,15 @@ async function updateLive(clone: string, input: CycleInput, live: string, next: 
     result.liveUpdated = true;
     return;
   }
-  await recordIntent(input.stateDir, live, next);
+  // Only this first write is reported: it is the one whose absence loses work already on
+  // disk. The writes after it replace a record that is already there, so a rename of
+  // theirs that a power loss drops leaves this one, which errs toward keeping.
+  const unflushed = await recordIntent(input.stateDir, live, next);
+  if (unflushed !== null) {
+    result.notices.push(
+      `the record that lets the next sync finish this vault update is on disk but could not be flushed to it (${unflushed}); a power loss now could lose it, and with it the knowledge that the update was unfinished`,
+    );
+  }
   const reset = await git(["reset", "-q", "--keep", next], {
     cwd: dir,
     timeoutMs: limitOf(ladder),
@@ -686,7 +702,9 @@ async function updateLive(clone: string, input: CycleInput, live: string, next: 
     // cycle that starts after this session dies waits for it instead of repairing over
     // it (spec 5.4 step 5). Only the instant between the spawn and this write is not
     // covered.
-    onSpawn: (group) => recordIntent(input.stateDir, live, next, group),
+    onSpawn: async (group) => {
+      await recordIntent(input.stateDir, live, next, group);
+    },
   });
   if (reset.code === 0 && !reset.timedOut) {
     await clearInterrupted(input.stateDir);

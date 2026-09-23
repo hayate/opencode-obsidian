@@ -207,7 +207,7 @@ mutate(CY, "    await recordIntent(input.stateDir, live, next);\n    result.outc
 # The intent written before git is spawned: the group write repeats it as soon as git exists,
 # so only a session death in the instant between them, or a group write that fails, leaves the
 # vault changing with no record at all.
-mutate(CY, "  await recordIntent(input.stateDir, live, next);\n  const reset = await git(", "  const reset = await git(", C, pattern="fails partway",
+mutate(CY, "  const unflushed = await recordIntent(input.stateDir, live, next);\n", "", C, pattern="fails partway",
        survives=("linux", "darwin"),
        why="defence in depth behind the group write, which records the same intent as soon as git is spawned: what it alone covers is a session death inside that instant, or a group write that fails, neither of which a deterministic test can stage")
 mutate(CY, "finishInterrupted(input.stateDir, dir, { timeoutMs: limitOf(ladder) })", "finishInterrupted(input.stateDir, dir)", C, pattern="repair that times out stops")
@@ -406,7 +406,7 @@ WAITS = "waits for a record's live process group"
 mutate(F_RC, "  if (!groupAlive(record.group)) return null;\n", "", C, runs=5, pattern="process group that is gone is repaired")
 mutate(CY, "      result.waiting = { ...running, hung: running.runningMs > limitOf({ ...ladder, level: MAX_LEVEL }) };\n      return result;",
        "      result.waiting = { ...running, hung: running.runningMs > limitOf({ ...ladder, level: MAX_LEVEL }) };", C, runs=5, pattern=WAITS)
-mutate(CY, "    onSpawn: (group) => recordIntent(input.stateDir, live, next, group),\n", "", C, pattern="records its process group")
+mutate(CY, "    onSpawn: async (group) => {\n      await recordIntent(input.stateDir, live, next, group);\n    },\n", "", C, pattern="records its process group")
 mutate("core/git.ts", '  if (started.size === 0) process.on("exit", killStarted);\n', "", G, pattern="session that exits normally takes the git")
 mutate("core/git.ts", "    started.delete(pid);\n", "", G, pattern="session that exits normally takes the git")
 # The wait comes before the blocked-cycle bookkeeping, so a cycle that only waited leaves
@@ -499,7 +499,7 @@ mutate(F_RC, "  return Math.round((Date.now() - uptime() * 1000) / 1000) * 1000;
 # (the one check a record with no fingerprints always reaches) and the snapshot's staging.
 FILTERED = "clean filter slower than the base limit"
 mutate(CY, '    await gitOk(["add", "-A"], { cwd: dir, timeoutMs: limit });\n', '    await gitOk(["add", "-A"], { cwd: dir });\n', C, pattern=FILTERED)
-mutate(CY, "    if (!(err instanceof GitError) || !err.result.timedOut) throw err;\n", "    throw err;\n", C, pattern=FILTERED)
+mutate(CY, '    if (!(err instanceof GitError) || !err.result.timedOut || err.args[0] !== "add") throw err;\n', "    throw err;\n", C, pattern=FILTERED)
 mutate(CY, '    await gitOk(["add", "--", literal(actual)], { cwd: dir, timeoutMs });\n', '    await gitOk(["add", "--", literal(actual)], { cwd: dir });\n', C,
        pattern='a case-only rename reaches the remote', survives=("linux", "darwin"),
        why="the same hazard as the snapshot's own `add -A`, one note at a time: no test stages a case-only rename whose clean filter is slower than the limit, and on Linux no case-only rename is staged at all")
@@ -563,15 +563,15 @@ mutate("core/session.ts", '    if (released !== null) out.push({ level: "warn", 
 # loses work already on disk, so it is written durably. What the two flushes guarantee is
 # only visible across a power loss; the rest of writeDurable is writeAtomic's contract and
 # is tested.
-mutate("core/sync/recovery.ts", "  await writeDurable(join(stateDir, RECORD), JSON.stringify(record));", "  await writeAtomic(join(stateDir, RECORD), JSON.stringify(record));", RC,
+mutate("core/sync/recovery.ts", "  return writeDurable(join(stateDir, RECORD), JSON.stringify(record));", "  await writeAtomic(join(stateDir, RECORD), JSON.stringify(record));\n  return null;", RC,
        pattern="records its process group", survives=("linux", "darwin"),
        why="writeDurable and writeAtomic differ only in what reaches the platter, which no test can observe: both leave the same bytes at the same path")
 mutate("core/store.ts", "    await handle.sync();\n  } finally {\n    await handle.close();\n  }\n  try {\n    await rename(tmp, path);", "  } finally {\n    await handle.close();\n  }\n  try {\n    await rename(tmp, path);",
        "tests/core/store.test.ts", pattern="writeDurable", survives=("linux", "darwin"),
        why="a flush to the platter is not observable from node: what it guarantees appears only across a power loss")
-mutate("core/store.ts", "  await flush(dir);\n}", "}", "tests/core/store.test.ts", pattern="writeDurable", survives=("linux", "darwin"),
+mutate("core/store.ts", "    await flush(dir);\n    return null;\n", "    return null;\n", "tests/core/store.test.ts", pattern="writeDurable", survives=("linux", "darwin"),
        why="a flush to the platter is not observable from node: what it guarantees appears only across a power loss")
-mutate("core/store.ts", "    await rm(tmp, { force: true });\n    throw err;\n  }\n  await flush(dir);", "    throw err;\n  }\n  await flush(dir);",
+mutate("core/store.ts", "    await rm(tmp, { force: true });\n    throw err;\n  }\n  try {\n    await flush(dir);", "    throw err;\n  }\n  try {\n    await flush(dir);",
        "tests/core/store.test.ts", pattern="temp sibling with it and throws")
 
 # Group E (the gauntlet fix wave): guards and paths no test covered. The lost-lock check at
@@ -614,3 +614,12 @@ mutate(CY, '    // --no-refresh, as at the unstage above: this rollback is index
        '    await gitOk(["reset", "-q"], { cwd: dir });\n    result.outcome = "aborted";\n    result.reason = `the secret scan could not hold back', C,
        pattern="a held-back file stays dirty and does not block", survives=("linux", "darwin"),
        why="the rollback it guards is behind the stillDirty branch, which nothing can make fire (see the declared survivor above); the same flag on the sibling rollback is caught")
+
+# B1, B2 and B3 (round 2): the snapshot's killed `add` carries its index.lock note too, only
+# an `add` of it climbs the ladder, and a directory flush that cannot run degrades once the
+# record is in place.
+SNAP_ADD = "under a clean filter slower than the base limit climbs it too"
+mutate(CY, "    if (err.result.lockNote) result.notices.push(err.result.lockNote);\n", "", C, pattern=SNAP_ADD)
+mutate(CY, ' || err.args[0] !== "add"', ' || err.args[0] === "add"', C, pattern=SNAP_ADD)
+mutate("core/store.ts", "    return `flushing ${dir} failed: ${errorText(err)}`;", "    throw err;", "tests/core/store.test.ts", pattern="directory cannot be flushed")
+mutate(CY, "  if (unflushed !== null) {\n", "  if (false) {\n", C, pattern="a state directory that cannot be flushed")
