@@ -677,3 +677,41 @@ mutate(OH, 'all.findIndex((m) => m.info.id === afterMessageId) + 1', "0", AH, pa
 mutate(OH, '            : p.state.status === "error"', '            : false', AH, pattern="readTranscript")
 mutate(OH, '        const call = `${p.tool ?? "tool"} ${JSON.stringify(p.state.input ?? {})}`;', '        const call = `${p.tool ?? "tool"}`;', AH, pattern="readTranscript")
 mutate(OH, "    const to = last !== undefined && running(last) ? all.length - 1 : all.length;", "    const to = all.length;", AH, pattern="still running in the last message")
+
+# The OpenCode adapter (spec 8): its sessions.
+OS = "adapters/opencode/sessions.ts"; AS = "tests/adapters/opencode/sessions.test.ts"
+# Spec 7.1: children and helpers are never initialized; a failed lookup is asked again.
+mutate(OS, "    if (this.input.harness.helpers.has(sessionId) || this.children.has(sessionId)) return", "    if (this.children.has(sessionId)) return", AS, pattern="summarizer's own sessions")
+mutate(OS, "      if (r.data.parentID !== undefined) {", "      if (false) {", AS, pattern="task child")
+mutate(OS, "        this.children.add(sessionId);\n", "", AS, pattern="looked up once")
+mutate(OS, 'found.kind === "top" ? found.directory : this.input.directory, found.kind === "top"', 'found.kind === "top" ? found.directory : this.input.directory, true', AS, pattern="failed lookup")
+mutate(OS, '    if (found.kind === "child") {\n      this.entries.delete(sessionId);', '    if (found.kind === "child") {\n      void 0;', AS, pattern="is a child")
+mutate(OS, '    if (found.kind === "top") entry.verified = true;\n', "", AS, pattern="confirmed by a later one")
+mutate(OS, "        if (!(await this.confirm(sessionId, entry)) || !entry.verified) return;", "        if (!(await this.confirm(sessionId, entry))) return;", AS, pattern="is a child")
+# Single-flight initialization, and the payload once per message list.
+mutate(OS, "    const existing = this.entries.get(sessionId);\n    if (existing) return existing;\n", "", AS, pattern="initialized once")
+mutate(OS, ' && !first.parts.some((p) => p.type === "text" && p.text?.includes(PAYLOAD_MARKER))', "", AS, pattern="payload goes first")
+# Spec 7.2: later status, told when new, where it arrived, and errors to the user.
+mutate(OS, "  private surface(entry: Entry, items: StatusItem[]): void {\n    const fresh = items.filter((item) => !entry.last.has(key(item)));", "  private surface(entry: Entry, items: StatusItem[]): void {\n    const fresh = items;", AS, pattern="stays is told once")
+mutate(OS, "    entry.last = new Set(items.map(key));\n    if (fresh.length === 0) return;", "    if (fresh.length === 0) return;", AS, pattern="stays is told once")
+mutate(OS, "        entry.last = new Set(result.status.map(key));\n", "", AS, pattern="never shown again")
+mutate(OS, "(later) => (later.length > 0 ? this.surface(entry, later) : undefined)", "(later) => this.surface(entry, later)", AS, pattern="never shown again")
+mutate(OS, "`${STATUS_MARKER} ${id} -->`", "`${STATUS_MARKER} -->`", AS, pattern="stays is told once")
+mutate(OS, ' && !at.parts.some((p) => p.type === "text" && p.text === text)', "", AS, pattern="stays there")
+mutate(OS, "    entry.latestUser = latest.info.id;\n", "", AS, pattern="stays there")
+mutate(OS, '      if (item.level === "error") void', "      void", AS, pattern="stays there")
+mutate(OS, "        note.anchor = latest.info.id;\n", "", AS, pattern="compaction")
+# Idle: settled first, one at a time, and once more for an idle that came during one.
+mutate(OS, "      entry.again = true;\n", "", AS, pattern="one at a time")
+mutate(OS, "        if (ctx === null) return;\n", "", AS, pattern="settle")
+mutate(OS, "        const ctx = await (await entry.init).settled;", "        const ctx = (await entry.init).context;", AS, pattern="settle")
+# remember_sync: undelivered notes lose what it said, delivered ones never change, and its
+# lines are the latest report.
+mutate(OS, "      if (!note.delivered) note.items = note.items.filter", "      note.items = note.items.filter", AS, pattern="already delivered")
+mutate(OS, "      note.delivered = true;\n", "", AS, pattern="already delivered")
+mutate(OS, "      if (!note.delivered) note.items = note.items.filter((item) => !told.has(key(item)));\n", "", AS, pattern="not delivered yet")
+mutate(OS, "    entry.last = told;\n", "", AS, pattern="adopt option")
+mutate(OS, "    // Memory off: the answer is why, which the session may also have queued as a note.\n",
+       "    if (ctx === null) return lines(result.context === null ? result.status : [...result.status, ...(await result.background)]);\n", AS, pattern="pull disabled memory is taken out")
+mutate(OS, "    if (ctx !== null) this.alert(fresh);", "    this.alert(fresh);", AS, pattern="pull disabled memory is taken out")
+mutate(OS, "  forget(sessionId: string): void {\n    this.entries.delete(sessionId);", "  forget(sessionId: string): void {\n    void 0;", AS, pattern="deleted session")
