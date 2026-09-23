@@ -40,6 +40,7 @@ export class FakeClient implements OpenCodeClient {
   prompted: Prompted[] = [];
   toasts: Array<{ message: string; variant: string }> = [];
   logs: Array<{ service: string; level: string; message: string }> = [];
+  logFails = false;
   // No TUI (headless opencode run): every toast is refused.
   toastFails = false;
   private next = 0;
@@ -82,6 +83,7 @@ export class FakeClient implements OpenCodeClient {
 
   app: OpenCodeClient["app"] = {
     log: (o) => {
+      if (this.logFails) return fail({ name: "LogError" });
       this.logs.push({ service: o.body.service, level: o.body.level, message: o.body.message });
       return ok(true);
     },

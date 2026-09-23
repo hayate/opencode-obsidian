@@ -99,6 +99,12 @@ function pathShown(path: string): string {
   return /^[^\p{Cc}\p{Cf}\u2028\u2029`]+$/u.test(path) ? `\`${path}\`` : quoted(path, Infinity);
 }
 
+// Where a truncated memory file is in full: absolute when the project's folder is known, like the
+// Project line, since a relative pointer reads as a path in the working directory.
+function fileOf(input: PayloadInput, rel: string): string {
+  return input.projectDir === null ? `Projects/${vaultName(input.project ?? "")}/${rel}` : pathShown(`${input.projectDir}/${rel}`);
+}
+
 export function buildPayload(input: PayloadInput): string {
   const budget = input.budgetChars ?? DEFAULT_BUDGET;
   const status = input.status.length ? input.status.map((s) => `- [${s.level}] ${escapeBlockTags(s.text)}`) : ["- [info] all good"];
@@ -127,7 +133,7 @@ export function buildPayload(input: PayloadInput): string {
       const share = Math.max(0, Math.floor((remaining * 0.5) / full.length) - HEAD_OVERHEAD);
       const block = [`\n### ${sel.title}`];
       for (const h of full) {
-        block.push(full.length > 1 ? `\n#### ${h.id}` : "", cut(h.body, share, `Projects/${input.project}/remember/handoffs/${h.id}.md`));
+        block.push(full.length > 1 ? `\n#### ${h.id}` : "", cut(h.body, share, fileOf(input, `remember/handoffs/${h.id}.md`)));
       }
       const rest = sel.list.slice(MAX_FULL_HEADS);
       if (rest.length) {
@@ -145,7 +151,7 @@ export function buildPayload(input: PayloadInput): string {
     for (const p of parts) remaining -= p.length;
   }
 
-  const identity = input.identity ? `\n### Identity\n${cut(input.identity, IDENTITY_CAP, `Projects/${input.project}/remember/identity.md`)}` : "";
+  const identity = input.identity ? `\n### Identity\n${cut(input.identity, IDENTITY_CAP, fileOf(input, "remember/identity.md"))}` : "";
   remaining -= identity.length;
 
   const today = [...input.todayEntries].sort((a, b) => b.id.localeCompare(a.id));
@@ -161,7 +167,7 @@ export function buildPayload(input: PayloadInput): string {
     remaining -= block.length;
   }
   if (input.recent?.trim() && remaining > 200) {
-    const block = `\n### Journal: recent\n${cut(input.recent.replace(/^# .*\n/, ""), remaining - 40, `Projects/${input.project}/remember/recent.md`)}`;
+    const block = `\n### Journal: recent\n${cut(input.recent.replace(/^# .*\n/, ""), remaining - 40, fileOf(input, "remember/recent.md"))}`;
     parts.push(block);
   }
   if (identity) parts.push(identity);

@@ -91,14 +91,15 @@ test("today's journal and recent.md are included; identity is capped", () => {
   assert.ok(p.indexOf("afternoon work") < p.indexOf("morning work"), "newest first");
   assert.match(p, /### Journal: recent\n## 2026-09-20/);
   assert.match(p, /### Identity\n/);
-  assert.match(p, /identity\.md\)/, "identity truncated with a pointer");
+  assert.match(p, /full text: `\/vault\/Projects\/kabin-api\/remember\/identity\.md`\)/, "identity truncated with a pointer");
 });
 
 test("a long handoff is truncated with a pointer to the full file, within the budget", () => {
   const long = h("big", "feat/x", "2026-09-21T10:00:00+09:00", "x".repeat(50_000));
   const p = buildPayload(base({ heads: computeHeads([long]), budgetChars: 8_000 }));
   assert.ok(p.length <= 8_000 + 200, `payload is ${p.length} chars`);
-  assert.match(p, /\(truncated; full text: Projects\/kabin-api\/remember\/handoffs\/big\.md\)/);
+  // Absolute, like the Project line: a relative pointer reads as a path in the working directory.
+  assert.match(p, /\(truncated; full text: `\/vault\/Projects\/kabin-api\/remember\/handoffs\/big\.md`\)/);
 });
 
 test("without a project the payload is just the bootstrap and the status", () => {

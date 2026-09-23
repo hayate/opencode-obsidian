@@ -95,6 +95,7 @@ mutate("core/inject.ts", '  const where = input.projectDir === null ? "" :', '  
 mutate("core/inject.ts", "`${shown} (a folder in Projects/)${where}`", "`${shown} (a folder in Projects/)`", "tests/core/inject.test.ts", pattern="line break cannot add lines")
 mutate("core/inject.ts", "u.test(path) ? `\\`${path}\\`` : quoted(path, Infinity);", "u.test(path) ? `\\`${path}\\`` : `\\`${path}\\``;", "tests/core/inject.test.ts", pattern="line break cannot add lines")
 mutate("core/inject.ts", "quoted(path, Infinity)", "quoted(path)", "tests/core/inject.test.ts", pattern="shown whole, however long")
+mutate("core/inject.ts", "input.projectDir === null ? `Projects/${vaultName(input.project ?? \"\")}/${rel}` : pathShown(`${input.projectDir}/${rel}`)", "`Projects/${input.project}/${rel}`", "tests/core/inject.test.ts", pattern="truncated with a pointer")
 mutate("core/vault.ts", '    if (code === "ENOENT" || code === "ENOTDIR") return false;\n', "    return false;\n", "tests/core/vault.test.ts", pattern="cannot be read says so")
 mutate("core/session.ts", "      project: project.name,\n      projectDir: project.dir,\n      status,", "      project: project.name,\n      projectDir: null,\n      status,", SE, pattern="happy path: clone")
 mutate("core/session.ts", "  if (early.kind === \"disabled\" && early.bare) return", "  if (early.kind === \"disabled\") return", SE)
@@ -775,6 +776,12 @@ mutate(OI, "        tellVault(event.type);\n", "", AI, pattern="told as the plug
 mutate(OI, "    () => null,\n", '    () => "memory and sync are off: fine",\n', AI, pattern="usable vault is not told")
 mutate(OI, "const problem = resolveVault(env).then(", "const problem = resolveVault({}).then(", AI, pattern="not a vault is told at load")
 mutate("core/vault.ts", "this plugin needs it set to the absolute path", "set it to the absolute path", "tests/core/vault.test.ts")
+# The load-time check: every tui.* type is skipped, the first event may come before the check ends,
+# and a failing log or toast is swallowed with the other channel still told.
+mutate(OI, 'if (told || eventType.startsWith("tui."))', 'if (told || eventType === "tui.toast.show")', AI, pattern="told as the plugin loads")
+mutate(OI, "harness.logError(p))).catch(() => undefined);", "harness.logError(p)));", AI, pattern="log that fails", runs=5)
+mutate(OI, "harness.notify(p))).catch(() => undefined);", "harness.notify(p)));", AI, pattern="log that fails", runs=5)
+mutate(OI, ("  let told = false;\n", "    void problem.then((p) => (p === null ? undefined : harness.notify(p))).catch(() => undefined);\n"), ("  let told = false;\n  let known: string | null = null;\n  void problem.then((p) => { known = p; });\n", "    if (known !== null) void harness.notify(known).catch(() => undefined);\n"), AI, pattern="before the load-time check has finished", runs=5)
 
 # The journal (gauntlet fix pass): one run per session in this process, and the position merged
 # under the machine's lock, never replacing a later one.

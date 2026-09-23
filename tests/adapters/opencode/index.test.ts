@@ -130,8 +130,10 @@ test("a missing vault is told as the plugin loads: logged at once, and a toast o
     { service: "superpower-remember-obsidian", level: "error", message: "memory and sync disabled: OBSIDIAN_VAULT_PATH is not set: this plugin needs it set to the absolute path of your Obsidian vault" },
   ]);
   assert.deepEqual(client.toasts, [], "nothing is drawn yet: the TUI may not be listening");
-  await h.event?.({ event: { type: "tui.toast.show", properties: {} } } as never);
-  assert.deepEqual(client.toasts, []);
+  for (const type of ["tui.toast.show", "tui.prompt.append", "tui.command.execute"]) {
+    await h.event?.({ event: { type, properties: {} } } as never);
+  }
+  assert.deepEqual(client.toasts, [], "the TUI's own events (every tui.* type the SDK has) are not the signal");
   await h.event?.({ event: { type: "plugin.added", properties: {} } } as never);
   await h.event?.({ event: { type: "catalog.updated", properties: {} } } as never);
   assert.deepEqual(client.toasts, [{ message: client.logs[0]?.message ?? "", variant: "error" }], "once");
@@ -166,4 +168,35 @@ test("a vault path that is not a vault is told at load with core's own reason", 
   } finally {
     delete process.env.OBSIDIAN_VAULT_PATH;
   }
+});
+
+test("the first event can come before the load-time check has finished: the toast still follows", async () => {
+  process.env.OBSIDIAN_VAULT_PATH = await tempDir(); // not a vault: finding that out reads the disk
+  try {
+    const client = new FakeClient();
+    const h = await hooks(client);
+    await h.event?.({ event: { type: "plugin.added", properties: {} } } as never);
+    assert.equal(client.logs.length, 0, "precondition: the check is still reading the disk");
+    await until("the toast", () => client.toasts.length > 0);
+    assert.match(client.toasts[0]?.message ?? "", /is not an Obsidian vault/);
+  } finally {
+    delete process.env.OBSIDIAN_VAULT_PATH;
+  }
+});
+
+test("at load, a log that fails still leaves the toast, and a TUI that refuses toasts (headless) still leaves the log; neither throws", async () => {
+  const noLog = new FakeClient();
+  noLog.logFails = true;
+  const a = await hooks(noLog);
+  await settle();
+  await a.event?.({ event: { type: "plugin.added", properties: {} } } as never);
+  await until("the toast", () => noLog.toasts.length > 0);
+  const noTui = new FakeClient();
+  noTui.toastFails = true;
+  const b = await hooks(noTui);
+  await b.event?.({ event: { type: "plugin.added", properties: {} } } as never);
+  await until("the log", () => noTui.logs.length > 0);
+  // An unhandled rejection from either channel would fail this file; give one a turn to surface.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual([noLog.logs.length, noTui.toasts.length], [0, 0]);
 });
