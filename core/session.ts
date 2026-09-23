@@ -12,7 +12,7 @@ import { buildRollups, catchUp, listEntries, type JournalContext, type JournalEn
 import { legacyReappeared, schemaVersion, SCHEMA_VERSION } from "./migrate.ts";
 import { normalizeOrigin, recordOrigin, resolveProject, type ProjectResolution } from "./project.ts";
 import { acquireLock } from "./lock.ts";
-import { branchKey, computeHeads, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
+import { branchKey, computeHeads, errorText, listHandoffs, quoted, readMemoryFile, sanitizeKey, vaultName, type Heads } from "./store.ts";
 import { runCycle, STILL_RUNNING, TIMED_OUT, type CycleResult } from "./sync/cycle.ts";
 import type { Conflict } from "./sync/resolve.ts";
 import { remoteVisibility, type Visibility } from "./sync/privacy.ts";
@@ -458,9 +458,9 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
             ? s.result.status
             : s.work.then(
                 (later) => [...s.status, ...afterSync(NOT_SHOWN, later)],
-                (err: unknown) => [...s.status, { level: "error" as const, text: `sync failed: ${(err as Error).message}` }],
+                (err: unknown) => [...s.status, { level: "error" as const, text: `sync failed: ${errorText(err)}` }],
               ),
-        (err: unknown) => [{ level: "error" as const, text: `memory and sync disabled: unexpected error: ${(err as Error).message}` }],
+        (err: unknown) => [{ level: "error" as const, text: `memory and sync disabled: unexpected error: ${errorText(err)}` }],
       );
       const line: StatusItem = {
         level: "error",
@@ -478,13 +478,13 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
     const project = started.shared.resolved;
     const status = started.status;
     if (first.kind === "done") status.push(...first.value.items);
-    if (first.kind === "failed") status.push({ level: "error", text: `sync failed: ${(first.err as Error).message}` });
+    if (first.kind === "failed") status.push({ level: "error", text: `sync failed: ${errorText(first.err)}` });
     if (first.kind === "timeout") status.push({ level: "warn", text: "sync still running - memory may be stale" });
     const background =
       first.kind === "timeout"
         ? work.then(
             (later) => afterSync(project, later),
-            (err: unknown) => [{ level: "error" as const, text: `sync failed: ${(err as Error).message}` }],
+            (err: unknown) => [{ level: "error" as const, text: `sync failed: ${errorText(err)}` }],
           )
         : Promise.resolve([]);
     if (project.kind === "disabled") return disabled(opts.bootstrap, project.reason, status, background);
@@ -549,7 +549,7 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
     });
     return { payload, status, context: ctx, background };
   } catch (err) {
-    return disabled(opts.bootstrap, `unexpected error: ${(err as Error).message}`);
+    return disabled(opts.bootstrap, `unexpected error: ${errorText(err)}`);
   } finally {
     clearTimeout(timer);
   }

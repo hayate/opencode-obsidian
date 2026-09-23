@@ -51,6 +51,22 @@ export function quoted(value: string): string {
   });
 }
 
+// The built-in kinds, which are what a bug of ours throws: their message says what went
+// wrong but never where it came from, so "sync aborted: x is not a function" could be read
+// as a bad repository. The plugin's own classes (git.ts's GitError and its subclasses,
+// this file's MemoryPathError) write their whole message for the user, spec 5.6's
+// stranded-lock sentence among them, so naming their kind would only get in the way.
+const BUG_KINDS = new Set(["TypeError", "RangeError", "ReferenceError", "SyntaxError", "EvalError", "URIError", "AggregateError"]);
+
+// What a thrown value says, for a status line. A catch-all catches whatever was thrown,
+// and `(err as Error).message` on a value that is not an Error (a string, a rejected
+// promise's value, a null from a library) renders "sync aborted: undefined", which says
+// nothing at all.
+export function errorText(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  return BUG_KINDS.has(err.name) ? `${err.name}: ${err.message}` : err.message;
+}
+
 // A folder name from the vault, shown as is when it is plain, quoted otherwise.
 export function vaultName(name: string): string {
   return /^[^\p{Cc}\p{Cf}\u2028\u2029`]{1,120}$/u.test(name) ? name : quoted(name);

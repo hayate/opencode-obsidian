@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { git, GitError, gitOk, literal, LOCAL_TIMEOUT_MS, NETWORK_TIMEOUT_MS } from "../git.ts";
 import { acquireLock, type LockHandle } from "../lock.ts";
 import { EMPTY_TREE, redactUrlCredentials, scanRange, scanStaged, scanText } from "../secrets.ts";
-import { quoted, writeAtomic } from "../store.ts";
+import { errorText, quoted, writeAtomic } from "../store.ts";
 import { ensureStateClone } from "./clone.ts";
 import { conflictStamp } from "./copies.ts";
 import { clearInterrupted, finishInterrupted, recordIntent, recordInterrupted, RepairTimedOut, runningUpdate, type Finished } from "./recovery.ts";
@@ -93,9 +93,13 @@ export async function changedSince(root: string, before: Map<string, Stamp>): Pr
 }
 
 // Raw stdout, never gitOk's trimmed form: a -z listing's last name may end in a space.
+// A killed git prints nothing, so the reason says `timed out` or the exit code rather
+// than ending at the colon, as its siblings in recovery.ts do.
 async function zList(cwd: string, args: string[]): Promise<string[]> {
   const r = await git(["-c", "core.quotePath=false", ...args, "-z"], { cwd });
-  if (r.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim()}`);
+  if (r.code !== 0 || r.timedOut) {
+    throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim() || (r.timedOut ? "timed out" : `exit ${r.code}`)}`);
+  }
   return r.stdout.split("\0").filter(Boolean);
 }
 
@@ -241,20 +245,29 @@ async function rev(cwd: string, ref: string): Promise<string | null> {
   return r.code === 0 ? r.stdout.trim() : null;
 }
 
-type Seen = { kind: "absent" } | { kind: "seen"; commit: string } | { kind: "unreadable" } | { kind: "unknown" };
+type Seen = { kind: "absent" } | { kind: "seen"; commit: string } | { kind: "unreadable"; detail: string } | { kind: "unknown"; detail: string };
 
 // refs/sro/remote-seen, three ways (verified, git 2.50.1): show-ref --exists says
 // present (0) or absent (2), and a present ref must name a commit. show-ref --verify
 // and rev-parse read a ref file git cannot parse as absent, which would skip the
 // rewrite check and merge or push back what a rewrite dropped.
+//
+// "Unreadable" carries git's own words and claims no more than the exit code supports.
+// Its reason prescribes deleting the ref, the one command that turns the rewrite check
+// off, so it is given only for an exit that is evidence about the ref: 1, which is what
+// show-ref answers for a ref it cannot look up (measured, git 2.50.1: exit 1, "error:
+// failed to look up reference"), and a rev-parse that cannot resolve a ref show-ref found.
+// Any other exit (129, the usage error a git without --exists gives) says nothing about
+// the ref, so it is "could not tell" and the next cycle asks again.
 async function remoteSeen(dir: string): Promise<Seen> {
   const exists = await git(["show-ref", "--exists", REMOTE_SEEN], { cwd: dir });
-  if (exists.timedOut) return { kind: "unknown" };
+  if (exists.timedOut) return { kind: "unknown", detail: "timed out" };
   if (exists.code === 2) return { kind: "absent" };
-  if (exists.code !== 0) return { kind: "unreadable" };
+  if (exists.code === 1) return { kind: "unreadable", detail: firstLines(exists.stderr) || "git show-ref exited 1" };
+  if (exists.code !== 0) return { kind: "unknown", detail: firstLines(exists.stderr) || `git show-ref exited ${exists.code}` };
   const r = await git(["rev-parse", "-q", "--verify", `${REMOTE_SEEN}^{commit}`], { cwd: dir });
-  if (r.timedOut) return { kind: "unknown" };
-  return r.code === 0 ? { kind: "seen", commit: r.stdout.trim() } : { kind: "unreadable" };
+  if (r.timedOut) return { kind: "unknown", detail: "timed out" };
+  return r.code === 0 ? { kind: "seen", commit: r.stdout.trim() } : { kind: "unreadable", detail: firstLines(r.stderr) || `git rev-parse exited ${r.code}` };
 }
 
 function emptyResult(): CycleResult {
@@ -355,14 +368,19 @@ async function snapshot(input: CycleInput, ladder: Ladder, result: CycleResult):
   return { ok: true, pushAllowed: (await changedSince(dir, before)).length === 0 };
 }
 
-type Ancestry = "yes" | "no" | "unknown";
+type Ancestry = { kind: "yes" } | { kind: "no" } | { kind: "unknown"; detail: string };
 
 // merge-base --is-ancestor: 0 is yes, 1 is no, anything else (a missing object, a
-// timeout) is "could not tell", which stops the cycle instead of reading as "no".
+// timeout) is "could not tell", which stops the cycle instead of reading as "no". "Could
+// not tell" carries git's own first lines, or `timed out`, or the exit code: a corrupt
+// object in the clone repeats this every cycle, and without them the reason says only
+// that a comparison failed, with nothing anywhere to say why (the plugin has no log).
 async function ancestry(cwd: string, a: string, b: string): Promise<Ancestry> {
   const r = await git(["merge-base", "--is-ancestor", a, b], { cwd });
-  if (r.timedOut) return "unknown";
-  return r.code === 0 ? "yes" : r.code === 1 ? "no" : "unknown";
+  if (r.timedOut) return { kind: "unknown", detail: "timed out" };
+  if (r.code === 0) return { kind: "yes" };
+  if (r.code === 1) return { kind: "no" };
+  return { kind: "unknown", detail: firstLines(r.stderr) || `git exited ${r.code}` };
 }
 
 // A status line, not a transcript: at most the first 10 items, then a count of
@@ -508,11 +526,11 @@ async function integrate(clone: string, input: CycleInput, live: string): Promis
   // remote-seen lives in the live repo, which keeps its commit reachable; a rebuilt
   // clone has it too, since a local clone links the whole object store.
   const seen = await remoteSeen(input.projectsDir);
-  if (seen.kind === "unknown") return { kind: "unsynced", reason: `reading ${REMOTE_SEEN} timed out` };
+  if (seen.kind === "unknown") return { kind: "unsynced", reason: `reading ${REMOTE_SEEN} failed: ${seen.detail}` };
   if (seen.kind === "unreadable") {
     return {
       kind: "stopped",
-      reason: `${REMOTE_SEEN} in Projects/ does not name a commit git can read, so a rewritten remote could go unnoticed. If the remote's history was not rewritten, delete it (git update-ref -d ${REMOTE_SEEN}) and sync again.`,
+      reason: `${REMOTE_SEEN} in Projects/ could not be read as a commit (${seen.detail}), so a rewritten remote could go unnoticed. If the remote's history was not rewritten, delete it (git update-ref -d ${REMOTE_SEEN}) and sync again.`,
     };
   }
   const fetched = await git(["fetch", "-q", "origin", `+refs/heads/${b}:refs/remotes/origin/${b}`], {
@@ -529,8 +547,8 @@ async function integrate(clone: string, input: CycleInput, live: string): Promis
 
   if (seen.kind === "seen") {
     const kept = await ancestry(clone, seen.commit, upstream);
-    if (kept === "unknown") return { kind: "unsynced", reason: "could not tell whether the remote's history was rewritten" };
-    if (kept === "no") {
+    if (kept.kind === "unknown") return { kind: "unsynced", reason: `could not tell whether the remote's history was rewritten: ${kept.detail}` };
+    if (kept.kind === "no") {
       if (!input.adoptRewrite) {
         return {
           kind: "stopped",
@@ -554,11 +572,11 @@ async function integrate(clone: string, input: CycleInput, live: string): Promis
   }
 
   const sent = await ancestry(clone, live, upstream);
-  if (sent === "unknown") return { kind: "unsynced", reason: "could not compare the live snapshot with the remote" };
-  if (sent === "yes") return { kind: "ok", next: upstream, needsPush: false, conflicts: [] };
+  if (sent.kind === "unknown") return { kind: "unsynced", reason: `could not compare the live snapshot with the remote: ${sent.detail}` };
+  if (sent.kind === "yes") return { kind: "ok", next: upstream, needsPush: false, conflicts: [] };
   const ahead = await ancestry(clone, upstream, live);
-  if (ahead === "unknown") return { kind: "unsynced", reason: "could not compare the remote with the live snapshot" };
-  if (ahead === "yes") return outbound(clone, input, upstream, live, false, []);
+  if (ahead.kind === "unknown") return { kind: "unsynced", reason: `could not compare the remote with the live snapshot: ${ahead.detail}` };
+  if (ahead.kind === "yes") return outbound(clone, input, upstream, live, false, []);
 
   const merged = await mergeAndResolve(clone, upstream, live, { when });
   if (merged.kind === "stop") return { kind: "stopped", reason: stopReason(merged) };
@@ -766,7 +784,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
     return result;
   } catch (err) {
     result.outcome = "aborted";
-    result.reason = (err as Error).message;
+    result.reason = errorText(err);
     return result;
   } finally {
     // A throw here would replace the cycle's result: report it in the reason.
@@ -774,7 +792,7 @@ export async function runCycle(input: CycleInput): Promise<CycleResult> {
       try {
         await lock.release();
       } catch (err) {
-        const failed = `releasing the sync lock failed: ${(err as Error).message}`;
+        const failed = `releasing the sync lock failed: ${errorText(err)}`;
         result.reason = result.reason ? `${result.reason}; ${failed}` : failed;
       }
     }

@@ -506,7 +506,10 @@ test("runCycle never throws: a Projects/ that does not exist is an aborted cycle
   const base = await tempDir();
   const r = await runCycle({ timezone: TZ, projectsDir: join(base, "missing"), remote: join(base, "r.git"), branch: "main", stateDir: join(base, "state"), machine: "a" });
   assert.equal(r.outcome, "aborted");
-  assert.ok(r.reason);
+  // The widest catch-all renders whatever was thrown: a plain Error here, whose message
+  // stands on its own, and never the "undefined" a non-Error used to render as.
+  assert.ok(r.reason && !r.reason.includes("undefined"), r.reason ?? "(no reason)");
+  assert.doesNotMatch(r.reason ?? "", /^Error: /);
 });
 
 test(
@@ -843,10 +846,81 @@ test("a remote-seen that cannot be read stops the cycle instead of skipping the 
     await forcePushBack(remote, before);
     const r = await cycle(remote, a);
     assert.equal(r.outcome, "stopped", `${label}: ${r.reason}`);
-    assert.match(r.reason ?? "", /remote-seen/);
+    // git's own words, or the exit code when `-q` left none: the reason prescribes
+    // deleting the ref, so it must say what was actually wrong with it.
+    const detail = {
+      "names a missing object": "git rev-parse exited 1",
+      "names a tree, not a commit": "error: refs/sro/remote-seen^{commit}: expected commit type, but the object dereferences to tree type",
+      "is a ref file git cannot parse": "error: failed to look up reference: Invalid argument",
+    }[label];
+    assert.equal(
+      r.reason,
+      `refs/sro/remote-seen in Projects/ could not be read as a commit (${detail}), so a rewritten remote could go unnoticed. If the remote's history was not rewritten, delete it (git update-ref -d refs/sro/remote-seen) and sync again.`,
+      label,
+    );
     assert.equal(stoppedMentions(r), 1, statusFromCycle(r)[0]?.text);
     assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), before, `${label}: nothing pushed back`);
   }
+});
+
+// B3 (the gauntlet fix wave): show-ref answers 1 for a ref it cannot look up and 2 for one
+// that is not there. Any other exit says nothing about the ref, so it must not be read as
+// "the ref is corrupt, delete it" - that is the one command that turns off the force-push
+// protection. The cycle says it could not tell, and the next one asks again.
+test("a show-ref that could not answer at all leaves the cycle unsynced, never prescribing the deletion that turns the rewrite check off", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  await writeRel(a.projects, "x/first.md", "1\n");
+  assert.ok((await cycle(remote, a)).pushed);
+  const seen = await gitOk(["rev-parse", "main"], { cwd: remote });
+  let r: CycleResult | undefined;
+  // Exit 129 is git's usage error: what a git without --exists would answer.
+  await withGitFailing("--exists", async () => { r = await cycle(remote, a); }, "error: unknown option `exists'", 129);
+  assert.equal(r?.outcome, "unsynced", r?.reason ?? "");
+  assert.equal(r?.reason, "reading refs/sro/remote-seen failed: error: unknown option `exists'");
+  assert.doesNotMatch(r?.reason ?? "", /update-ref -d/, "no deletion is prescribed for a git that could not answer");
+  assert.equal(await gitOk(["rev-parse", REMOTE_SEEN], { cwd: a.projects }), seen, "and the ref is still there");
+  // A git that printed nothing still says what happened.
+  await withGitFailing("--exists", async () => { r = await cycle(remote, a); }, "", 129);
+  assert.equal(r?.reason, "reading refs/sro/remote-seen failed: git show-ref exited 129");
+  assert.equal((await cycle(remote, a)).outcome, "synced", "and the next cycle runs normally");
+});
+
+// B2 (the gauntlet fix wave): a -z listing that fails says `timed out` or the exit code
+// when git printed nothing, as its five siblings in recovery.ts do. Four call sites
+// inherited a message that ended at the colon.
+test("a -z listing that fails carries git's words, and the exit code when git printed none", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  await writeRel(a.projects, "x/first.md", "1\n");
+  let r: CycleResult | undefined;
+  // --stage is this listing's alone: the snapshot's check for repositories inside Projects/.
+  await withGitFailing("--stage", async () => { r = await cycle(remote, a); }, "fatal: this operation must be run in a work tree");
+  assert.equal(r?.outcome, "aborted", r?.reason ?? "");
+  assert.equal(r?.reason, "git ls-files --stage failed: fatal: this operation must be run in a work tree");
+  await withGitFailing("--stage", async () => { r = await cycle(remote, a); }, "");
+  assert.equal(r?.reason, "git ls-files --stage failed: exit 128", "never a reason that ends at the colon");
+  assert.ok((await cycle(remote, a)).pushed, "and the next cycle runs normally");
+});
+
+// B4 (the gauntlet fix wave): the widest catch-all kept only `.message`, which renders
+// "undefined" for a value that is not an Error, and dropped the kind, which is the only
+// thing distinguishing a bug of ours from a bad repository. A vault timezone Intl refuses
+// is a real one: the conflict stamp throws a RangeError from inside the cycle.
+test("an aborted cycle names the kind of a built-in error, and leaves the plugin's own sentences alone", async () => {
+  const { remote, m } = await setup(["a"]);
+  const [a] = m as [Machine];
+  await writeRel(a.projects, "x/first.md", "1\n");
+  const bug = await runCycle({ timezone: "Not/AZone", projectsDir: a.projects, remote, branch: "main", stateDir: a.state, machine: "a", quietMs: 0 });
+  assert.equal(bug.outcome, "aborted", bug.reason ?? "");
+  assert.equal(bug.reason, "RangeError: Invalid time zone specified: Not/AZone");
+  // A GitError's message is already written for the user: no kind is put in front of it.
+  let r: CycleResult | undefined;
+  // -A is the snapshot's staging alone.
+  await withGitFailing("-A", async () => { r = await cycle(remote, a); }, "fatal: unable to write new index file");
+  assert.equal(r?.outcome, "aborted", r?.reason ?? "");
+  assert.equal(r?.reason, "git add -A exited 128: fatal: unable to write new index file");
+  assert.ok((await cycle(remote, a)).pushed, "and the next cycle runs normally");
 });
 
 test("adopting a rewritten remote carries over only the changes this machine had not sent", async () => {
@@ -1650,13 +1724,39 @@ test("a temporary index a killed cycle left in the state clone is swept away", a
   assert.deepEqual((await readdir(clone)).filter((n) => n.startsWith("sro-index-")), []);
 });
 
+// What a message becomes inside the shims' single-quoted `echo` (git's own words hold
+// apostrophes: "error: unknown option `exists'").
+const shellQuoted = (text: string): string => text.split("'").join(`'\\''`);
+
 // Runs fn with a git on PATH that fails `merge-base --is-ancestor <pair>` as an
 // object git cannot read would (exit 128), and runs the real git for everything
 // else: an ancestry git cannot tell is not something a test can set up on demand.
-async function withAncestryFailing(pair: string, fn: () => Promise<void>): Promise<void> {
+// `says` is what it prints on stderr; empty, it prints nothing at all, which is what a
+// killed git leaves and what makes the exit-code fallback the only thing to say.
+async function withAncestryFailing(pair: string, fn: () => Promise<void>, says = "fatal: could not parse commit"): Promise<void> {
   const dir = await tempDir();
   const real = `${await gitOk(["--exec-path"], { cwd: dir })}/git`;
-  const script = `#!/bin/sh\nif [ "$1" = merge-base ] && [ "$2" = --is-ancestor ] && [ "$3 $4" = '${pair}' ]; then\n  echo "fatal: could not parse commit" >&2\n  exit 128\nfi\nexec '${real}' "$@"\n`;
+  const complain = says ? `  echo '${shellQuoted(says)}' >&2\n` : "";
+  const script = `#!/bin/sh\nif [ "$1" = merge-base ] && [ "$2" = --is-ancestor ] && [ "$3 $4" = '${pair}' ]; then\n${complain}  exit 128\nfi\nexec '${real}' "$@"\n`;
+  await writeFile(join(dir, "git"), script, { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${dir}:${path}`;
+  try {
+    await fn();
+  } finally {
+    process.env.PATH = path;
+  }
+}
+
+// Runs fn with a git on PATH that fails whenever its arguments hold `match`, printing
+// `says` (empty: nothing, as a killed git leaves) and exiting `code`; everything else is
+// the real git. The failures these stage (a corrupt object, a lookup git cannot answer)
+// are not ones a test can set up on demand.
+async function withGitFailing(match: string, fn: () => Promise<void>, says = "fatal: bad object", code = 128): Promise<void> {
+  const dir = await tempDir();
+  const real = `${await gitOk(["--exec-path"], { cwd: dir })}/git`;
+  const complain = says ? `  echo '${shellQuoted(says)}' >&2\n` : "";
+  const script = `#!/bin/sh\ncase " $* " in\n  *' ${match} '*|*"${match}"*)\n${complain}  exit ${code}\n  ;;\nesac\nexec '${real}' "$@"\n`;
   await writeFile(join(dir, "git"), script, { mode: 0o755 });
   const path = process.env.PATH;
   process.env.PATH = `${dir}:${path}`;
@@ -1687,10 +1787,21 @@ test("an ancestry git cannot tell leaves the cycle unsynced, with nothing pushed
       r = await cycle(remote, a);
     });
     assert.equal(r?.outcome, "unsynced", `${reason}: ${r?.reason}`);
-    assert.equal(r?.reason, reason);
+    // git's own words go with it: this repeats every cycle, and the plugin has no log.
+    assert.equal(r?.reason, `${reason}: fatal: could not parse commit`);
     assert.equal(await gitOk(["rev-parse", "main"], { cwd: remote }), seen, `${reason}: nothing pushed`);
     assert.equal(await gitOk(["rev-parse", "HEAD"], { cwd: a.projects }), live, `${reason}: the vault is as it was`);
   }
+  // A git that printed nothing (a killed one leaves nothing) still says what happened.
+  let silent: CycleResult | undefined;
+  await withAncestryFailing(
+    `${seen} ${seen}`,
+    async () => {
+      silent = await cycle(remote, a);
+    },
+    "",
+  );
+  assert.equal(silent?.reason, "could not tell whether the remote's history was rewritten: git exited 128");
   const r = await cycle(remote, a);
   assert.ok(r.pushed, r.reason ?? "");
   assert.equal(await remoteFile(remote, "x/by-hand.md"), "h");

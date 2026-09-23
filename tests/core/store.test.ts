@@ -7,6 +7,7 @@ import {
   computeHeads,
   createAt,
   createExclusive,
+  errorText,
   listHandoffs,
   MALFORMED_BRANCH,
   parseDoc,
@@ -264,5 +265,36 @@ test("writeHandoff throws when another holder keeps the handoff lock", async () 
     await assert.rejects(writeHandoff(input(p, "ses_aaaaaaaa1", "blocked", [])), /is busy/);
   } finally {
     await held.release();
+  }
+});
+
+// B4 (the gauntlet fix wave): the widest catch-alls render whatever was thrown. A value
+// that is not an Error has no .message, and `(err as Error).message` on one renders
+// "sync aborted: undefined"; and a built-in kind, which is what a bug of ours throws, is
+// named, so a TypeError from a resolver bug is not indistinguishable from a bad repository.
+test("errorText renders what was thrown, whatever it is, and names the built-in kinds a bug throws", () => {
+  assert.equal(errorText(new Error("plain")), "plain");
+  assert.equal(errorText(new TypeError("x is not a function")), "TypeError: x is not a function");
+  assert.equal(errorText(new RangeError("Invalid time zone specified: zz")), "RangeError: Invalid time zone specified: zz");
+  for (const kind of [ReferenceError, SyntaxError, EvalError, URIError]) {
+    assert.equal(errorText(new kind("boom")), `${kind.name}: boom`, kind.name);
+  }
+  // The plugin's own classes write their whole message for the user (spec 5.6's
+  // stranded-lock sentence is one): naming their kind would only get in the way.
+  class GitError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = "GitError";
+    }
+  }
+  assert.equal(errorText(new GitError("git left a lock file behind: ...")), "git left a lock file behind: ...");
+  for (const [thrown, reads] of [
+    ["a bare string", "a bare string"],
+    [null, "null"],
+    [undefined, "undefined"],
+    [42, "42"],
+    [{ message: "not an Error" }, "[object Object]"],
+  ] as Array<[unknown, string]>) {
+    assert.equal(errorText(thrown), reads, JSON.stringify(thrown));
   }
 });

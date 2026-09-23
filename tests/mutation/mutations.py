@@ -141,7 +141,7 @@ mutate("core/sync/recovery.ts", '    await remove(dir, unit[0] ?? "");\n', "", R
 mutate("core/sync/recovery.ts", "  if (head === record.to) {", "  if (false) {", RC)
 # cycle.ts: two parents, the rewrite stop, adopt, the outbound scan, step 5.
 mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-p", live, "-m", message]', '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-m", message]', C, pattern='a snapshot pushed before step 5 failed is never merged again|a note deleted after a push whose acknowledgement was lost')
-mutate("core/sync/cycle.ts", '    if (kept === "no") {', "    if (false) {", C, pattern='a rewritten remote stops the cycle: nothing is merged')
+mutate("core/sync/cycle.ts", '    if (kept.kind === "no") {', "    if (false) {", C, pattern='a rewritten remote stops the cycle: nothing is merged')
 mutate("core/sync/cycle.ts", '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-m", message]', '[...NO_SIGN, "commit-tree", merged.tree, "-p", upstream, "-p", live, "-m", message]', C, pattern='adopting a rewritten remote carries over only the changes')
 mutate("core/sync/cycle.ts", "if (!(await exempt(to, file))) inTree.push(file);", "inTree.push(file);", C, pattern="what the remote already holds never blocks")
 mutate("core/sync/cycle.ts", "  const { inCommits, inTree, generatedMessage } = await outboundHits(clone, from, to, built);",
@@ -169,8 +169,15 @@ mutate(F_R, "if (s) (sides[n].has.has(key(s)) ? versions.push({ path, entry: s }
 mutate(F_R, "if (s) (sides[n].has.has(key(s)) ? versions.push({ path, entry: s }) : candidates.push(s));", "if (s) candidates.push(s);", R, pattern="renamed here and edited there, clashing")
 mutate(F_R, "if (record.type !== COLLISION && resolvedElsewhere(record.paths)) continue;", "if (resolvedElsewhere(record.paths)) continue;", R, pattern="keeps all three versions")
 # cycle-clone
-mutate(CY, '  if (exists.code === 2) return { kind: "absent" };\n  if (exists.code !== 0) return { kind: "unreadable" };', '  if (exists.code !== 0) return { kind: "absent" };', C, pattern=P)
-mutate(CY, 'return r.code === 0 ? { kind: "seen", commit: r.stdout.trim() } : { kind: "unreadable" };', 'return r.code === 0 ? { kind: "seen", commit: r.stdout.trim() } : { kind: "absent" };', C, pattern=P)
+mutate(CY, '  if (exists.code === 2) return { kind: "absent" };\n', '  if (exists.code !== 0) return { kind: "absent" };\n', C, pattern=P)
+mutate(CY, '  if (exists.code !== 0) return { kind: "unknown", detail: firstLines(exists.stderr) || `git show-ref exited ${exists.code}` };\n',
+       '  if (exists.code !== 0) return { kind: "unreadable", detail: firstLines(exists.stderr) || `git show-ref exited ${exists.code}` };\n', C,
+       pattern="show-ref that could not answer")
+mutate(CY, '  if (seen.kind === "unknown") return { kind: "unsynced", reason: `reading ${REMOTE_SEEN} failed: ${seen.detail}` };\n', "", C, pattern="show-ref that could not answer")
+mutate(CY, '{ kind: "unreadable", detail: firstLines(r.stderr) || `git rev-parse exited ${r.code}` };',
+       '{ kind: "unreadable", detail: firstLines(r.stderr) };', C, pattern="a remote-seen that cannot be read")
+mutate(CY, 'return r.code === 0 ? { kind: "seen", commit: r.stdout.trim() } : { kind: "unreadable", detail: firstLines(r.stderr) || `git rev-parse exited ${r.code}` };',
+       'return r.code === 0 ? { kind: "seen", commit: r.stdout.trim() } : { kind: "absent" };', C, pattern=P)
 mutate(CY, '  if (seen.kind === "unreadable") {', '  if (false) {', C, pattern=P)
 mutate(K, '  if ((await ask(["rev-parse", "--is-bare-repository"])) !== "true") return false;\n', '', CL, pattern="core.bare turned off")
 mutate(K, '  if ((await ask(["rev-parse", "--show-ref-format"])) !== "files") return false;\n', '', CL, pattern="reftable \\(locks")
@@ -276,16 +283,22 @@ mutate(CY, "    if (own) continue;\n", "", C, pattern="scans what it carries ove
 mutate(CY, "  for (const file of (await scanRange(clone, from, to)).keys()) if (!(await exempt(to, file))) inTree.push(file);\n", "", C, pattern="scans what it carries over")
 mutate(CY, "      conflicts = integration.conflicts;\n", "      conflicts = integration.conflicts;\n      result.conflicts = conflicts;\n", C, pattern="only once its copy is on the remote")
 mutate(CY, "(a force-push): nothing the rewrite", "(a force-push): sync stopped, so nothing the rewrite", C, pattern="a rewritten remote stops the cycle")
-mutate(CY, "does not name a commit git can read, so a rewritten remote could go unnoticed",
-       "does not name a commit git can read: sync stopped, so a rewritten remote cannot go unnoticed", C, pattern="a remote-seen that cannot be read")
+mutate(CY, "could not be read as a commit (${seen.detail}), so a rewritten remote could go unnoticed",
+       "could not be read as a commit: sync stopped, so a rewritten remote cannot go unnoticed", C, pattern="a remote-seen that cannot be read")
 mutate(CY, 'const named = stop.paths.length ? `: ${joinNames(stop.paths)}` : "";', "const named = `: ${joinNames(stop.paths)}`;", C, pattern="no dangling colon")
 mutate(CY, 'if (merged.tree === (await gitOk(["rev-parse", `${upstream}^{tree}`], { cwd: clone }))) {', 'if (false && merged.tree === (await gitOk(["rev-parse", `${upstream}^{tree}`], { cwd: clone }))) {', C,
        pattern="nothing unsent pushes nothing")
 mutate(CY, '  for (const name of await readdir(clone)) if (name.startsWith("sro-index-")) await rm(join(clone, name), { force: true });\n', "", C, pattern="a temporary index a killed cycle left")
-mutate(CY, "    if (kept === \"unknown\") return { kind: \"unsynced\", reason: \"could not tell whether the remote's history was rewritten\" };\n", "", C, pattern="an ancestry git cannot tell")
-mutate(CY, '  if (sent === "unknown") return { kind: "unsynced", reason: "could not compare the live snapshot with the remote" };\n', "", C, pattern="an ancestry git cannot tell")
-mutate(CY, '  if (ahead === "unknown") return { kind: "unsynced", reason: "could not compare the remote with the live snapshot" };\n', "", C, pattern="an ancestry git cannot tell")
-mutate(CY, 'return r.code === 0 ? "yes" : r.code === 1 ? "no" : "unknown";', 'return r.code === 0 ? "yes" : "no";', C, pattern="an ancestry git cannot tell")
+mutate(CY, "    if (kept.kind === \"unknown\") return { kind: \"unsynced\", reason: `could not tell whether the remote's history was rewritten: ${kept.detail}` };\n", "", C,
+       pattern="an ancestry git cannot tell")
+mutate(CY, '  if (sent.kind === "unknown") return { kind: "unsynced", reason: `could not compare the live snapshot with the remote: ${sent.detail}` };\n', "", C,
+       pattern="an ancestry git cannot tell")
+mutate(CY, '  if (ahead.kind === "unknown") return { kind: "unsynced", reason: `could not compare the remote with the live snapshot: ${ahead.detail}` };\n', "", C,
+       pattern="an ancestry git cannot tell")
+mutate(CY, '  if (r.code === 1) return { kind: "no" };\n  return { kind: "unknown", detail: firstLines(r.stderr) || `git exited ${r.code}` };',
+       '  return { kind: "no" };', C, pattern="an ancestry git cannot tell")
+mutate(CY, "return { kind: \"unknown\", detail: firstLines(r.stderr) || `git exited ${r.code}` };", 'return { kind: "unknown", detail: firstLines(r.stderr) };', C,
+       pattern="an ancestry git cannot tell")
 mutate("core/session.ts", "; no version was lost, and any copy made sits beside its note", ", each with its copy beside it", SE, pattern="statusFromCycle gives each conflict")
 # Task 7's review (fix round 1): a candidate the first pass dropped, three guards now pinned
 # by tests of their own, and the type check's place before any skip.
@@ -492,3 +505,21 @@ mutate(CY, "  if (generatedMessage) {", "  if (false) {", C, pattern=GENERATED)
 mutate(CY, "      if (own) generatedMessage = true;\n      else inCommits.push({ file: null, commit });\n", "      inCommits.push({ file: null, commit });\n", C, pattern=GENERATED)
 mutate(CY, "and the folders it would send (${joinNames(projects)})", 'and the folders it would send (${projects.join(", ")})', C, pattern=GENERATED)
 mutate(CY, "this machine's name (${quoted(input.machine)})", "this machine's name (${input.machine})", C, pattern=GENERATED)
+
+# B2, B3 and B4 (the gauntlet fix wave): a reason that reaches the user carries git's own
+# first lines, or `timed out`, or the exit code, and never nothing; the plugin refuses a git
+# older than the one 5.3-5.4 were verified against; and a catch-all renders whatever was
+# thrown, name and all.
+mutate(CY, '''  if (r.code !== 0 || r.timedOut) {
+    throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim() || (r.timedOut ? "timed out" : `exit ${r.code}`)}`);
+  }''', '  if (r.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim()}`);', C, pattern="a -z listing that fails")
+mutate("core/sync/state.ts", '  const old = await gitVersionProblem(vault.root);\n  if (old) return { kind: "stopped", reason: old };\n', "", S, pattern="older than the minimum")
+mutate("core/sync/state.ts", "if (major > MIN_GIT.major || (major === MIN_GIT.major && minor >= MIN_GIT.minor)) return null;",
+       "if (major > MIN_GIT.major || (major === MIN_GIT.major && minor > MIN_GIT.minor)) return null;", S, pattern="at the minimum")
+mutate("core/sync/state.ts", "const MIN_GIT = { major: 2, minor: 47 };", "const MIN_GIT = { major: 2, minor: 39 };", S, pattern="older than the minimum")
+mutate("core/sync/state.ts", "  if (found === null || !Number.isInteger(major) || !Number.isInteger(minor)) {\n", "  if (false) {\n", S, pattern="older than the minimum")
+mutate("core/store.ts", "  if (!(err instanceof Error)) return String(err);\n", "", "tests/core/store.test.ts", pattern="errorText renders")
+mutate("core/store.ts", "return BUG_KINDS.has(err.name) ? `${err.name}: ${err.message}` : err.message;", "return err.message;", "tests/core/store.test.ts", pattern="errorText renders")
+mutate("core/store.ts", 'const BUG_KINDS = new Set(["TypeError", "RangeError",', 'const BUG_KINDS = new Set(["TypeError",', "tests/core/store.test.ts", pattern="errorText renders")
+mutate("core/store.ts", "return BUG_KINDS.has(err.name)", "return !BUG_KINDS.has(err.name)", "tests/core/store.test.ts", pattern="errorText renders")
+mutate(CY, "    result.reason = errorText(err);\n", "    result.reason = (err as Error).message;\n", C, pattern="names the kind of a built-in")

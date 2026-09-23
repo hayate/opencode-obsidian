@@ -599,3 +599,57 @@ test("the emptiness check never follows a symlink, so bootstrap cannot delete ou
   assert.equal(await readFile(join(outside, ".DS_Store"), "utf8"), "outside");
   assert.match(await gitOk(["ls-tree", "HEAD", "escape"], { cwd: v.projectsDir }), /^120000 /, "committed as a link, not followed");
 });
+
+// B3 (the gauntlet fix wave): spec 5.3-5.4 were verified against git 2.47, and the cycle
+// leans on `show-ref --exists` (2.43) to tell a remote-seen that is absent from one git
+// cannot parse. An older git would skip the rewrite check and fail later, inside a cycle,
+// with git's own wording for a flag it does not know. The version is read once, where sync
+// state is detected, before anything touches Projects/.
+async function withGitSaying(version: string, fn: () => Promise<void>): Promise<void> {
+  const dir = await tempDir();
+  const real = `${await gitOk(["--exec-path"], { cwd: dir })}/git`;
+  await writeFile(join(dir, "git"), `#!/bin/sh\nif [ "$1" = --version ]; then\n  echo '${version}'\n  exit 0\nfi\nexec '${real}' "$@"\n`, { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${dir}:${path}`;
+  try {
+    await fn();
+  } finally {
+    process.env.PATH = path;
+  }
+}
+
+test("a git older than the minimum stops sync before anything touches Projects/, naming the minimum and what it found", async () => {
+  for (const [version, reason] of [
+    ["git version 2.39.5 (Apple Git-154)", "sync needs git 2.47 or newer, and this machine has 2.39: upgrade git, then start a new session"],
+    ["git version 1.9.1", "sync needs git 2.47 or newer, and this machine has 1.9: upgrade git, then start a new session"],
+    ["not a version at all", 'git\'s version could not be read (git --version said "not a version at all"); sync needs git 2.47 or newer'],
+  ] as Array<[string, string]>) {
+    const v = await vault();
+    let state: SyncState | undefined;
+    await withGitSaying(version, async () => {
+      state = await prepareProjects(v, { remote: await bareRemote() }, TZ);
+    });
+    assert.deepEqual(state, { kind: "stopped", reason }, version);
+    assert.deepEqual(await readdir(v.root), [".obsidian"], `${version}: Projects/ was not created`);
+  }
+});
+
+test("a git at the minimum, or past it, is accepted", async () => {
+  for (const version of ["git version 2.47.0", "git version 2.50.1 (Apple Git-155)", "git version 3.0.0"]) {
+    const v = await vault();
+    let state: SyncState | undefined;
+    await withGitSaying(version, async () => {
+      state = await prepareProjects(v, { remote: await seededRemote() }, TZ);
+    });
+    assert.equal(state?.kind, "ready", `${version}: ${state?.kind === "stopped" ? state.reason : ""}`);
+  }
+});
+
+test("the version check does not run when sync is off: no remote, nothing to check", async () => {
+  const v = await vault();
+  let state: SyncState | undefined;
+  await withGitSaying("git version 1.0.0", async () => {
+    state = await prepareProjects(v, { remote: null }, TZ);
+  });
+  assert.deepEqual(state, { kind: "off" });
+});

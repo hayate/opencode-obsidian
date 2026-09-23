@@ -86,6 +86,31 @@ async function clearLitter(dir: string): Promise<void> {
   }
 }
 
+// The git the whole of spec 5.3-5.4 was verified against. Older ones lack features the
+// cycle cannot do without and fail inside it, with git's own wording for a flag it does
+// not know: `show-ref --exists` (2.43) is what tells a remote-seen that is absent from one
+// git cannot parse, so on an older git the rewrite check would be skipped; the scan's
+// `--attr-source` is 2.41, and `merge-tree --write-tree --merge-base` is 2.38. Checked
+// once, where sync state is detected, so the answer is one sentence naming the minimum and
+// what this machine has, before anything touches Projects/.
+const MIN_GIT = { major: 2, minor: 47 };
+const MIN_GIT_TEXT = `${MIN_GIT.major}.${MIN_GIT.minor}`;
+
+async function gitVersionProblem(cwd: string): Promise<string | null> {
+  const r = await git(["--version"], { cwd });
+  if (r.code !== 0 || r.timedOut) {
+    return `git could not be run (${firstLines(r.stderr) || (r.timedOut ? "timed out" : `git exited ${r.code}`)}); sync needs git ${MIN_GIT_TEXT} or newer`;
+  }
+  const found = /^git version (\d+)\.(\d+)/.exec(r.stdout.trim());
+  const major = Number(found?.[1]);
+  const minor = Number(found?.[2]);
+  if (found === null || !Number.isInteger(major) || !Number.isInteger(minor)) {
+    return `git's version could not be read (git --version said ${quoted(r.stdout.trim())}); sync needs git ${MIN_GIT_TEXT} or newer`;
+  }
+  if (major > MIN_GIT.major || (major === MIN_GIT.major && minor >= MIN_GIT.minor)) return null;
+  return `sync needs git ${MIN_GIT_TEXT} or newer, and this machine has ${major}.${minor}: upgrade git, then start a new session`;
+}
+
 export async function identityProblem(repo: string): Promise<string | null> {
   const name = await git(["config", "user.name"], { cwd: repo });
   const email = await git(["config", "user.email"], { cwd: repo });
@@ -340,6 +365,9 @@ async function prepare(vault: Vault, cfg: SyncConfig, timezone: string): Promise
     }
     return { kind: "off" };
   }
+
+  const old = await gitVersionProblem(vault.root);
+  if (old) return { kind: "stopped", reason: old };
 
   if (await vaultTracksProjects(vault.root)) {
     return {
