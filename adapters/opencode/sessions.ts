@@ -78,6 +78,16 @@ type Lookup = { kind: "top"; directory: string } | { kind: "child" } | { kind: "
 
 const key = (item: StatusItem): string => `${item.level} ${item.text}`;
 
+const PENDING = Symbol("pending");
+const NOT_KNOWN = Symbol("not known");
+
+// What a promise holds if it settles within this event-loop turn, else PENDING: every chain
+// whose inputs have already settled finishes in the microtask queue before setImmediate fires,
+// however many steps it has.
+function withinTurn<T>(p: Promise<T>): Promise<T | typeof PENDING> {
+  return Promise.race([p, new Promise<typeof PENDING>((resolve) => setImmediate(() => resolve(PENDING)))]);
+}
+
 
 export function renderStatus(id: number, items: StatusItem[]): string {
   return [`${STATUS_MARKER} ${id} -->`, "Memory status update (superpower-remember-obsidian):", ...items.map((s) => `- [${s.level}] ${escapeBlockTags(s.text)}`)].join("\n");
@@ -219,24 +229,45 @@ export class Sessions {
   }
 
   // Spec 4.4: the config hook's lines, on the session's first request. The project the pull
-  // resolved is compared with the grant then when it has already settled (initialization in
-  // time), or when it settles, on a later request: the first request is never held for the pull.
-  // A settled promise's reaction is queued at once, before transform's await on this method
-  // resumes, so the first request carries it (promise jobs run in order; a test pins it). Memory
-  // off is told once the background's lines, which say why, are in. A comparison that fails is
-  // a line too.
+  // resolved is compared with the grant on that request when it is already known (initialization
+  // in time), or when it settles, on a later one: the first request waits one event-loop turn at
+  // most, never for the pull. Memory off is told once the background's lines, which say why, are
+  // in: on that request when they already are. A comparison that fails is a line too.
   private async tellAccess(entry: Entry, result: InitResult): Promise<void> {
     const access = this.input.access;
     if (access === undefined || entry.accessTold) return;
     entry.accessTold = true;
     for (const item of access.lines()) this.tellOnce(entry, item);
+    const failed = (err: unknown): void =>
+      this.tellOnce(entry, { level: "error", text: `vault file access: comparing this session's project with the grant failed: ${errorText(err)}` });
     const compare = (project: string | null): void => {
-      const off = access.mismatch(project);
-      if (off !== null) this.tellOnce(entry, off);
+      try {
+        const off = access.mismatch(project);
+        if (off !== null) this.tellOnce(entry, off);
+      } catch (err) {
+        failed(err);
+      }
     };
-    void result.settledProject
-      .then((project) => (project === null ? result.background.then(() => compare(null), () => compare(null)) : compare(project)))
-      .catch((err: unknown) => this.tellOnce(entry, { level: "error", text: `vault file access: comparing this session's project with the grant failed: ${errorText(err)}` }));
+    const reasonsIn = result.background.then(
+      () => undefined,
+      () => undefined,
+    );
+    const whenOff = (): void => void reasonsIn.then(() => compare(null));
+    const project = await withinTurn(
+      result.settledProject.catch((err: unknown): typeof NOT_KNOWN => {
+        failed(err);
+        return NOT_KNOWN;
+      }),
+    );
+    if (project === NOT_KNOWN) return;
+    if (project === PENDING) {
+      void result.settledProject.then((later) => (later === null ? whenOff() : compare(later)), () => undefined);
+      return;
+    }
+    if (project !== null) return compare(project);
+    // Its reasons already in (initialization in time), this lands before the request renders:
+    // reasonsIn settled within the turn just waited, so its reaction is queued now.
+    whenOff();
   }
 
   async transform(messages: Message[]): Promise<void> {

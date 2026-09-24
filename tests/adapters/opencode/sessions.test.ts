@@ -568,3 +568,25 @@ test("vault access: a comparison that fails is an error line, never lost", async
   await registry.transform(again);
   assert.ok(again.flatMap((m) => texts(m)).some((t) => t.includes("- [error] vault file access: comparing this session's project with the grant failed: broken")));
 });
+
+test("vault access: memory off, with its reasons already in, is told on the first request", async () => {
+  const { fake, registry, asked } = withAccess([], (s) => (s === null ? { level: "warn", text: "granted, but memory is off" } : null));
+  fake.settledProject = Promise.resolve(null);
+  fake.background = Promise.resolve([]);
+  const messages = conversation("ses_top", ["u1"]);
+  await registry.transform(messages);
+  assert.deepEqual(asked, [null]);
+  assert.ok(texts(messages[0]).some((t) => t.includes("- [warn] granted, but memory is off")), "on the first and only request");
+});
+
+test("vault access: a project that settles within the turn is compared on the first request, not only an already-settled one", async () => {
+  const { fake, registry, asked } = withAccess([], (s) => ({ level: "warn", text: `compared with ${s}` }));
+  // Many microtask steps, all within the turn: a first request that only waited for one would miss it.
+  let chain: Promise<unknown> = Promise.resolve();
+  for (let i = 0; i < 50; i++) chain = chain.then(() => undefined);
+  fake.settledProject = chain.then(() => "kabin-api");
+  const messages = conversation("ses_top", ["u1"]);
+  await registry.transform(messages);
+  assert.deepEqual(asked, ["kabin-api"]);
+  assert.ok(texts(messages[0]).some((t) => t.includes("- [warn] compared with kabin-api")));
+});
