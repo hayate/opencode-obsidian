@@ -462,3 +462,58 @@ test("a status line shaped like the memory block's tags is escaped in its note",
   assert.match(note, /held back/);
   assert.ok(!note.includes("</recorded-project-memory>"), note);
 });
+
+function withAccess(lines: StatusItem[], mismatch: (settled: string | null) => StatusItem | null) {
+  const client = new FakeClient([{ id: "ses_top", directory: "/code/kabin-api" }]);
+  client.cfg = { small_model: "p/small" };
+  const harness = new OpenCodeHarness(client, undefined);
+  const fake = new FakeCore();
+  const asked: Array<string | null> = [];
+  const registry = new Sessions({
+    client, harness, directory: "/plugin/dir", bootstrap: "BOOT", env: {}, core: fake.core,
+    access: { lines: () => lines, mismatch: (s) => (asked.push(s), mismatch(s)) },
+  });
+  return { client, fake, registry, asked };
+}
+
+test("vault access: its lines reach the session's first request, and an error is a toast too", async () => {
+  const { client, registry } = withAccess([{ level: "error", text: "vault file access: boom" }], () => null);
+  const messages = conversation("ses_top", ["u1"]);
+  await registry.transform(messages);
+  assert.ok(texts(messages[0]).some((t) => t.includes("- [error] vault file access: boom")), "on the first request");
+  await tick();
+  assert.equal(client.toasts.filter((t) => t.message === "vault file access: boom").length, 1);
+});
+
+test("vault access: a project already settled is compared on the first request", async () => {
+  const { registry, asked } = withAccess([], (s) => (s === "kabin-api" ? { level: "warn", text: `moved from ${s}` } : null));
+  const messages = conversation("ses_top", ["u1"]);
+  await registry.transform(messages);
+  assert.deepEqual(asked, ["kabin-api"]);
+  assert.ok(texts(messages[0]).some((t) => t.includes("- [warn] moved from kabin-api")), "on the first request");
+});
+
+test("vault access: a project still settling is compared when it settles, on a later request", async () => {
+  const { fake, registry, asked } = withAccess([], (s) => (s === "kabin-api" ? null : { level: "warn", text: `moved to ${s}` }));
+  let settle!: (ctx: SessionContext | null) => void;
+  fake.settled = new Promise((resolve) => (settle = resolve));
+  const first = conversation("ses_top", ["u1"]);
+  await registry.transform(first);
+  assert.deepEqual(asked, [], "not before the project has settled, and the first request is not held");
+  settle({ project: "canonical-a" } as unknown as SessionContext);
+  await tick();
+  const messages = conversation("ses_top", ["u1", "u2"]);
+  await registry.transform(messages);
+  assert.deepEqual(asked, ["canonical-a"]);
+  assert.ok(texts(messages[2]).some((t) => t.includes("- [warn] moved to canonical-a")));
+});
+
+test("vault access: told once per session, however many requests", async () => {
+  const { registry, asked } = withAccess([{ level: "warn", text: "vault file access: x" }], () => null);
+  await registry.transform(conversation("ses_top", ["u1"]));
+  const messages = conversation("ses_top", ["u1", "u2"]);
+  await registry.transform(messages);
+  assert.equal(asked.length, 1);
+  const all = messages.flatMap((m) => texts(m)).join("\n");
+  assert.equal(all.split("- [warn] vault file access: x").length - 1, 1);
+});

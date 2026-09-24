@@ -4,6 +4,7 @@
 // OpenCode (spec 7.6).
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin/tool";
+import { VaultAccess, type ConfigLike } from "./access.ts";
 import { OpenCodeHarness, type OpenCodeClient } from "./harness.ts";
 import { Sessions } from "./sessions.ts";
 import { errorText } from "../../core/store.ts";
@@ -14,17 +15,20 @@ export const BOOTSTRAP = [
   "## Project memory (superpower-remember-obsidian)",
   "This plugin loads the project's memory from the Obsidian vault into this message and keeps `Projects/` in sync across machines.",
   "- Never run git in `Projects/`: the plugin commits, pulls and pushes it at session start and when the session goes idle.",
+  "- The files under `remember/` in the project's vault folder (the journal, its rollups, `.origin`) are written by this plugin only: read them, never edit or delete them.",
   "- `remember_sync` syncs now, for example after fixing a file the secret scan held back. Its `adopt_rewrite` option is only for a status line saying the remote's history was rewritten, and only once the user confirms the rewrite was intended.",
   "- A status line tagged [error] needs the user: tell them what it says.",
 ].join("\n");
 
 // The plugin's working parts, from what OpenCode passes in. A journalModel option that is not
 // a string is not ignored: it becomes text, which the harness tells is not provider/model.
-export function assemble(input: { client: OpenCodeClient; directory: string }, options?: Record<string, unknown>): { harness: OpenCodeHarness; sessions: Sessions } {
+export function assemble(input: { client: OpenCodeClient; directory: string }, options?: Record<string, unknown>): { harness: OpenCodeHarness; sessions: Sessions; access: VaultAccess } {
   const option = options?.journalModel;
   const harness = new OpenCodeHarness(input.client, option === undefined ? undefined : String(option));
-  const sessions = new Sessions({ client: input.client, harness, directory: input.directory, bootstrap: BOOTSTRAP, env: process.env });
-  return { harness, sessions };
+  // Spec 4.4: the config hook's grant, and what every session is told about it.
+  const access = new VaultAccess({ env: process.env, directory: input.directory, log: (message) => harness.logError(message) });
+  const sessions = new Sessions({ client: input.client, harness, directory: input.directory, bootstrap: BOOTSTRAP, env: process.env, access });
+  return { harness, sessions, access };
 }
 
 // Andrea (2026-09-23): the vault is essential, so a missing or unusable one is told as the plugin
@@ -48,12 +52,21 @@ function vaultCheck(harness: OpenCodeHarness, env: NodeJS.ProcessEnv): (eventTyp
 }
 
 export const SuperpowerRememberObsidian: Plugin = async (input, options) => {
-  const { harness, sessions } = assemble(input, options);
+  const { harness, sessions, access } = assemble(input, options);
   const tellVault = vaultCheck(harness, process.env);
   const report = (what: string, err: unknown): void => {
     void harness.notify(`${what} failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => undefined);
   };
   return {
+    // Spec 4.4. The pinned SDK types say external_directory is one action; the runtime takes a
+    // map (measured), so the config is handed over structurally.
+    config: async (cfg) => {
+      try {
+        await access.configure(cfg as unknown as ConfigLike);
+      } catch (err) {
+        report("granting vault access", err);
+      }
+    },
     "experimental.chat.messages.transform": async (_input, output) => {
       try {
         await sessions.transform(output.messages);

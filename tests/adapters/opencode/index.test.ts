@@ -4,9 +4,9 @@ import type { PluginInput } from "@opencode-ai/plugin";
 import plugin, { assemble, BOOTSTRAP, rememberSync, SuperpowerRememberObsidian } from "../../../adapters/opencode/index.ts";
 import { PAYLOAD_MARKER } from "../../../core/inject.ts";
 import { FakeClient } from "./fake-client.ts";
-import { mkdir } from "node:fs/promises";
+import { mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
-import { tempDir } from "../../core/helpers.ts";
+import { commitFile, initRepo, tempDir } from "../../core/helpers.ts";
 import type { Message } from "../../../adapters/opencode/sessions.ts";
 
 // The plugin reads process.env: no test may ever reach the vault of the machine it runs on.
@@ -199,4 +199,42 @@ test("at load, a log that fails still leaves the toast, and a TUI that refuses t
   // An unhandled rejection from either channel would fail this file; give one a turn to surface.
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.deepEqual([noLog.logs.length, noTui.toasts.length], [0, 0]);
+});
+
+test("the bootstrap tells the model remember/ is the plugin's", () => {
+  assert.match(BOOTSTRAP, /`remember\/` .*written by this plugin only/);
+});
+
+test("the config hook grants nothing without a vault, and never throws", async () => {
+  const client = new FakeClient([{ id: "ses_top", directory: "/code" }]);
+  const h = await hooks(client);
+  assert.ok(h.config, "the plugin has a config hook");
+  const cfg = { permission: { external_directory: "ask" } };
+  await h.config?.(cfg as never);
+  assert.deepEqual(cfg, { permission: { external_directory: "ask" } });
+});
+
+test("the config hook grants the project's folder with a vault", async () => {
+  const root = join(await tempDir("sro-index-"), "Da Vinci");
+  await mkdir(join(root, ".obsidian"), { recursive: true });
+  await mkdir(join(root, "Projects"));
+  const code = join(await tempDir(), "kabin-api");
+  await initRepo(code);
+  await commitFile(code, "README.md", "x\n", "init");
+  process.env.OBSIDIAN_VAULT_PATH = root;
+  try {
+    const h = await SuperpowerRememberObsidian({ client: new FakeClient([]), directory: code } as unknown as PluginInput, {});
+    const cfg: { permission?: Record<string, unknown> } = {};
+    await h.config?.(cfg as never);
+    const dir = join(await realpath(root), "Projects", "kabin-api");
+    assert.deepEqual(cfg.permission, { external_directory: { [`${dir}/**`]: "allow" } });
+  } finally {
+    delete process.env.OBSIDIAN_VAULT_PATH;
+  }
+});
+
+test("assemble builds the vault access the sessions tell", () => {
+  const { access, sessions } = assemble({ client: new FakeClient([]), directory: "/code" }, {});
+  assert.deepEqual(access.lines(), []);
+  assert.ok(sessions);
 });

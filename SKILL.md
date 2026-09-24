@@ -38,6 +38,7 @@ subfolders) if they do not already exist.
 - `Projects/<project>/decisions/` - durable decisions (`YYYY-MM-DD-slug.md`).
 - `Projects/<project>/notes/` - durable notes (gotchas, procedures).
 - `Projects/<project>/archive/` - dated copies of superseded handoffs and plans.
+- `Projects/<project>/remember/` - the plugin's memory (the journal, its rollups, `.origin`): written by the plugin only. Read it; never edit or delete it.
 - `Agents/<machine>/` - per-machine working notes.
 
 The project folder is the one the session's memory names: the `Project:`

@@ -3,8 +3,9 @@
 // every transform, and status that arrives later (the background sync, an idle) is
 // appended to the first user message the model sees after it arrived.
 import { escapeBlockTags, PAYLOAD_MARKER, type StatusItem } from "../../core/inject.ts";
-import { idleSession, initializeSession, syncSession, type InitResult } from "../../core/session.ts";
+import { idleSession, initializeSession, syncSession, type InitResult, type SessionContext } from "../../core/session.ts";
 import { errorText } from "../../core/store.ts";
+import type { VaultAccess } from "./access.ts";
 import type { OpenCodeClient, OpenCodeHarness } from "./harness.ts";
 
 // Each note's text starts with this and its own number, so two notes saying the same thing
@@ -29,6 +30,9 @@ export interface SessionsInput {
   directory: string;
   bootstrap: string;
   env: Record<string, string | undefined>;
+  // Spec 4.4: what the config hook granted, told in every session; each session's settled
+  // project is compared with the granted one.
+  access?: Pick<VaultAccess, "lines" | "mismatch">;
   core?: Core;
 }
 
@@ -66,11 +70,15 @@ interface Entry {
   again: boolean;
   // Lines told once per session whatever the reports say (a model setting, a skipped idle).
   once: Set<string>;
+  // The config hook's lines were told (spec 4.4): once, on the first request.
+  accessTold: boolean;
 }
 
 type Lookup = { kind: "top"; directory: string } | { kind: "child" } | { kind: "unknown"; why: string };
 
 const key = (item: StatusItem): string => `${item.level} ${item.text}`;
+
+const PENDING = Symbol("pending");
 
 export function renderStatus(id: number, items: StatusItem[]): string {
   return [`${STATUS_MARKER} ${id} -->`, "Memory status update (superpower-remember-obsidian):", ...items.map((s) => `- [${s.level}] ${escapeBlockTags(s.text)}`)].join("\n");
@@ -159,6 +167,7 @@ export class Sessions {
       idle: null,
       again: false,
       once: new Set(),
+      accessTold: false,
     };
     this.entries.set(sessionId, entry);
     void init
@@ -209,6 +218,24 @@ export class Sessions {
     this.tell(entry, fresh);
   }
 
+  // Spec 4.4: the config hook's lines, on the session's first request. Its settled project is
+  // compared with the grant then when it has already settled (initialization in time), or when
+  // it settles, on a later request: the first request is never held for the pull. Promise.race
+  // takes an already-settled promise before the marker behind it.
+  private async tellAccess(entry: Entry, result: InitResult): Promise<void> {
+    const access = this.input.access;
+    if (access === undefined || entry.accessTold) return;
+    entry.accessTold = true;
+    for (const item of access.lines()) this.tellOnce(entry, item);
+    const compare = (ctx: SessionContext | null): void => {
+      const off = access.mismatch(ctx?.project ?? null);
+      if (off !== null) this.tellOnce(entry, off);
+    };
+    const now = await Promise.race([result.settled, Promise.resolve(PENDING)]);
+    if (now === PENDING) void result.settled.then(compare, () => undefined);
+    else compare(now);
+  }
+
   async transform(messages: Message[]): Promise<void> {
     const first = messages.find((m) => m.info.role === "user");
     if (!first || first.parts.length === 0) return;
@@ -225,6 +252,7 @@ export class Sessions {
       entry = this.start(sessionId, found.kind === "top" ? found.directory : this.input.directory, found);
     }
     const result = await entry.init;
+    await this.tellAccess(entry, result);
     const latest = messages.findLast((m) => m.info.role === "user") ?? first;
     const ref = first.parts[0];
     if (ref && !first.parts.some((p) => p.type === "text" && p.text?.includes(PAYLOAD_MARKER))) {
