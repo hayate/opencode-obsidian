@@ -212,3 +212,11 @@ test("a config that cannot be read is told, and read again next time", async () 
   client.cfg = { small_model: "p/small" };
   assert.deepEqual(await harness.model(), { name: "p/small", ref: { providerID: "p", modelID: "small" }, source: 'small_model "p/small"', problem: null });
 });
+
+test("the log writes each line at its own level", async () => {
+  const client = new FakeClient([]);
+  const harness = new OpenCodeHarness(client, undefined);
+  await harness.log("warn", "a warning");
+  await harness.logError("an error");
+  assert.deepEqual(client.logs.map((l) => [l.level, l.message]), [["warn", "a warning"], ["error", "an error"]]);
+});

@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import type { PluginInput } from "@opencode-ai/plugin";
 import plugin, { assemble, BOOTSTRAP, rememberSync, SuperpowerRememberObsidian } from "../../../adapters/opencode/index.ts";
 import { PAYLOAD_MARKER } from "../../../core/inject.ts";
+import { gitOk } from "../../../core/git.ts";
 import { FakeClient } from "./fake-client.ts";
-import { mkdir } from "node:fs/promises";
+import { mkdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
-import { tempDir } from "../../core/helpers.ts";
+import { commitFile, initRepo, tempDir } from "../../core/helpers.ts";
 import type { Message } from "../../../adapters/opencode/sessions.ts";
 
 // The plugin reads process.env: no test may ever reach the vault of the machine it runs on.
@@ -199,4 +200,109 @@ test("at load, a log that fails still leaves the toast, and a TUI that refuses t
   // An unhandled rejection from either channel would fail this file; give one a turn to surface.
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.deepEqual([noLog.logs.length, noTui.toasts.length], [0, 0]);
+});
+
+test("the bootstrap tells the model remember/ is the plugin's", () => {
+  assert.match(BOOTSTRAP, /`remember\/` .*written by this plugin only/);
+});
+
+test("the config hook grants nothing without a vault", async () => {
+  const client = new FakeClient([{ id: "ses_top", directory: "/code" }]);
+  const h = await hooks(client);
+  assert.ok(h.config, "the plugin has a config hook");
+  const cfg = { permission: { external_directory: "ask" } };
+  await h.config?.(cfg as never);
+  assert.deepEqual(cfg, { permission: { external_directory: "ask" } });
+});
+
+test("the config hook grants the project's folder with a vault", async () => {
+  const root = join(await tempDir("sro-index-"), "Da Vinci");
+  await mkdir(join(root, ".obsidian"), { recursive: true });
+  await mkdir(join(root, "Projects"));
+  const code = join(await tempDir(), "kabin-api");
+  await initRepo(code);
+  await commitFile(code, "README.md", "x\n", "init");
+  process.env.OBSIDIAN_VAULT_PATH = root;
+  try {
+    const h = await SuperpowerRememberObsidian({ client: new FakeClient([]), directory: code } as unknown as PluginInput, {});
+    const cfg: { permission?: Record<string, unknown> } = {};
+    await h.config?.(cfg as never);
+    const dir = join(await realpath(root), "Projects", "kabin-api");
+    assert.deepEqual(cfg.permission, { external_directory: { [`${dir}/**`]: "allow" } });
+  } finally {
+    delete process.env.OBSIDIAN_VAULT_PATH;
+  }
+});
+
+test("assemble builds the vault access the sessions tell", () => {
+  const { access, sessions } = assemble({ client: new FakeClient([]), directory: "/code" }, {});
+  assert.deepEqual(access.lines(), []);
+  assert.ok(sessions);
+});
+
+test("vault access reaches the sessions: one whose project is not the granted one is told on its first request", async () => {
+  const root = join(await tempDir("sro-index-"), "Da Vinci");
+  await mkdir(join(root, ".obsidian"), { recursive: true });
+  await mkdir(join(root, "Projects"));
+  const parent = await tempDir();
+  for (const name of ["kabin-api", "canonical-a"]) {
+    await initRepo(join(parent, name));
+    await commitFile(join(parent, name), "README.md", "x\n", "init");
+  }
+  process.env.OBSIDIAN_VAULT_PATH = root;
+  try {
+    const client = new FakeClient([{ id: "ses_b", directory: join(parent, "canonical-a") }]);
+    client.cfg = { small_model: "p/small" };
+    const h = await SuperpowerRememberObsidian({ client, directory: join(parent, "kabin-api") } as unknown as PluginInput, {});
+    await h.config?.({} as never);
+    const messages = user("ses_b");
+    await h["experimental.chat.messages.transform"]?.({}, { messages } as never);
+    const all = messages[0]?.parts.map((p) => p.text ?? "").join("\n") ?? "";
+    assert.match(all, /vault file access was granted for Projects\/kabin-api at startup, but this session's project is Projects\/canonical-a; restart OpenCode to move it/);
+  } finally {
+    delete process.env.OBSIDIAN_VAULT_PATH;
+  }
+});
+
+test("vault access lines reach OpenCode's log at their own level", async () => {
+  const root = join(await tempDir("sro-index-"), "Da Vinci");
+  await mkdir(join(root, ".obsidian"), { recursive: true });
+  await mkdir(join(root, "Projects"));
+  const odd = join(await tempDir(), "a*b");
+  await mkdir(odd);
+  process.env.OBSIDIAN_VAULT_PATH = root;
+  try {
+    const client = new FakeClient([]);
+    const h = await SuperpowerRememberObsidian({ client, directory: odd } as unknown as PluginInput, {});
+    await h.config?.({} as never);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(client.logs.some((l) => l.level === "warn" && l.message.startsWith("vault file access: the path")), JSON.stringify(client.logs));
+  } finally {
+    delete process.env.OBSIDIAN_VAULT_PATH;
+  }
+});
+
+
+test("vault access: a session whose memory is refused at once (a bare repository) learns on its first request that the grant stays", async () => {
+  const root = join(await tempDir("sro-index-"), "Da Vinci");
+  await mkdir(join(root, ".obsidian"), { recursive: true });
+  await mkdir(join(root, "Projects"));
+  const parent = await tempDir();
+  await initRepo(join(parent, "kabin-api"));
+  await commitFile(join(parent, "kabin-api"), "README.md", "x\n", "init");
+  await gitOk(["init", "-q", "--bare", join(parent, "bare.git")], { cwd: parent });
+  process.env.OBSIDIAN_VAULT_PATH = root;
+  try {
+    const client = new FakeClient([{ id: "ses_bare", directory: join(parent, "bare.git") }]);
+    client.cfg = { small_model: "p/small" };
+    const h = await SuperpowerRememberObsidian({ client, directory: join(parent, "kabin-api") } as unknown as PluginInput, {});
+    await h.config?.({} as never);
+    const messages = user("ses_bare");
+    await h["experimental.chat.messages.transform"]?.({}, { messages } as never);
+    const all = messages[0]?.parts.map((p) => p.text ?? "").join("\n") ?? "";
+    assert.match(all, /bare repository/);
+    assert.match(all, /vault file access was granted for Projects\/kabin-api at startup, but memory is off in this session/);
+  } finally {
+    delete process.env.OBSIDIAN_VAULT_PATH;
+  }
 });

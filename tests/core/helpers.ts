@@ -114,3 +114,20 @@ export function asRead(text: string): string {
     .replace(/[\u2010-\u2015\u2212]/g, "-")
     .replace(/[\u2215\u2044]/g, "/");
 }
+
+// Runs fn with a git first on PATH that sleeps 3 s before running the real git when its
+// first argument is `subcommand`: a call with a shorter timeout is killed, every other call
+// answers normally.
+export async function withSlowGit(subcommand: string, fn: () => Promise<void>): Promise<void> {
+  const dir = await tempDir("sro-slowgit-");
+  const real = (await gitOk(["--exec-path"], { cwd: dir })) + "/git";
+  const script = ["#!/bin/sh", `if [ "$1" = ${JSON.stringify(subcommand)} ]; then sleep 3; fi`, `exec ${JSON.stringify(real)} "$@"`, ""].join("\n");
+  await writeFile(join(dir, "git"), script, { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${dir}:${path}`;
+  try {
+    await fn();
+  } finally {
+    process.env.PATH = path;
+  }
+}

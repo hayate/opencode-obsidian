@@ -2,7 +2,7 @@
 // is the plain repo name; remember/.origin makes it stable across machines.
 import { readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { git, gitOk } from "./git.ts";
+import { git, GitError, gitOk } from "./git.ts";
 import { createAt, MemoryPathError, quoted, readMemoryFile, vaultName } from "./store.ts";
 import type { Vault } from "./vault.ts";
 
@@ -85,16 +85,25 @@ async function foldersClaiming(projectsDir: string, origin: string): Promise<str
   return matches.sort();
 }
 
-async function checkoutName(sessionDir: string): Promise<string> {
-  const common = await gitOk(["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: sessionDir });
+async function checkoutName(sessionDir: string, run: { cwd: string; timeoutMs?: number }): Promise<string> {
+  const common = await gitOk(["rev-parse", "--path-format=absolute", "--git-common-dir"], run);
   // Main checkout or any of its linked worktrees: <repo>/.git -> <repo>.
   if (basename(common) === ".git") return basename(dirname(common));
   // Submodule (<super>/.git/modules/<name>): its own working tree names it.
-  return basename(await gitOk(["rev-parse", "--show-toplevel"], { cwd: sessionDir }));
+  return basename(await gitOk(["rev-parse", "--show-toplevel"], run));
 }
 
-export async function resolveProject(vault: Vault, sessionDir: string): Promise<ProjectResolution> {
-  const bare = await git(["rev-parse", "--is-bare-repository"], { cwd: sessionDir });
+// A git call killed on its timeout says nothing about the repository: it is an error, never
+// "not a git repository" or "no origin", which would name a folder from a guess.
+async function answered(args: string[], run: { cwd: string; timeoutMs?: number }) {
+  const result = await git(args, run);
+  if (result.timedOut) throw new GitError(args, result);
+  return result;
+}
+
+export async function resolveProject(vault: Vault, sessionDir: string, opts: { timeoutMs?: number } = {}): Promise<ProjectResolution> {
+  const run = { cwd: sessionDir, timeoutMs: opts.timeoutMs };
+  const bare = await answered(["rev-parse", "--is-bare-repository"], run);
   let name: string;
   let origin: string | null = null;
 
@@ -104,7 +113,7 @@ export async function resolveProject(vault: Vault, sessionDir: string): Promise<
     } else if (bare.stdout.trim() === "true") {
       return { kind: "disabled", reason: `${sessionDir} is a bare repository: memory and sync are disabled`, bare: true };
     } else {
-      const remote = await git(["config", "--get", "remote.origin.url"], { cwd: sessionDir });
+      const remote = await answered(["config", "--get", "remote.origin.url"], run);
       origin = remote.code === 0 ? normalizeOrigin(remote.stdout) : null;
       if (origin) {
         const claimed = await foldersClaiming(vault.projectsDir, origin);
@@ -118,9 +127,14 @@ export async function resolveProject(vault: Vault, sessionDir: string): Promise<
         const only = claimed[0];
         if (only) return { kind: "ok", name: only, origin, dir: join(vault.projectsDir, only) };
       }
-      name = await checkoutName(sessionDir);
+      name = await checkoutName(sessionDir, run);
     }
 
+    // A directory with no folder name ("/", or a path ending in . or ..) would make Projects/
+    // itself, or a folder outside it, the project.
+    if (name === "" || name === "." || name === "..") {
+      return { kind: "disabled", reason: `${quoted(sessionDir)} has no folder name to give a project: memory and sync are disabled`, bare: false };
+    }
     const dir = join(vault.projectsDir, name);
     const existing = await readOrigin(dir);
     if (existing !== null && existing !== origin) {

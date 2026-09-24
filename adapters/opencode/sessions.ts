@@ -5,6 +5,7 @@
 import { escapeBlockTags, PAYLOAD_MARKER, type StatusItem } from "../../core/inject.ts";
 import { idleSession, initializeSession, syncSession, type InitResult } from "../../core/session.ts";
 import { errorText } from "../../core/store.ts";
+import type { VaultAccess } from "./access.ts";
 import type { OpenCodeClient, OpenCodeHarness } from "./harness.ts";
 
 // Each note's text starts with this and its own number, so two notes saying the same thing
@@ -29,6 +30,9 @@ export interface SessionsInput {
   directory: string;
   bootstrap: string;
   env: Record<string, string | undefined>;
+  // Spec 4.4: what the config hook granted, told in every session; each session's settled
+  // project is compared with the granted one.
+  access?: Pick<VaultAccess, "lines" | "mismatch">;
   core?: Core;
 }
 
@@ -66,11 +70,24 @@ interface Entry {
   again: boolean;
   // Lines told once per session whatever the reports say (a model setting, a skipped idle).
   once: Set<string>;
+  // The config hook's lines were told (spec 4.4): once, on the first request.
+  accessTold: boolean;
 }
 
 type Lookup = { kind: "top"; directory: string } | { kind: "child" } | { kind: "unknown"; why: string };
 
 const key = (item: StatusItem): string => `${item.level} ${item.text}`;
+
+const PENDING = Symbol("pending");
+const NOT_KNOWN = Symbol("not known");
+
+// What a promise holds if it settles within this event-loop turn, else PENDING: every chain
+// whose inputs have already settled finishes in the microtask queue before setImmediate fires,
+// however many steps it has.
+function withinTurn<T>(p: Promise<T>): Promise<T | typeof PENDING> {
+  return Promise.race([p, new Promise<typeof PENDING>((resolve) => setImmediate(() => resolve(PENDING)))]);
+}
+
 
 export function renderStatus(id: number, items: StatusItem[]): string {
   return [`${STATUS_MARKER} ${id} -->`, "Memory status update (superpower-remember-obsidian):", ...items.map((s) => `- [${s.level}] ${escapeBlockTags(s.text)}`)].join("\n");
@@ -88,6 +105,7 @@ function failedInit(bootstrap: string, err: unknown): InitResult {
     context: null,
     background: Promise.resolve([]),
     settled: Promise.resolve(null),
+    settledProject: Promise.resolve(null),
   };
 }
 
@@ -159,6 +177,7 @@ export class Sessions {
       idle: null,
       again: false,
       once: new Set(),
+      accessTold: false,
     };
     this.entries.set(sessionId, entry);
     void init
@@ -209,6 +228,48 @@ export class Sessions {
     this.tell(entry, fresh);
   }
 
+  // Spec 4.4: the config hook's lines, on the session's first request. The project the pull
+  // resolved is compared with the grant on that request when it is already known (initialization
+  // in time), or when it settles, on a later one: the first request waits one event-loop turn at
+  // most, never for the pull. Memory off is told once the background's lines, which say why, are
+  // in: on that request when they already are. A comparison that fails is a line too.
+  private async tellAccess(entry: Entry, result: InitResult): Promise<void> {
+    const access = this.input.access;
+    if (access === undefined || entry.accessTold) return;
+    entry.accessTold = true;
+    for (const item of access.lines()) this.tellOnce(entry, item);
+    const failed = (err: unknown): void =>
+      this.tellOnce(entry, { level: "error", text: `vault file access: comparing this session's project with the grant failed: ${errorText(err)}` });
+    const compare = (project: string | null): void => {
+      try {
+        const off = access.mismatch(project);
+        if (off !== null) this.tellOnce(entry, off);
+      } catch (err) {
+        failed(err);
+      }
+    };
+    const reasonsIn = result.background.then(
+      () => undefined,
+      () => undefined,
+    );
+    const whenOff = (): void => void reasonsIn.then(() => compare(null));
+    const project = await withinTurn(
+      result.settledProject.catch((err: unknown): typeof NOT_KNOWN => {
+        failed(err);
+        return NOT_KNOWN;
+      }),
+    );
+    if (project === NOT_KNOWN) return;
+    if (project === PENDING) {
+      void result.settledProject.then((later) => (later === null ? whenOff() : compare(later)), () => undefined);
+      return;
+    }
+    if (project !== null) return compare(project);
+    // Its reasons already in (initialization in time), this lands before the request renders:
+    // reasonsIn settled within the turn just waited, so its reaction is queued now.
+    whenOff();
+  }
+
   async transform(messages: Message[]): Promise<void> {
     const first = messages.find((m) => m.info.role === "user");
     if (!first || first.parts.length === 0) return;
@@ -225,6 +286,7 @@ export class Sessions {
       entry = this.start(sessionId, found.kind === "top" ? found.directory : this.input.directory, found);
     }
     const result = await entry.init;
+    await this.tellAccess(entry, result);
     const latest = messages.findLast((m) => m.info.role === "user") ?? first;
     const ref = first.parts[0];
     if (ref && !first.parts.some((p) => p.type === "text" && p.text?.includes(PAYLOAD_MARKER))) {
