@@ -78,7 +78,6 @@ type Lookup = { kind: "top"; directory: string } | { kind: "child" } | { kind: "
 
 const key = (item: StatusItem): string => `${item.level} ${item.text}`;
 
-const PENDING = Symbol("pending");
 
 export function renderStatus(id: number, items: StatusItem[]): string {
   return [`${STATUS_MARKER} ${id} -->`, "Memory status update (superpower-remember-obsidian):", ...items.map((s) => `- [${s.level}] ${escapeBlockTags(s.text)}`)].join("\n");
@@ -220,8 +219,9 @@ export class Sessions {
 
   // Spec 4.4: the config hook's lines, on the session's first request. Its settled project is
   // compared with the grant then when it has already settled (initialization in time), or when
-  // it settles, on a later request: the first request is never held for the pull. Promise.race
-  // takes an already-settled promise before the marker behind it.
+  // it settles, on a later request: the first request is never held for the pull. A settled
+  // promise's reaction is queued at once, before transform's await on this method resumes, so
+  // the first request carries it (promise jobs run in order; a test pins it).
   private async tellAccess(entry: Entry, result: InitResult): Promise<void> {
     const access = this.input.access;
     if (access === undefined || entry.accessTold) return;
@@ -231,9 +231,7 @@ export class Sessions {
       const off = access.mismatch(ctx?.project ?? null);
       if (off !== null) this.tellOnce(entry, off);
     };
-    const now = await Promise.race([result.settled, Promise.resolve(PENDING)]);
-    if (now === PENDING) void result.settled.then(compare, () => undefined);
-    else compare(now);
+    void result.settled.then(compare, () => undefined);
   }
 
   async transform(messages: Message[]): Promise<void> {
