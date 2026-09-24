@@ -204,3 +204,10 @@ test("resolveProject: without a timeout option it resolves as before", async () 
   const r = await resolveProject(v, code);
   assert.equal(r.kind === "ok" ? r.name : r.reason, "kabin-api");
 });
+
+test("resolveProject: a directory with no name to give a project (/) is refused, never Projects/ itself", async () => {
+  const v = await vault();
+  const r = await resolveProject(v, "/");
+  assert.equal(r.kind, "disabled");
+  assert.match(r.kind === "disabled" ? r.reason : "", /^"\/" has no folder name to give a project/);
+});

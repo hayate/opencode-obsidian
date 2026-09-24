@@ -130,6 +130,11 @@ export async function resolveProject(vault: Vault, sessionDir: string, opts: { t
       name = await checkoutName(sessionDir, run);
     }
 
+    // A directory with no folder name ("/", or a path ending in . or ..) would make Projects/
+    // itself, or a folder outside it, the project.
+    if (name === "" || name === "." || name === "..") {
+      return { kind: "disabled", reason: `${quoted(sessionDir)} has no folder name to give a project: memory and sync are disabled`, bare: false };
+    }
     const dir = join(vault.projectsDir, name);
     const existing = await readOrigin(dir);
     if (existing !== null && existing !== origin) {

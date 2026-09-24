@@ -58,19 +58,71 @@ const NOT_ADDED = "the automatic grant was not added; your permission rules appl
 const named = (rule: string, action: string, repo = "kabin-api") =>
   `vault file access: your permission.external_directory rule "${rule}" (${action}) comes after the grant and applies where it matches in Projects/${repo}`;
 
-function access(result: () => Promise<Found>, extra: { timeoutMs?: number; log?: (m: string) => Promise<void> } = {}) {
+function access(result: () => Promise<Found>, extra: { timeoutMs?: number } = {}) {
   const logged: string[] = [];
   const a = new VaultAccess({
     env: {},
     directory: "/code/kabin-api",
     home: "/Users/a",
-    log: extra.log ?? (async (m) => void logged.push(m)),
+    log: async (level, m) => void logged.push(`${level}: ${m}`),
     resolve: result,
     timeoutMs: extra.timeoutMs,
   });
   return { a, logged };
 }
 const ok = (over: Partial<Extract<Found, { kind: "ok" }>> = {}) => access(async () => found(over));
+
+// OpenCode's evaluate over one rule map: the last rule whose pattern matches, else ask.
+const decide = (rules: Record<string, string>, path: string): string =>
+  Object.entries(rules).filter(([pattern]) => wildcardMatch(path, pattern)).at(-1)?.[1] ?? "ask";
+
+test("the grant goes right after the user's blanket wherever it is, and nothing outside the project changes", () => {
+  const cases: Array<[Record<string, string>, string]> = [
+    [{ "/srv/**": "allow", "*": "deny" }, "/srv/x/*"],
+    [{ [`${V}/Projects/**`]: "deny", "*": "ask" }, `${V}/Projects/other/*`],
+    [{ "*": "ask", "/srv/**": "deny" }, "/srv/x/*"],
+  ];
+  for (const [user, outside] of cases) {
+    const built = withGrant(user, `${P}/**`);
+    assert.equal(decide(built, outside), decide(user, outside), `${JSON.stringify(user)} at ${outside}`);
+    const keys = Object.keys(built);
+    assert.deepEqual(keys.filter((k) => k !== `${P}/**`), Object.keys(user), "the user's rules keep their order");
+    assert.equal(keys.indexOf(`${P}/**`), keys.indexOf("*") + 1, "right after the blanket");
+  }
+});
+
+test("vault access: a rule before the user's blanket is not named (the blanket already overrides it)", async () => {
+  const { a } = ok();
+  const cfg: ConfigLike = { permission: { external_directory: { [`${P}/notes/**`]: "deny", "*": "ask" } } };
+  await a.configure(cfg);
+  assert.deepEqual(Object.keys(cfg.permission?.external_directory as object), [`${P}/notes/**`, "*", `${P}/**`]);
+  assert.deepEqual(a.lines(), []);
+});
+
+test("vault access: a long user pattern is named whole", async () => {
+  const { a } = ok();
+  const long = `${P}/${"x".repeat(200)}/**`;
+  await a.configure({ permission: { external_directory: { [long]: "deny" } } });
+  assert.ok(a.lines()[0]?.text.includes(JSON.stringify(long)), a.lines()[0]?.text);
+});
+
+test("vault access: an error that spans lines is one status line", async () => {
+  const { a } = access(async () => {
+    throw new Error("fatal: one\n  hint: two\n");
+  });
+  await a.configure({});
+  assert.deepEqual(a.lines(), [{ level: "error", text: `vault file access: fatal: one hint: two, so ${NOT_ADDED}` }]);
+});
+
+test("vault access, for real: a directory with no name to give a project (/) is granted nothing", async () => {
+  const root = join(await tempDir("sro-access-"), "Da Vinci");
+  await mkdir(join(root, ".obsidian"), { recursive: true });
+  await mkdir(join(root, "Projects"));
+  const a = new VaultAccess({ env: { OBSIDIAN_VAULT_PATH: root }, directory: "/", log: async () => undefined });
+  const cfg: ConfigLike = {};
+  await a.configure(cfg);
+  assert.equal(cfg.permission, undefined, "never all of Projects/");
+});
 
 test("vault access: no setting, the grant alone, no status line", async () => {
   const { a } = ok();
@@ -104,7 +156,7 @@ test("vault access: the user's own rules win, and each one about the project is 
   assert.deepEqual(Object.keys(cfg.permission?.external_directory as object), ["*", `${P}/**`, `${P}/remember/**`, `${P}/specs/**`]);
   assert.deepEqual(a.lines(), [{ level: "warn", text: named(`${P}/remember/**`, "ask") }], "an allow takes nothing away: not named");
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(logged, [named(`${P}/remember/**`, "ask")]);
+  assert.deepEqual(logged, [`warn: ${named(`${P}/remember/**`, "ask")}`], "logged at its own level");
 });
 
 test("vault access: a broad user deny over the project is named", async () => {
@@ -237,7 +289,7 @@ test("vault access: a session whose project is not the granted one is told", asy
   await a.configure({});
   assert.equal(a.mismatch("kabin-api"), null);
   assert.equal(a.mismatch("canonical-a")?.text, "vault file access was granted for Projects/kabin-api at startup, but this session's project is Projects/canonical-a; restart OpenCode to move it");
-  assert.equal(a.mismatch(null)?.text, "vault file access was granted for Projects/kabin-api at startup, but memory is off in this session (see the lines above); restart OpenCode to move it");
+  assert.equal(a.mismatch(null)?.text, "vault file access was granted for Projects/kabin-api at startup, but memory is off in this session (see the lines above)");
   assert.equal(a.mismatch(null)?.level, "warn");
 });
 

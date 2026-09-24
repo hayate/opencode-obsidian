@@ -66,12 +66,13 @@ The plugin loads each project's memory into the session and keeps the vault's
 When OpenCode starts in a repository, the plugin lets OpenCode's file tools read and write that
 project's folder in the vault (`Projects/<repo>/`) without asking: headless `opencode run`
 rejects every permission prompt, so without this it could not write memory at all. The rest of
-the vault still asks.
+the vault keeps what your rules say (OpenCode's default is to ask).
 
 Your own `permission.external_directory` rules that name a path inside the project still decide
 there (a `deny` on `Projects/**` or on `Projects/<repo>/notes/**` stays a deny), and the session
 status names each one. A blanket rule does not: `"*"`, or `external_directory` set to a single
-action, `deny` included, is overridden for the project's folder. That is deliberate: it is your
+action, `deny` included, is overridden for the project's folder (the plugin's rule goes right
+after your `"*"`, and your other rules keep their order, so nothing outside the folder changes). That is deliberate: it is your
 machine and your repositories, and a blanket rule is not a decision about this project.
 
 This saves prompts; it is not a sandbox: symlinks are followed, and `bash` has its own

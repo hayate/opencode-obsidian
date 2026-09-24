@@ -211,6 +211,10 @@ export class OpenCodeHarness implements Harness {
 
   // OpenCode's own log, which keeps what a toast sent too early would lose.
   async logError(message: string): Promise<void> {
-    await data(this.client.app.log({ body: { service: "superpower-remember-obsidian", level: "error", message } }), "writing to the OpenCode log");
+    await this.log("error", message);
+  }
+
+  async log(level: "info" | "warn" | "error", message: string): Promise<void> {
+    await data(this.client.app.log({ body: { service: "superpower-remember-obsidian", level, message } }), "writing to the OpenCode log");
   }
 }

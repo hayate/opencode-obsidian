@@ -33,14 +33,18 @@ export function expandHome(pattern: string, home: string): string {
 }
 
 // OpenCode takes the last matching rule, and reads a map's rules in the order written. So the
-// user's blanket "*" comes first, the grant next, and every other user rule after it: a rule of
-// theirs about the project decides there. The caller never passes a pattern the user already
-// has (reassigning a key keeps its earlier place). A new object: the user's is shared.
+// grant goes right after the user's blanket "*" (first when there is none), and every user rule
+// keeps its place: one after the blanket still comes after the grant and decides where it
+// matches, and nothing outside the project changes (the grant matches nothing there; moving the
+// blanket would). The caller never passes a pattern the user already has (reassigning a key
+// keeps its earlier place). A new object: the user's is shared.
 export function withGrant(user: Rules, pattern: string): Rules {
   const out: Rules = {};
-  if ("*" in user) out["*"] = user["*"] as string;
-  out[pattern] = "allow";
-  for (const [key, action] of Object.entries(user)) if (key !== "*") out[key] = action;
+  if (!("*" in user)) out[pattern] = "allow";
+  for (const [key, action] of Object.entries(user)) {
+    out[key] = action;
+    if (key === "*") out[pattern] = "allow";
+  }
   return out;
 }
 
@@ -61,13 +65,17 @@ export interface VaultAccessInput {
   env: Record<string, string | undefined>;
   // The instance's directory, as OpenCode passes it to the plugin.
   directory: string;
-  log: (message: string) => Promise<void>;
+  log: (level: StatusItem["level"], message: string) => Promise<void>;
   home?: string;
   timeoutMs?: number;
   resolve?: Resolve;
 }
 
 const NOT_ADDED = "the automatic grant was not added; your permission rules apply as they are";
+
+// A user pattern is shown whole in a status line, up to this: its tail is what places it in the
+// project, and quoted()'s default cap (120) would cut it.
+const PATTERN_SHOWN = 1000;
 
 // The project from local state, read-only: no pull, no folder created.
 async function resolveLocal(env: Record<string, string | undefined>, directory: string, timeoutMs: number): Promise<Found> {
@@ -112,7 +120,6 @@ export class VaultAccess {
         timer = setTimeout(() => resolve("late"), ms);
       });
       const resolving = (this.input.resolve ?? resolveLocal)(this.input.env, this.input.directory, ms);
-      resolving.catch(() => undefined); // a rejection after the bound is nobody's
       const found = await Promise.race([resolving, late]);
       if (found === "late") return this.tell("warn", `vault file access: finding this project took longer than ${ms / 1000} s, so ${NOT_ADDED}`);
       if (found.kind === "off") {
@@ -126,18 +133,20 @@ export class VaultAccess {
       const user = userRules(cfg.permission?.external_directory);
       if (user === null) return this.tell("warn", `vault file access: permission.external_directory is neither an action nor a map of patterns, so ${NOT_ADDED}`);
       if (pattern in user) {
-        return this.tell("warn", `vault file access: your permission.external_directory already has ${quoted(pattern)}, which decides it, so ${NOT_ADDED}`);
+        return this.tell("warn", `vault file access: your permission.external_directory already has ${quoted(pattern, PATTERN_SHOWN)}, which decides it, so ${NOT_ADDED}`);
       }
       const rules = withGrant(user, pattern);
       // A user rule after the grant that takes something away in the project: one matching the
-      // folder itself, or one naming a path inside it (any depth, hidden folders included).
+      // folder itself, or one naming a path inside it (any depth, hidden folders included). A
+      // rule before the grant is before the blanket too, which already overrides it.
       const home = this.input.home ?? homedir();
       const named: string[] = [];
-      for (const [key, action] of Object.entries(rules)) {
-        if (action === "allow" || key === "*" || key === pattern) continue;
+      const entries = Object.entries(rules);
+      for (const [key, action] of entries.slice(entries.findIndex(([k]) => k === pattern) + 1)) {
+        if (action === "allow") continue;
         const expanded = expandHome(key, home);
         if (wildcardMatch(`${found.dir}/*`, expanded) || expanded.startsWith(`${found.dir}/`)) {
-          named.push(`vault file access: your permission.external_directory rule ${quoted(key)} (${action}) comes after the grant and applies where it matches in Projects/${vaultName(found.name)}`);
+          named.push(`vault file access: your permission.external_directory rule ${quoted(key, PATTERN_SHOWN)} (${action}) comes after the grant and applies where it matches in Projects/${vaultName(found.name)}`);
         }
       }
       // A new permission object: OpenCode's config merge shares nested objects with the cached
@@ -146,7 +155,8 @@ export class VaultAccess {
       this.granted = found.name;
       for (const text of named) this.tell("warn", text);
     } catch (err) {
-      this.tell("error", `vault file access: ${errorText(err)}, so ${NOT_ADDED}`);
+      // One status line: git's stderr can span several.
+      this.tell("error", `vault file access: ${errorText(err).trim().replace(/\s*\n\s*/g, " ")}, so ${NOT_ADDED}`);
     } finally {
       clearTimeout(timer);
     }
@@ -156,7 +166,7 @@ export class VaultAccess {
     this.told.push({ level, text });
     // Through a promise, so a log that throws at once is caught like one that rejects.
     void Promise.resolve()
-      .then(() => this.input.log(text))
+      .then(() => this.input.log(level, text))
       .catch(() => undefined);
   }
 
@@ -177,7 +187,9 @@ export class VaultAccess {
       };
     }
     if (settled === this.granted) return null;
-    const now = settled === null ? "memory is off in this session (see the lines above)" : `this session's project is Projects/${vaultName(settled)}`;
-    return { level: "warn", text: `vault file access was granted for Projects/${vaultName(this.granted)} at startup, but ${now}; restart OpenCode to move it` };
+    const granted = `vault file access was granted for Projects/${vaultName(this.granted)} at startup`;
+    // Memory off: the lines above say why and what to do; a restart is not always it.
+    if (settled === null) return { level: "warn", text: `${granted}, but memory is off in this session (see the lines above)` };
+    return { level: "warn", text: `${granted}, but this session's project is Projects/${vaultName(settled)}; restart OpenCode to move it` };
   }
 }

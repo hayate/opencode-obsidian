@@ -26,7 +26,7 @@ export function assemble(input: { client: OpenCodeClient; directory: string }, o
   const option = options?.journalModel;
   const harness = new OpenCodeHarness(input.client, option === undefined ? undefined : String(option));
   // Spec 4.4: the config hook's grant, and what every session is told about it.
-  const access = new VaultAccess({ env: process.env, directory: input.directory, log: (message) => harness.logError(message) });
+  const access = new VaultAccess({ env: process.env, directory: input.directory, log: (level, message) => harness.log(level, message) });
   const sessions = new Sessions({ client: input.client, harness, directory: input.directory, bootstrap: BOOTSTRAP, env: process.env, access });
   return { harness, sessions, access };
 }

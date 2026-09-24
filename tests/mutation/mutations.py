@@ -773,41 +773,6 @@ mutate(OI, '    if (told || eventType.startsWith("tui.")) return;', "    if (tol
 mutate(OI, "    told = true;\n", "", AI, pattern="told as the plugin loads")
 mutate(OI, "  void problem.then((p) => (p === null ? undefined : harness.logError(p))).catch(() => undefined);\n", "", AI, pattern="told as the plugin loads")
 
-# Spec 4.4: vault access. Each guard, and the test that must notice it gone.
-OA = "adapters/opencode/access.ts"; AA = "tests/adapters/opencode/access.test.ts"
-mutate(OA, ('  out[pattern] = "allow";\n  for (const [key, action] of Object.entries(user)) if (key !== "*") out[key] = action;\n',),
-       ('  for (const [key, action] of Object.entries(user)) if (key !== "*") out[key] = action;\n  out[pattern] = "allow";\n',), AA, pattern="before every other user rule")
-mutate(OA, '  if ("*" in user) out["*"] = user["*"] as string;\n', "", AA, pattern="string setting")
-mutate(OA, "      if (pattern in user) {", "      if (false) {", AA, pattern="exact pattern is kept")
-mutate(OA, "      cfg.permission = { ...(cfg.permission ?? {}), external_directory: rules };",
-       "      (cfg.permission ??= {}).external_directory = rules;", AA, pattern="never changed in place")
-mutate(OA, "      if (/[*?\\\\]/.test(found.dir)) {", "      if (/[*?]/.test(found.dir)) {", AA, pattern="cannot match literally")
-mutate(OA, "      const found = await Promise.race([resolving, late]);", "      const found = await Promise.race([resolving]);", AA, pattern="past the bound")
-mutate(OA, '        if (action === "allow" || key === "*" || key === pattern) continue;', "        if (key === pattern) continue;", AA, pattern="blanket deny")
-mutate(OA, " || expanded.startsWith(`${found.dir}/`)) {", ") {", AA, pattern="hidden and nested")
-mutate(OA, "        if (wildcardMatch(`${found.dir}/*`, expanded) || ", "        if (", AA, pattern="broad user deny")
-mutate(OA, '    .replace(/\\?/g, ".");', "    ;", AA, pattern="source's details")
-mutate(OA, '  return new RegExp(`^${p}$`, "s").test(s);', "  return new RegExp(`^${p}$`).test(s);", AA, pattern="source's details")
-mutate(OA, '  if (p.endsWith(" .*")) p = `${p.slice(0, -3)}( .*)?`;\n', "", AA, pattern="source's details")
-mutate(OA, '  if (pattern === "~") return home;\n', "", AA, pattern="four prefixes")
-mutate(OA, "    if (settled === this.granted) return null;\n", "", AA, pattern="not the granted one")
-mutate(OA, "      this.granted = found.name;\n", "", AA, pattern="not the granted one")
-mutate(OA, "        this.refused = found.reason;\n", "", AA, pattern="refused before the pull")
-mutate(OA, "      if (this.refused === null || settled === null) return null;", "      if (this.refused === null) return null;", AA, pattern="refused before the pull")
-mutate(OA, "        this.refused = found.reason;\n        return;\n", '        this.refused = found.reason;\n        return this.tell("warn", "off");\n', AA, pattern="memory off adds nothing")
-mutate(OA, "    void Promise.resolve()\n      .then(() => this.input.log(text))\n      .catch(() => undefined);\n",
-       "    void this.input.log(text).catch(() => undefined);\n", AA, pattern="synchronous throw")
-mutate(OA, "    } finally {\n      clearTimeout(timer);\n    }\n", "    } finally {\n    }\n", AA, pattern="synchronous throw")
-# The sessions tell it on the first request, once, and the plugin wires it.
-mutate(OS, "    await this.tellAccess(entry, result);\n", "", AS, pattern="vault access")
-mutate(OS, "    for (const item of access.lines()) this.tellOnce(entry, item);\n", "", AS, pattern="vault access")
-mutate(OS, "    void result.settled.then(compare, () => undefined);\n", "", AS, pattern="vault access")
-mutate(OS, "    if (access === undefined || entry.accessTold) return;", "    if (access === undefined) return;", AS, pattern="vault access")
-mutate(OI, "        await access.configure(cfg as unknown as ConfigLike);", "        void cfg;", AI, pattern="config hook grants")
-# Core: a git call past its timeout is an error, never a guess about the repository.
-# P is reassigned to a pattern string at line 162: name the project test file explicitly.
-mutate("core/project.ts", "  if (result.timedOut) throw new GitError(args, result);\n", "", "tests/core/project.test.ts", pattern="times out")
-mutate("core/project.ts", "  const run = { cwd: sessionDir, timeoutMs: opts.timeoutMs };", "  const run = { cwd: sessionDir };", "tests/core/project.test.ts", pattern="times out")
 mutate(OI, "    void problem.then((p) => (p === null ? undefined : harness.notify(p))).catch(() => undefined);\n", "", AI, pattern="told as the plugin loads")
 mutate(OI, "        tellVault(event.type);\n", "", AI, pattern="told as the plugin loads")
 mutate(OI, "    () => null,\n", '    () => "memory and sync are off: fine",\n', AI, pattern="usable vault is not told")
@@ -819,6 +784,57 @@ mutate(OI, 'if (told || eventType.startsWith("tui."))', 'if (told || eventType =
 mutate(OI, "harness.logError(p))).catch(() => undefined);", "harness.logError(p)));", AI, pattern="log that fails", runs=5)
 mutate(OI, "harness.notify(p))).catch(() => undefined);", "harness.notify(p)));", AI, pattern="log that fails", runs=5)
 mutate(OI, ("  let told = false;\n", "    void problem.then((p) => (p === null ? undefined : harness.notify(p))).catch(() => undefined);\n"), ("  let told = false;\n  let known: string | null = null;\n  void problem.then((p) => { known = p; });\n", "    if (known !== null) void harness.notify(known).catch(() => undefined);\n"), AI, pattern="before the load-time check has finished", runs=5)
+
+# Spec 4.4: vault access. Each guard, and the test that must notice it gone.
+OA = "adapters/opencode/access.ts"; AA = "tests/adapters/opencode/access.test.ts"
+# The grant goes right after the user's blanket (first without one), every user rule in its place.
+mutate(OA, '  if (!("*" in user)) out[pattern] = "allow";\n', "", AA, pattern="no setting, the grant alone")
+mutate(OA, '    if (key === "*") out[pattern] = "allow";\n', "", AA, pattern="string setting")
+mutate(OA, ('  if (!("*" in user)) out[pattern] = "allow";\n  for (const [key, action] of Object.entries(user)) {\n    out[key] = action;\n    if (key === "*") out[pattern] = "allow";\n  }\n',),
+       ('  if ("*" in user) out["*"] = user["*"] as string;\n  out[pattern] = "allow";\n  for (const [key, action] of Object.entries(user)) if (key !== "*") out[key] = action;\n',), AA, pattern="nothing outside the project changes")
+mutate(OA, "      if (pattern in user) {", "      if (false) {", AA, pattern="exact pattern is kept")
+mutate(OA, "      cfg.permission = { ...(cfg.permission ?? {}), external_directory: rules };",
+       "      (cfg.permission ??= {}).external_directory = rules;", AA, pattern="never changed in place")
+mutate(OA, "      if (/[*?\\\\]/.test(found.dir)) {", "      if (/[*?]/.test(found.dir)) {", AA, pattern="cannot match literally")
+mutate(OA, "      const found = await Promise.race([resolving, late]);", "      const found = await Promise.race([resolving]);", AA, pattern="past the bound")
+# Which user rules are named: after the grant, not allowing, about the folder or a path inside it.
+mutate(OA, "      for (const [key, action] of entries.slice(entries.findIndex(([k]) => k === pattern) + 1)) {",
+       "      for (const [key, action] of entries) {", AA, pattern="blanket deny")
+mutate(OA, '        if (action === "allow") continue;\n', "", AA, pattern="own rules win")
+mutate(OA, " || expanded.startsWith(`${found.dir}/`)) {", ") {", AA, pattern="hidden and nested")
+mutate(OA, "        if (wildcardMatch(`${found.dir}/*`, expanded) || ", "        if (", AA, pattern="broad user deny")
+mutate(OA, "rule ${quoted(key, PATTERN_SHOWN)} (${action})", "rule ${quoted(key)} (${action})", AA, pattern="long user pattern")
+mutate(OA, '.trim().replace(/\\s*\\n\\s*/g, " ")', "", AA, pattern="spans lines")
+# OpenCode's matcher and home expansion, copied.
+mutate(OA, '    .replace(/\\?/g, ".");', "    ;", AA, pattern="source's details")
+mutate(OA, '  return new RegExp(`^${p}$`, "s").test(s);', "  return new RegExp(`^${p}$`).test(s);", AA, pattern="source's details")
+mutate(OA, '  if (p.endsWith(" .*")) p = `${p.slice(0, -3)}( .*)?`;\n', "", AA, pattern="source's details")
+mutate(OA, '  if (pattern === "~") return home;\n', "", AA, pattern="four prefixes")
+# The mismatch and not-granted lines.
+mutate(OA, "    if (settled === this.granted) return null;\n", "", AA, pattern="not the granted one")
+mutate(OA, "      this.granted = found.name;\n", "", AA, pattern="not the granted one")
+mutate(OA, '    if (settled === null) return { level: "warn", text: `${granted}, but memory is off in this session (see the lines above)` };\n', "", AA, pattern="not the granted one")
+mutate(OA, "        this.refused = found.reason;\n", "", AA, pattern="refused before the pull")
+mutate(OA, "      if (this.refused === null || settled === null) return null;", "      if (this.refused === null) return null;", AA, pattern="refused before the pull")
+mutate(OA, "        this.refused = found.reason;\n        return;\n", '        this.refused = found.reason;\n        return this.tell("warn", "off");\n', AA, pattern="memory off adds nothing")
+# The log: its own level, and a throw from it caught; the bound's timer always cleared.
+mutate(OA, "      .then(() => this.input.log(level, text))", '      .then(() => this.input.log("error", text))', AA, pattern="own rules win")
+mutate(OA, "    void Promise.resolve()\n      .then(() => this.input.log(level, text))\n      .catch(() => undefined);\n",
+       "    void this.input.log(level, text).catch(() => undefined);\n", AA, pattern="synchronous throw")
+mutate(OA, "    } finally {\n      clearTimeout(timer);\n    }\n", "    } finally {\n    }\n", AA, pattern="synchronous throw")
+mutate(OH, "level, message } }), \"writing to the OpenCode log\"", 'level: "error", message } }), "writing to the OpenCode log"', AH, pattern="its own level")
+# The sessions tell it on the first request, once, and the plugin wires it.
+mutate(OS, "    await this.tellAccess(entry, result);\n", "", AS, pattern="vault access")
+mutate(OS, "    for (const item of access.lines()) this.tellOnce(entry, item);\n", "", AS, pattern="vault access")
+mutate(OS, "    void result.settled.then(compare, () => undefined);\n", "", AS, pattern="vault access")
+mutate(OS, "    if (access === undefined || entry.accessTold) return;", "    if (access === undefined) return;", AS, pattern="vault access")
+mutate(OI, "        await access.configure(cfg as unknown as ConfigLike);", "        void cfg;", AI, pattern="config hook grants")
+# Core: a git call past its timeout is an error, never a guess about the repository; a directory
+# with no folder name is no project. P is reassigned to a pattern string at line 162: name the
+# project test file explicitly.
+mutate("core/project.ts", "  if (result.timedOut) throw new GitError(args, result);\n", "", "tests/core/project.test.ts", pattern="times out")
+mutate("core/project.ts", "  const run = { cwd: sessionDir, timeoutMs: opts.timeoutMs };", "  const run = { cwd: sessionDir };", "tests/core/project.test.ts", pattern="times out")
+mutate("core/project.ts", '    if (name === "" || name === "." || name === "..") {', "    if (false) {", "tests/core/project.test.ts", pattern="no name to give")
 
 # The journal (gauntlet fix pass): one run per session in this process, and the position merged
 # under the machine's lock, never replacing a later one.
