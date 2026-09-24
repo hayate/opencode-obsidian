@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { normalizeOrigin, recordOrigin, resolveProject } from "../../core/project.ts";
 import { gitOk } from "../../core/git.ts";
 import type { Vault } from "../../core/vault.ts";
-import { commitFile, initRepo, tempDir, writeRel } from "./helpers.ts";
+import { commitFile, initRepo, tempDir, withSlowGit, writeRel } from "./helpers.ts";
 
 async function vault(): Promise<Vault> {
   const root = await tempDir("sro-vault-");
@@ -180,4 +180,27 @@ test("a symlinked .origin or project folder refuses: a claim is never read throu
   const r2 = await resolveProject(v2, await repo(await tempDir(), "web"));
   assert.equal(r2.kind, "disabled");
   assert.match(r2.kind === "disabled" ? r2.reason : "", /the project folder is a symbolic link/);
+});
+
+test("resolveProject: a bare-check that times out is an error, never read as 'not a repository'", async () => {
+  const v = await vault();
+  const code = await repo(await tempDir(), "kabin-api", "git@github.com:hayate/kabin-api.git");
+  await withSlowGit("rev-parse", async () => {
+    await assert.rejects(resolveProject(v, code, { timeoutMs: 300 }), /timed out/);
+  });
+});
+
+test("resolveProject: an origin lookup that times out is an error, never read as 'no origin'", async () => {
+  const v = await vault();
+  const code = await repo(await tempDir(), "kabin-api", "git@github.com:hayate/kabin-api.git");
+  await withSlowGit("config", async () => {
+    await assert.rejects(resolveProject(v, code, { timeoutMs: 300 }), /timed out/);
+  });
+});
+
+test("resolveProject: without a timeout option it resolves as before", async () => {
+  const v = await vault();
+  const code = await repo(await tempDir(), "kabin-api", "git@github.com:hayate/kabin-api.git");
+  const r = await resolveProject(v, code);
+  assert.equal(r.kind === "ok" ? r.name : r.reason, "kabin-api");
 });
