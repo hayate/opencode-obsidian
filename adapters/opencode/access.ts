@@ -56,8 +56,8 @@ export const GRANT_TIMEOUT_MS = 5_000;
 // read structurally.
 export type ConfigLike = { permission?: Record<string, unknown> };
 
-// "off" with a reason: memory is disabled for the project as local state stands (the pull may
-// still resolve it). With none: no usable vault (the plugin's load already tells it).
+// "off": memory is disabled for the project as local state stands, or the vault is unusable,
+// with why (the pull, or a vault that becomes ready, may still resolve it).
 export type Found = { kind: "ok"; name: string; dir: string } | { kind: "off"; reason: string | null };
 export type Resolve = (env: Record<string, string | undefined>, directory: string, timeoutMs: number) => Promise<Found>;
 
@@ -77,13 +77,15 @@ const NOT_ADDED = "the automatic grant was not added; your permission rules appl
 // project, and quoted()'s default cap (120) would cut it.
 const PATTERN_SHOWN = 1000;
 
-// The project from local state, read-only: no pull, no folder created.
+// The project from local state, read-only: no pull, no folder created. A vault that fails here
+// keeps its reason: when the session's own start then finds a project (a mount that was not
+// ready yet), it is told the grant is missing.
 async function resolveLocal(env: Record<string, string | undefined>, directory: string, timeoutMs: number): Promise<Found> {
   let vault;
   try {
     vault = await resolveVault(env);
-  } catch {
-    return { kind: "off", reason: null };
+  } catch (err) {
+    return { kind: "off", reason: errorText(err) };
   }
   const project = await resolveProject(vault, directory, { timeoutMs });
   return project.kind === "ok" ? { kind: "ok", name: project.name, dir: project.dir } : { kind: "off", reason: project.reason };

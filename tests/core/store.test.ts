@@ -357,3 +357,7 @@ test("a writeDurable whose rename fails takes its temp sibling with it and throw
   await assert.rejects(() => writeDurable(join(dir, "record.json"), "x"));
   assert.deepEqual(await readdir(dir), ["record.json"], "no temp sibling is left behind");
 });
+
+test("errorText never throws, even for a value that cannot become text", () => {
+  assert.equal(errorText(Object.create(null)), "an error that cannot be shown as text");
+});

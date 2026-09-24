@@ -205,7 +205,7 @@ test("the bootstrap tells the model remember/ is the plugin's", () => {
   assert.match(BOOTSTRAP, /`remember\/` .*written by this plugin only/);
 });
 
-test("the config hook grants nothing without a vault, and never throws", async () => {
+test("the config hook grants nothing without a vault", async () => {
   const client = new FakeClient([{ id: "ses_top", directory: "/code" }]);
   const h = await hooks(client);
   assert.ok(h.config, "the plugin has a config hook");
@@ -237,4 +237,46 @@ test("assemble builds the vault access the sessions tell", () => {
   const { access, sessions } = assemble({ client: new FakeClient([]), directory: "/code" }, {});
   assert.deepEqual(access.lines(), []);
   assert.ok(sessions);
+});
+
+test("vault access reaches the sessions: one whose project is not the granted one is told on its first request", async () => {
+  const root = join(await tempDir("sro-index-"), "Da Vinci");
+  await mkdir(join(root, ".obsidian"), { recursive: true });
+  await mkdir(join(root, "Projects"));
+  const parent = await tempDir();
+  for (const name of ["kabin-api", "canonical-a"]) {
+    await initRepo(join(parent, name));
+    await commitFile(join(parent, name), "README.md", "x\n", "init");
+  }
+  process.env.OBSIDIAN_VAULT_PATH = root;
+  try {
+    const client = new FakeClient([{ id: "ses_b", directory: join(parent, "canonical-a") }]);
+    client.cfg = { small_model: "p/small" };
+    const h = await SuperpowerRememberObsidian({ client, directory: join(parent, "kabin-api") } as unknown as PluginInput, {});
+    await h.config?.({} as never);
+    const messages = user("ses_b");
+    await h["experimental.chat.messages.transform"]?.({}, { messages } as never);
+    const all = messages[0]?.parts.map((p) => p.text ?? "").join("\n") ?? "";
+    assert.match(all, /vault file access was granted for Projects\/kabin-api at startup, but this session's project is Projects\/canonical-a; restart OpenCode to move it/);
+  } finally {
+    delete process.env.OBSIDIAN_VAULT_PATH;
+  }
+});
+
+test("vault access lines reach OpenCode's log at their own level", async () => {
+  const root = join(await tempDir("sro-index-"), "Da Vinci");
+  await mkdir(join(root, ".obsidian"), { recursive: true });
+  await mkdir(join(root, "Projects"));
+  const odd = join(await tempDir(), "a*b");
+  await mkdir(odd);
+  process.env.OBSIDIAN_VAULT_PATH = root;
+  try {
+    const client = new FakeClient([]);
+    const h = await SuperpowerRememberObsidian({ client, directory: odd } as unknown as PluginInput, {});
+    await h.config?.({} as never);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(client.logs.some((l) => l.level === "warn" && l.message.startsWith("vault file access: the path")), JSON.stringify(client.logs));
+  } finally {
+    delete process.env.OBSIDIAN_VAULT_PATH;
+  }
 });

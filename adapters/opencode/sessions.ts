@@ -3,7 +3,7 @@
 // every transform, and status that arrives later (the background sync, an idle) is
 // appended to the first user message the model sees after it arrived.
 import { escapeBlockTags, PAYLOAD_MARKER, type StatusItem } from "../../core/inject.ts";
-import { idleSession, initializeSession, syncSession, type InitResult, type SessionContext } from "../../core/session.ts";
+import { idleSession, initializeSession, syncSession, type InitResult } from "../../core/session.ts";
 import { errorText } from "../../core/store.ts";
 import type { VaultAccess } from "./access.ts";
 import type { OpenCodeClient, OpenCodeHarness } from "./harness.ts";
@@ -95,6 +95,7 @@ function failedInit(bootstrap: string, err: unknown): InitResult {
     context: null,
     background: Promise.resolve([]),
     settled: Promise.resolve(null),
+    settledProject: Promise.resolve(null),
   };
 }
 
@@ -217,21 +218,25 @@ export class Sessions {
     this.tell(entry, fresh);
   }
 
-  // Spec 4.4: the config hook's lines, on the session's first request. Its settled project is
-  // compared with the grant then when it has already settled (initialization in time), or when
-  // it settles, on a later request: the first request is never held for the pull. A settled
-  // promise's reaction is queued at once, before transform's await on this method resumes, so
-  // the first request carries it (promise jobs run in order; a test pins it).
+  // Spec 4.4: the config hook's lines, on the session's first request. The project the pull
+  // resolved is compared with the grant then when it has already settled (initialization in
+  // time), or when it settles, on a later request: the first request is never held for the pull.
+  // A settled promise's reaction is queued at once, before transform's await on this method
+  // resumes, so the first request carries it (promise jobs run in order; a test pins it). Memory
+  // off is told once the background's lines, which say why, are in. A comparison that fails is
+  // a line too.
   private async tellAccess(entry: Entry, result: InitResult): Promise<void> {
     const access = this.input.access;
     if (access === undefined || entry.accessTold) return;
     entry.accessTold = true;
     for (const item of access.lines()) this.tellOnce(entry, item);
-    const compare = (ctx: SessionContext | null): void => {
-      const off = access.mismatch(ctx?.project ?? null);
+    const compare = (project: string | null): void => {
+      const off = access.mismatch(project);
       if (off !== null) this.tellOnce(entry, off);
     };
-    void result.settled.then(compare, () => undefined);
+    void result.settledProject
+      .then((project) => (project === null ? result.background.then(() => compare(null), () => compare(null)) : compare(project)))
+      .catch((err: unknown) => this.tellOnce(entry, { level: "error", text: `vault file access: comparing this session's project with the grant failed: ${errorText(err)}` }));
   }
 
   async transform(messages: Message[]): Promise<void> {

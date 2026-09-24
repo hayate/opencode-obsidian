@@ -1270,3 +1270,28 @@ test("an idle's journal entry is the one the next session start's catch-up sees:
   assert.equal(entries[0]?.meta?.branch, "feat/x");
   assert.equal(entries[0]?.day, "2026-09-22", "the vault's day, not UTC's");
 });
+
+test("settledProject: in time, the project the session was given", async () => {
+  const r = await initializeSession(opts(await world()));
+  assert.ok(r.context);
+  assert.equal(await r.settledProject, r.context.project);
+});
+
+test("settledProject: memory off, null", async () => {
+  const r = await initializeSession(opts(await world(), { env: {} }));
+  assert.equal(await r.settledProject, null);
+});
+
+test("settledProject: after a timeout, the folder the pull maps this repository to, even when the context cannot be used", async () => {
+  const w = await identityWorld();
+  const lock = await holdPrepareLock(w); // the work cannot reach the post-pull identity
+  let r;
+  try {
+    r = await initializeSession(opts(w, { waitMs: 1_500 }));
+  } finally {
+    await lock.release();
+  }
+  assert.equal(r.context?.project, "different-local-name");
+  assert.equal(await r.settledProject, "canonical", "the name, where settled is null");
+  assert.equal(await r.settled, null);
+});

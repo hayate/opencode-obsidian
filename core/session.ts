@@ -63,6 +63,11 @@ export interface InitResult {
   // to another folder (the background's lines tell the session to restart). A sync failure
   // keeps the context: memory still works.
   settled: Promise<SessionContext | null>;
+  // The project the session-start pull resolved, by name, settling with `settled`: the folder
+  // the repository maps to even where the context cannot be used (the pull mapped it to another
+  // folder), and null when memory is disabled. The vault-access grant is compared with it
+  // (spec 4.4).
+  settledProject: Promise<string | null>;
 }
 
 export const DEFAULT_STATE_ROOT = join(homedir(), ".local", "state", "superpower-remember-obsidian");
@@ -279,6 +284,7 @@ function statusOnly(bootstrap: string, status: StatusItem[], background: Promise
     context: null,
     background,
     settled: Promise.resolve(null),
+    settledProject: Promise.resolve(null),
   };
 }
 
@@ -646,7 +652,14 @@ export async function initializeSession(opts: SessionOptions): Promise<InitResul
             return later.kind === "ok" && later.name === ctx.project ? { ...ctx, timezone: started.shared.timezone } : null;
           })
         : Promise.resolve(ctx);
-    return { payload, status, context: ctx, background, settled };
+    const settledProject: Promise<string | null> =
+      first.kind === "timeout"
+        ? started.pulled.then(() => {
+            const later = started.shared.resolved;
+            return later.kind === "ok" ? later.name : null;
+          })
+        : Promise.resolve(project.name);
+    return { payload, status, context: ctx, background, settled, settledProject };
   } catch (err) {
     return disabled(opts.bootstrap, `unexpected error: ${errorText(err)}`);
   } finally {

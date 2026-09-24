@@ -39,9 +39,9 @@ subfolders) if they do not already exist.
 - `Projects/<project>/notes/` - durable notes (gotchas, procedures).
 - `Projects/<project>/archive/` - dated copies of superseded handoffs and plans.
 - `Projects/<project>/remember/` - the plugin's memory (the journal, its rollups, `.origin`): written by the plugin only. Read it; never edit or delete it.
+- `Agents/<machine>/` - per-machine working notes.
 
 The current project's folder is yours to read and write without asking. Other projects' folders and the rest of the vault (`Articles`, `YouTube Transcripts`, ...) are not: open them only when the user asks.
-- `Agents/<machine>/` - per-machine working notes.
 
 The project folder is the one the session's memory names: the `Project:`
 line at the top of the session. The plugin finds it by the repository's

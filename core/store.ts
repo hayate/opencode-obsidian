@@ -64,8 +64,14 @@ const BUG_KINDS = new Set(["TypeError", "RangeError", "ReferenceError", "SyntaxE
 // promise's value, a null from a library) renders "sync aborted: undefined", which says
 // nothing at all.
 export function errorText(err: unknown): string {
-  if (!(err instanceof Error)) return String(err);
-  return BUG_KINDS.has(err.name) ? `${err.name}: ${err.message}` : err.message;
+  // Never a throw of its own: it runs inside the catch blocks that turn failures into lines,
+  // and String() throws for an object without a prototype.
+  try {
+    if (!(err instanceof Error)) return String(err);
+    return BUG_KINDS.has(err.name) ? `${err.name}: ${err.message}` : err.message;
+  } catch {
+    return "an error that cannot be shown as text";
+  }
 }
 
 // A folder name from the vault, shown as is when it is plain, quoted otherwise.

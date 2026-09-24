@@ -20,6 +20,8 @@ class FakeCore {
   idleItems: StatusItem[] | Error = [];
   // The context once the background work ends; the context itself unless a test says.
   settled: Promise<SessionContext | null> | null = null;
+  // The project the pull resolved (spec 4.4's comparison); the context's own unless a test says.
+  settledProject: Promise<string | null> | null = null;
   // Held until the test opens it: the core's idle is in progress meanwhile.
   idleGate: Promise<void> = Promise.resolve();
   syncItems: StatusItem[] = [];
@@ -33,6 +35,7 @@ class FakeCore {
         context: this.context,
         background: this.background,
         settled: this.settled ?? Promise.resolve(this.context),
+        settledProject: this.settledProject ?? Promise.resolve(this.context?.project ?? null),
       } satisfies InitResult;
     },
     idle: async (_ctx, opts) => {
@@ -495,12 +498,12 @@ test("vault access: a project already settled is compared on the first request",
 
 test("vault access: a project still settling is compared when it settles, on a later request", async () => {
   const { fake, registry, asked } = withAccess([], (s) => (s === "kabin-api" ? null : { level: "warn", text: `moved to ${s}` }));
-  let settle!: (ctx: SessionContext | null) => void;
-  fake.settled = new Promise((resolve) => (settle = resolve));
+  let settle!: (project: string | null) => void;
+  fake.settledProject = new Promise((resolve) => (settle = resolve));
   const first = conversation("ses_top", ["u1"]);
   await registry.transform(first);
   assert.deepEqual(asked, [], "not before the project has settled, and the first request is not held");
-  settle({ project: "canonical-a" } as unknown as SessionContext);
+  settle("canonical-a");
   await tick();
   const messages = conversation("ses_top", ["u1", "u2"]);
   await registry.transform(messages);
@@ -516,4 +519,52 @@ test("vault access: told once per session, however many requests", async () => {
   assert.equal(asked.length, 1);
   const all = messages.flatMap((m) => texts(m)).join("\n");
   assert.equal(all.split("- [warn] vault file access: x").length - 1, 1);
+});
+
+test("vault access: every session is told on its own first request", async () => {
+  const client = new FakeClient([{ id: "ses_a", directory: "/code/kabin-api" }, { id: "ses_b", directory: "/code/kabin-api" }]);
+  client.cfg = { small_model: "p/small" };
+  const harness = new OpenCodeHarness(client, undefined);
+  const fake = new FakeCore();
+  const asked: Array<string | null> = [];
+  const registry = new Sessions({
+    client, harness, directory: "/plugin/dir", bootstrap: "BOOT", env: {}, core: fake.core,
+    access: { lines: () => [{ level: "warn", text: "vault file access: x" }], mismatch: (s) => (asked.push(s), null) },
+  });
+  for (const id of ["ses_a", "ses_b"]) {
+    const messages = conversation(id, ["u1"]);
+    await registry.transform(messages);
+    assert.ok(texts(messages[0]).some((t) => t.includes("- [warn] vault file access: x")), id);
+  }
+  assert.equal(asked.length, 2);
+});
+
+test("vault access: memory off is told after the lines that say why", async () => {
+  const { fake, registry, asked } = withAccess([], (s) => (s === null ? { level: "warn", text: "granted, but memory is off (see the lines above)" } : null));
+  let finish!: (items: StatusItem[]) => void;
+  fake.background = new Promise((resolve) => (finish = resolve));
+  fake.settledProject = Promise.resolve(null);
+  await registry.transform(conversation("ses_top", ["u1"]));
+  await tick();
+  assert.deepEqual(asked, [], "not before the background's lines");
+  finish([{ level: "error", text: "after sync memory and sync are disabled: x" }]);
+  await tick();
+  await tick();
+  const messages = conversation("ses_top", ["u1", "u2"]);
+  await registry.transform(messages);
+  assert.deepEqual(asked, [null]);
+  const later = texts(messages[2]).join("\n");
+  assert.ok(later.indexOf("after sync memory and sync are disabled") < later.indexOf("granted, but memory is off"), later);
+});
+
+test("vault access: a comparison that fails is an error line, never lost", async () => {
+  const { registry } = withAccess([], () => {
+    throw new Error("broken");
+  });
+  const messages = conversation("ses_top", ["u1"]);
+  await registry.transform(messages);
+  await tick();
+  const again = conversation("ses_top", ["u1", "u2"]);
+  await registry.transform(again);
+  assert.ok(again.flatMap((m) => texts(m)).some((t) => t.includes("- [error] vault file access: comparing this session's project with the grant failed: broken")));
 });

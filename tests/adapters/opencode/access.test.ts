@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, realpath } from "node:fs/promises";
+import { mkdir, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expandHome, GRANT_TIMEOUT_MS, VaultAccess, wildcardMatch, withGrant, type ConfigLike, type Found } from "../../../adapters/opencode/access.ts";
 import { gitOk } from "../../../core/git.ts";
@@ -106,12 +106,14 @@ test("vault access: a long user pattern is named whole", async () => {
   assert.ok(a.lines()[0]?.text.includes(JSON.stringify(long)), a.lines()[0]?.text);
 });
 
-test("vault access: an error that spans lines is one status line", async () => {
-  const { a } = access(async () => {
+test("vault access: an error that spans lines is one status line, logged as an error", async () => {
+  const { a, logged } = access(async () => {
     throw new Error("fatal: one\n  hint: two\n");
   });
   await a.configure({});
   assert.deepEqual(a.lines(), [{ level: "error", text: `vault file access: fatal: one hint: two, so ${NOT_ADDED}` }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(logged, [`error: vault file access: fatal: one hint: two, so ${NOT_ADDED}`]);
 });
 
 test("vault access, for real: a directory with no name to give a project (/) is granted nothing", async () => {
@@ -168,7 +170,17 @@ test("vault access: a broad user deny over the project is named", async () => {
 test("vault access: user rules on hidden and nested folders are named, rules elsewhere are not", async () => {
   const { a } = ok();
   await a.configure({
-    permission: { external_directory: { [`${P}/.private/**`]: "deny", [`${P}/notes/private/**`]: "deny", [`${V}/Articles/**`]: "deny", "/srv/**": "ask", [`${V}/Projects/kabin-api-other/**`]: "deny" } },
+    permission: {
+      external_directory: {
+        [`${P}/.private/**`]: "deny",
+        [`${P}/notes/private/**`]: "deny",
+        [`${V}/Articles/**`]: "deny",
+        "/srv/**": "ask",
+        [`${V}/Projects/kabin-api-other/**`]: "deny",
+        // A wildcard before the project's path: not named (spec 4.4), though it still decides.
+        "/Users/*/Documents/Da Vinci/Projects/kabin-api/notes/**": "deny",
+      },
+    },
   });
   assert.deepEqual(a.lines().map((l) => l.text), [named(`${P}/.private/**`, "deny"), named(`${P}/notes/private/**`, "deny")]);
 });
@@ -316,6 +328,7 @@ test("vault access, for real: a vault and a repository on disk (folder absent ye
   const dir = join(await realpath(root), "Projects", "kabin-api");
   assert.deepEqual(cfg.permission, { external_directory: { [`${dir}/**`]: "allow" } });
   assert.deepEqual(a.lines(), []);
+  await assert.rejects(stat(dir), "read-only: the hook creates no folder");
 });
 
 test("vault access, for real: no vault set adds nothing and says nothing (the plugin's load already tells it)", async () => {
@@ -324,4 +337,72 @@ test("vault access, for real: no vault set adds nothing and says nothing (the pl
   await a.configure(cfg);
   assert.equal(cfg.permission, undefined);
   assert.deepEqual(a.lines(), []);
+});
+
+test("vault access: a rule matching the folder's own ask is named", async () => {
+  const { a } = ok();
+  await a.configure({ permission: { external_directory: { "*/kabin-api/*": "deny" } } });
+  assert.deepEqual(a.lines().map((l) => l.text), [named("*/kabin-api/*", "deny")]);
+});
+
+test("vault access: the bound is 5 s by default, for the race and the git calls", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let given = 0;
+  const a = new VaultAccess({
+    env: {},
+    directory: "/code/kabin-api",
+    log: async () => undefined,
+    resolve: (_env, _dir, ms) => {
+      given = ms;
+      return new Promise<Found>(() => undefined);
+    },
+  });
+  const done = a.configure({});
+  t.mock.timers.tick(5000);
+  await done;
+  assert.equal(given, 5000);
+  assert.equal(a.lines()[0]?.text, `vault file access: finding this project took longer than 5 s, so ${NOT_ADDED}`);
+});
+
+test("vault access, for real: a vault that fails at startup but works for the session is told the grant is missing", async () => {
+  const a = new VaultAccess({ env: { OBSIDIAN_VAULT_PATH: "/nonexistent/vault" }, directory: "/code/kabin-api", log: async () => undefined });
+  const cfg: ConfigLike = {};
+  await a.configure(cfg);
+  assert.equal(cfg.permission, undefined);
+  assert.deepEqual(a.lines(), [], "at startup the plugin's load already tells it");
+  assert.equal(a.mismatch(null), null, "still off for the session: nothing to add");
+  assert.match(a.mismatch("kabin-api")?.text ?? "", /^vault file access was not granted at startup \(OBSIDIAN_VAULT_PATH .*\), and the sync then found this session's project, Projects\/kabin-api; restart OpenCode to grant it$/);
+});
+
+test("vault access, for real: a project local state refuses (two folders claim it) is refused with its reason", async () => {
+  const root = join(await tempDir("sro-access-"), "Da Vinci");
+  for (const folder of ["one", "two"]) {
+    await mkdir(join(root, "Projects", folder, "remember"), { recursive: true });
+    await writeFile(join(root, "Projects", folder, "remember", ".origin"), "github.com/hayate/kabin-api\n");
+  }
+  await mkdir(join(root, ".obsidian"));
+  const code = join(await tempDir(), "kabin-api");
+  await initRepo(code);
+  await commitFile(code, "README.md", "x\n", "init");
+  await gitOk(["remote", "add", "origin", "git@github.com:hayate/kabin-api.git"], { cwd: code });
+  const a = new VaultAccess({ env: { OBSIDIAN_VAULT_PATH: root }, directory: code, log: async () => undefined });
+  const cfg: ConfigLike = {};
+  await a.configure(cfg);
+  assert.equal(cfg.permission, undefined);
+  assert.match(a.mismatch("one")?.text ?? "", /^vault file access was not granted at startup \(origin .* is claimed by several folders/);
+});
+
+test("vault access, for real: the pattern uses the resolved vault root, not a symlink's spelling", async () => {
+  const root = join(await tempDir("sro-access-"), "Da Vinci");
+  await mkdir(join(root, ".obsidian"), { recursive: true });
+  await mkdir(join(root, "Projects"));
+  const alias = join(await tempDir("sro-alias-"), "vault-link");
+  await symlink(root, alias);
+  const code = join(await tempDir(), "kabin-api");
+  await initRepo(code);
+  await commitFile(code, "README.md", "x\n", "init");
+  const a = new VaultAccess({ env: { OBSIDIAN_VAULT_PATH: alias }, directory: code, log: async () => undefined });
+  const cfg: ConfigLike = {};
+  await a.configure(cfg);
+  assert.deepEqual(Object.keys(cfg.permission?.external_directory as object), [`${join(await realpath(root), "Projects", "kabin-api")}/**`]);
 });

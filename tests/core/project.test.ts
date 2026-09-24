@@ -211,3 +211,10 @@ test("resolveProject: a directory with no name to give a project (/) is refused,
   assert.equal(r.kind, "disabled");
   assert.match(r.kind === "disabled" ? r.reason : "", /^"\/" has no folder name to give a project/);
 });
+
+test("resolveProject: a directory whose name is .. is refused too", async () => {
+  const v = await vault();
+  const parent = await tempDir();
+  const r = await resolveProject(v, `${parent}/..`);
+  assert.equal(r.kind, "disabled");
+});
