@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { expandHome, wildcardMatch, withGrant } from "../../../adapters/opencode/access.ts";
+import { mkdir, realpath } from "node:fs/promises";
+import { join } from "node:path";
+import { expandHome, GRANT_TIMEOUT_MS, VaultAccess, wildcardMatch, withGrant, type ConfigLike, type Found } from "../../../adapters/opencode/access.ts";
+import { gitOk } from "../../../core/git.ts";
+import { commitFile, initRepo, tempDir } from "../../core/helpers.ts";
 
 // Expectations come from OpenCode 1.18.32 (its source, quoted in the plan, and the live runs of
 // spec 4.4), never from this copy.
@@ -44,4 +48,228 @@ test("the grant goes after the user's blanket and before every other user rule, 
   assert.notEqual(built, user);
   assert.deepEqual(Object.keys(user), ["*", `${V}/Projects/**`, "/srv/**"], "the user's object is untouched");
   assert.deepEqual(Object.entries(withGrant({}, `${P}/**`)), [[`${P}/**`, "allow"]], "no setting: the grant alone");
+});
+
+// The plugin reads process.env in production: no test may reach this machine's vault.
+delete process.env.OBSIDIAN_VAULT_PATH;
+
+const found = (over: Partial<Extract<Found, { kind: "ok" }>> = {}): Found => ({ kind: "ok", name: "kabin-api", dir: P, ...over });
+const NOT_ADDED = "the automatic grant was not added; your permission rules apply as they are";
+const named = (rule: string, action: string, repo = "kabin-api") =>
+  `vault file access: your permission.external_directory rule "${rule}" (${action}) comes after the grant and applies where it matches in Projects/${repo}`;
+
+function access(result: () => Promise<Found>, extra: { timeoutMs?: number; log?: (m: string) => Promise<void> } = {}) {
+  const logged: string[] = [];
+  const a = new VaultAccess({
+    env: {},
+    directory: "/code/kabin-api",
+    home: "/Users/a",
+    log: extra.log ?? (async (m) => void logged.push(m)),
+    resolve: result,
+    timeoutMs: extra.timeoutMs,
+  });
+  return { a, logged };
+}
+const ok = (over: Partial<Extract<Found, { kind: "ok" }>> = {}) => access(async () => found(over));
+
+test("vault access: no setting, the grant alone, no status line", async () => {
+  const { a } = ok();
+  const cfg: ConfigLike = {};
+  await a.configure(cfg);
+  assert.deepEqual(cfg.permission, { external_directory: { [`${P}/**`]: "allow" } });
+  assert.deepEqual(a.lines(), []);
+});
+
+test("vault access: a string setting is the user's blanket, kept first", async () => {
+  const { a } = ok();
+  const cfg: ConfigLike = { permission: { external_directory: "ask", bash: "allow" } };
+  await a.configure(cfg);
+  assert.deepEqual(cfg.permission, { external_directory: { "*": "ask", [`${P}/**`]: "allow" }, bash: "allow" });
+});
+
+test("vault access: a blanket deny is overridden for the project too, in both forms (Andrea, 2026-09-24)", async () => {
+  for (const setting of ["deny", { "*": "deny" }]) {
+    const { a } = ok();
+    const cfg: ConfigLike = { permission: { external_directory: setting } };
+    await a.configure(cfg);
+    assert.deepEqual(Object.entries(cfg.permission?.external_directory as object), [["*", "deny"], [`${P}/**`, "allow"]]);
+    assert.deepEqual(a.lines(), [], "a blanket is not a rule about the project: nothing to tell");
+  }
+});
+
+test("vault access: the user's own rules win, and each one about the project is named", async () => {
+  const { a, logged } = ok();
+  const cfg: ConfigLike = { permission: { external_directory: { "*": "ask", [`${P}/remember/**`]: "ask", [`${P}/specs/**`]: "allow" } } };
+  await a.configure(cfg);
+  assert.deepEqual(Object.keys(cfg.permission?.external_directory as object), ["*", `${P}/**`, `${P}/remember/**`, `${P}/specs/**`]);
+  assert.deepEqual(a.lines(), [{ level: "warn", text: named(`${P}/remember/**`, "ask") }], "an allow takes nothing away: not named");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(logged, [named(`${P}/remember/**`, "ask")]);
+});
+
+test("vault access: a broad user deny over the project is named", async () => {
+  const { a } = ok();
+  await a.configure({ permission: { external_directory: { [`${V}/Projects/**`]: "deny" } } });
+  assert.deepEqual(a.lines().map((l) => l.text), [named(`${V}/Projects/**`, "deny")]);
+});
+
+test("vault access: user rules on hidden and nested folders are named, rules elsewhere are not", async () => {
+  const { a } = ok();
+  await a.configure({
+    permission: { external_directory: { [`${P}/.private/**`]: "deny", [`${P}/notes/private/**`]: "deny", [`${V}/Articles/**`]: "deny", "/srv/**": "ask", [`${V}/Projects/kabin-api-other/**`]: "deny" } },
+  });
+  assert.deepEqual(a.lines().map((l) => l.text), [named(`${P}/.private/**`, "deny"), named(`${P}/notes/private/**`, "deny")]);
+});
+
+test("vault access: a user rule written with ~/ is expanded as OpenCode does", async () => {
+  const { a } = ok();
+  await a.configure({ permission: { external_directory: { "~/Documents/**": "ask" } } });
+  // home is /Users/a and P is under /Users/a/Documents
+  assert.deepEqual(a.lines().map((l) => l.text), [named("~/Documents/**", "ask")]);
+});
+
+test("vault access: the user's exact pattern is kept, no rule is added, and that is told", async () => {
+  const { a } = ok();
+  const user = { [`${V}/Projects/**`]: "allow", [`${P}/**`]: "deny" };
+  const cfg: ConfigLike = { permission: { external_directory: user } };
+  await a.configure(cfg);
+  assert.equal(cfg.permission?.external_directory, user, "untouched");
+  assert.deepEqual(a.lines(), [{ level: "warn", text: `vault file access: your permission.external_directory already has "${P}/**", which decides it, so ${NOT_ADDED}` }]);
+  assert.equal(a.mismatch("kabin-api"), null, "nothing granted, nothing to compare");
+});
+
+test("vault access: a nested config object is never changed in place (two directories, one process)", async () => {
+  // OpenCode's merge copies the top level and shares nested objects, and the global config is
+  // cached: each instance's config is a top-level copy of the same global.
+  const global = { permission: { external_directory: { "*": "ask" } as Record<string, string> } };
+  const one = { ...global };
+  const two = { ...global };
+  await ok({ name: "one", dir: `${V}/Projects/one` }).a.configure(one);
+  await ok({ name: "two", dir: `${V}/Projects/two` }).a.configure(two);
+  assert.deepEqual(global.permission.external_directory, { "*": "ask" }, "the shared object is untouched");
+  assert.deepEqual(Object.keys(two.permission.external_directory), ["*", `${V}/Projects/two/**`], "two carries only its own grant");
+  assert.deepEqual(Object.keys(one.permission.external_directory), ["*", `${V}/Projects/one/**`]);
+});
+
+test("vault access: a path OpenCode cannot match literally gets no rule", async () => {
+  for (const dir of [`${V}/Projects/a*b`, `${V}/Projects/a?b`, `${V}/Projects/a\\b`]) {
+    const { a } = ok({ dir });
+    const cfg: ConfigLike = {};
+    await a.configure(cfg);
+    assert.equal(cfg.permission, undefined, dir);
+    assert.equal(a.lines()[0]?.text, `vault file access: the path ${JSON.stringify(dir)} contains *, ? or \\, which OpenCode's permission patterns cannot match literally, so ${NOT_ADDED}`);
+  }
+});
+
+test("vault access: a setting that is neither an action nor a map is left alone and told", async () => {
+  for (const value of [["x"], null, 3]) {
+    const { a } = ok();
+    const cfg: ConfigLike = { permission: { external_directory: value } };
+    await a.configure(cfg);
+    assert.equal(cfg.permission?.external_directory, value);
+    assert.equal(a.lines()[0]?.text, `vault file access: permission.external_directory is neither an action nor a map of patterns, so ${NOT_ADDED}`);
+  }
+});
+
+test("vault access: past the bound nothing is added, then or later, and the timeout is told", { timeout: 5_000 }, async () => {
+  let finish!: (f: Found) => void;
+  const pending = new Promise<Found>((resolve) => (finish = resolve));
+  const { a } = access(() => pending, { timeoutMs: 30 });
+  const cfg: ConfigLike = {};
+  await a.configure(cfg);
+  finish(found());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cfg.permission, undefined);
+  assert.equal(a.lines()[0]?.text, `vault file access: finding this project took longer than 0.03 s, so ${NOT_ADDED}`);
+  assert.equal(GRANT_TIMEOUT_MS, 5000);
+});
+
+test("vault access: memory off adds nothing and says nothing", async () => {
+  const { a } = access(async () => ({ kind: "off", reason: null }));
+  const cfg: ConfigLike = {};
+  await a.configure(cfg);
+  assert.equal(cfg.permission, undefined);
+  assert.deepEqual(a.lines(), []);
+  assert.equal(a.mismatch("kabin-api"), null, "no vault: the plugin's load already tells it");
+});
+
+test("vault access: a project refused before the pull and found by it is told the grant is missing", async () => {
+  const { a } = access(async () => ({ kind: "off", reason: "origin x is claimed by several folders" }));
+  await a.configure({});
+  assert.deepEqual(a.lines(), [], "memory is off at startup: the session's own status says why");
+  assert.equal(a.mismatch(null), null, "still off after the pull: nothing to add");
+  assert.deepEqual(a.mismatch("kabin-api"), {
+    level: "warn",
+    text: "vault file access was not granted at startup (origin x is claimed by several folders), and the sync then found this session's project, Projects/kabin-api; restart OpenCode to grant it",
+  });
+});
+
+test("vault access: a failure is an error line, never a throw", async () => {
+  const { a } = access(async () => {
+    throw new Error("boom");
+  });
+  await a.configure({});
+  assert.deepEqual(a.lines(), [{ level: "error", text: `vault file access: boom, so ${NOT_ADDED}` }]);
+});
+
+test("vault access: a synchronous throw from the resolver or the log is still an error line, with no timer left", async () => {
+  const timers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  const before = timers();
+  const throwing = new VaultAccess({
+    env: {},
+    directory: "/code/kabin-api",
+    log: () => {
+      throw new Error("log down");
+    },
+    resolve: () => {
+      throw new Error("sync boom");
+    },
+    timeoutMs: 60_000,
+  });
+  await throwing.configure({});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(throwing.lines(), [{ level: "error", text: `vault file access: sync boom, so ${NOT_ADDED}` }]);
+  assert.equal(timers(), before, "the bound's timer is cleared");
+});
+
+test("vault access: a session whose project is not the granted one is told", async () => {
+  const { a } = ok();
+  await a.configure({});
+  assert.equal(a.mismatch("kabin-api"), null);
+  assert.equal(a.mismatch("canonical-a")?.text, "vault file access was granted for Projects/kabin-api at startup, but this session's project is Projects/canonical-a; restart OpenCode to move it");
+  assert.equal(a.mismatch(null)?.text, "vault file access was granted for Projects/kabin-api at startup, but memory is off in this session (see the lines above); restart OpenCode to move it");
+  assert.equal(a.mismatch(null)?.level, "warn");
+});
+
+test("vault access: odd names and patterns reach a status line quoted", async () => {
+  const { a } = ok({ name: "we`ird" });
+  await a.configure({ permission: { external_directory: { [`${P}/no\u0007tes/**`]: "deny" } } });
+  const text = a.lines().map((l) => l.text).join("\n");
+  assert.ok(!text.includes("\u0007"), text);
+  assert.ok(text.includes("\\u0007"), text);
+  assert.ok(text.endsWith('in Projects/"we`ird"'), text);
+});
+
+test("vault access, for real: a vault and a repository on disk (folder absent yet, a space in the path)", async () => {
+  const root = join(await tempDir("sro-access-"), "Da Vinci");
+  await mkdir(join(root, ".obsidian"), { recursive: true });
+  await mkdir(join(root, "Projects"));
+  const code = join(await tempDir(), "kabin-api");
+  await initRepo(code);
+  await commitFile(code, "README.md", "x\n", "init");
+  await gitOk(["remote", "add", "origin", "git@github.com:hayate/kabin-api.git"], { cwd: code });
+  const a = new VaultAccess({ env: { OBSIDIAN_VAULT_PATH: root }, directory: code, log: async () => undefined });
+  const cfg: ConfigLike = {};
+  await a.configure(cfg);
+  const dir = join(await realpath(root), "Projects", "kabin-api");
+  assert.deepEqual(cfg.permission, { external_directory: { [`${dir}/**`]: "allow" } });
+  assert.deepEqual(a.lines(), []);
+});
+
+test("vault access, for real: no vault set adds nothing and says nothing (the plugin's load already tells it)", async () => {
+  const a = new VaultAccess({ env: {}, directory: "/nonexistent", log: async () => undefined });
+  const cfg: ConfigLike = {};
+  await a.configure(cfg);
+  assert.equal(cfg.permission, undefined);
+  assert.deepEqual(a.lines(), []);
 });
